@@ -191,6 +191,7 @@ ATTENTION_BACKEND_CHOICES = [
     "fa3",
     "fa4",
     "flashinfer",
+    "flashinfer-cascade",
     "flashmla",
     "trtllm_mla",
     "cutedsl_mla",
@@ -1359,6 +1360,14 @@ class ServerArgs:
             choices=ATTENTION_BACKEND_CHOICES,
         ),
     ] = None
+    cascade_min_prefix_tokens: A[
+        int,
+        "Minimum shared-prefix length for the flashinfer-cascade decode path.",
+    ] = 128
+    cascade_min_batch_size: A[
+        int,
+        "Minimum running batch size for the flashinfer-cascade decode path.",
+    ] = 4
     sampling_backend: A[
         Optional[str],
         Arg(
