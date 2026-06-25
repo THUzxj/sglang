@@ -157,6 +157,7 @@ ATTENTION_BACKEND_CHOICES = [
     "fa3",
     "fa4",
     "flashinfer",
+    "flashinfer-cascade",
     "flashmla",
     "trtllm_mla",
     "tokenspeed_mla",
@@ -561,6 +562,8 @@ class ServerArgs:
     attention_backend: Optional[str] = None
     decode_attention_backend: Optional[str] = None
     prefill_attention_backend: Optional[str] = None
+    cascade_min_prefix_tokens: int = 128
+    cascade_min_batch_size: int = 4
     sampling_backend: Optional[str] = None
     grammar_backend: Optional[str] = None
     mm_attention_backend: Optional[str] = None
@@ -5700,6 +5703,18 @@ class ServerArgs:
             choices=ATTENTION_BACKEND_CHOICES,
             default=ServerArgs.decode_attention_backend,
             help="Choose the kernels for decode attention layers (have priority over --attention-backend).",
+        )
+        parser.add_argument(
+            "--cascade-min-prefix-tokens",
+            type=int,
+            default=ServerArgs.cascade_min_prefix_tokens,
+            help="Minimum shared-prefix length for the flashinfer-cascade decode path.",
+        )
+        parser.add_argument(
+            "--cascade-min-batch-size",
+            type=int,
+            default=ServerArgs.cascade_min_batch_size,
+            help="Minimum running batch size for the flashinfer-cascade decode path.",
         )
         parser.add_argument(
             "--sampling-backend",
