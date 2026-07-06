@@ -400,6 +400,11 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
     # Pre-computed delimiter indices for multi-item scoring (CPU tensors, one per request)
     multi_item_delimiter_indices: Optional[List[torch.Tensor]] = None
 
+    # For FlashInfer cascade attention: request-declared shared-prefix metadata.
+    cascade_prefix_ref_rids: Optional[List[Optional[str]]] = None
+    cascade_shared_prefix_lens_cpu: Optional[List[Optional[int]]] = None
+    cascade_system_prefix_lens_cpu: Optional[List[Optional[int]]] = None
+
     # Speculative decoding
     spec_info: Optional[SpecInput] = None
     spec_algorithm: SpeculativeAlgorithm = None
@@ -474,6 +479,15 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
             is_prefill_only=batch.is_prefill_only,
             multi_item_delimiter_indices=batch.multi_item_delimiter_indices,
             lora_ids=batch.lora_ids,
+            cascade_prefix_ref_rids=[
+                getattr(req, "cascade_prefix_ref_rid", None) for req in batch.reqs
+            ],
+            cascade_shared_prefix_lens_cpu=[
+                getattr(req, "cascade_shared_prefix_len", None) for req in batch.reqs
+            ],
+            cascade_system_prefix_lens_cpu=[
+                getattr(req, "cascade_system_prefix_len", None) for req in batch.reqs
+            ],
             sampling_info=batch.sampling_info,
             req_to_token_pool=model_runner.req_to_token_pool,
             token_to_kv_pool=model_runner.token_to_kv_pool,
