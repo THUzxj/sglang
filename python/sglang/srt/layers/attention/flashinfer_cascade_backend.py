@@ -29,7 +29,7 @@ from __future__ import annotations
 
 import logging
 import os
-from typing import TYPE_CHECKING, Optional
+from typing import TYPE_CHECKING, Any, Optional
 
 import msgspec
 import torch
@@ -58,6 +58,7 @@ class _CascadePlanState(msgspec.Struct):
 
     common_prefix_tokens: int
     bs: int
+    graph_key: Optional[Any] = None
     perm: Optional[torch.Tensor] = None
     inv_perm: Optional[torch.Tensor] = None
 
@@ -187,6 +188,11 @@ class FlashInferCascadeAttnBackend(FlashInferAttnBackend):
         self._dbg_skip_below_prefix_cg: int = 0  # CG ran but threshold not met
         self._dbg_skip_in_cg: int = 0
         self._dbg_skip_not_decode: int = 0
+        self._dbg_cg_graph_key_log_count: int = 0
+        self._dbg_cg_graph_key_log_limit: int = int(
+            os.environ.get("SGLANG_CASCADE_DEBUG_CG_GRAPH_KEY_LIMIT", "64")
+        )
+        self._last_cg_cascade_plan_debug: dict = {}
         # Set SGLANG_CASCADE_DEBUG_KERNEL_INPUTS=1 to inspect the eager
         # FlashInfer cascade plan/run inputs. This intentionally does not log
         # under CUDA graph capture/replay because those code paths require
@@ -250,6 +256,194 @@ class FlashInferCascadeAttnBackend(FlashInferAttnBackend):
             "last_cg_cascade_plan_failure": self._last_cg_cascade_plan_failure,
         }
 
+    def get_cuda_graph_seq_len_fill_value(self):
+        # Cascade metadata treats seq_len<=1 as a non-cascade request in
+        # non-force mode. CUDA graph padding slots are synthetic, so keep them
+        # at length 2 to avoid letting padding alone disable replay planning.
+        return 2
+
+    @staticmethod
+    def _cascade_graph_variant_label(
+        layout_kind: str, group_bucket: Optional[int] = None
+    ) -> str:
+        if layout_kind not in ("level1_only", "level0_level1"):
+            return f"cascade:{layout_kind}"
+        return f"cascade:{layout_kind}:g{int(group_bucket)}"
+
+    @staticmethod
+    def _parse_cascade_graph_variant_label(
+        label: Optional[str],
+    ) -> tuple[str, Optional[int]]:
+        if not label:
+            return "no_prefix", None
+        for part in str(label).split("|"):
+            if not part.startswith("cascade:"):
+                continue
+            pieces = part.split(":")
+            if len(pieces) == 2:
+                return pieces[1], None
+            if len(pieces) != 3 or not pieces[2].startswith("g"):
+                continue
+            try:
+                return pieces[1], int(pieces[2][1:])
+            except ValueError:
+                continue
+        return "no_prefix", None
+
+    @staticmethod
+    def _cascade_group_count_buckets(bs: int) -> list[int]:
+        half = max(1, (bs + 1) // 2)
+        three_quarter = max(1, (3 * bs + 3) // 4)
+        return list(dict.fromkeys([half, three_quarter, bs]))
+
+    def _bucketize_cascade_group_count(self, num_groups: int, bs: int) -> int:
+        for bucket in self._cascade_group_count_buckets(bs):
+            if num_groups <= bucket:
+                return bucket
+        return bs
+
+    def _classify_cascade_graph_variant_from_meta(self, meta: dict, bs: int) -> str:
+        system_prefix = int(meta["system_prefix"])
+        groups = meta["groups"]
+        has_level0 = system_prefix > 0
+        has_effective_level1 = any(
+            len(group["members"]) > 1
+            and int(group["shared_prefix"]) > system_prefix
+            for group in groups
+        )
+
+        if not has_level0 and not has_effective_level1:
+            layout_kind = "no_prefix"
+        elif has_level0 and not has_effective_level1:
+            layout_kind = "level0_only"
+        elif not has_level0 and has_effective_level1:
+            layout_kind = "level1_only"
+        else:
+            layout_kind = "level0_level1"
+
+        group_bucket = None
+        if layout_kind in ("level1_only", "level0_level1"):
+            group_bucket = self._bucketize_cascade_group_count(len(groups), bs)
+        return self._cascade_graph_variant_label(layout_kind, group_bucket)
+
+    def get_cuda_graph_capture_variant_labels(self, bs: int) -> list[str]:
+        """Cascade-specific graph variants to capture for one padded bs.
+
+        This intentionally keeps the variant set small. Online shared-prefix
+        case2/case3 use pair groups, so g=bs/2 covers the primary experiment;
+        no-prefix uses singleton groups.
+        """
+        labels = [self._cascade_graph_variant_label("no_prefix")]
+        labels.append(self._cascade_graph_variant_label("level0_only"))
+        if bs >= 2:
+            for num_groups in self._cascade_group_count_buckets(bs):
+                labels.append(
+                    self._cascade_graph_variant_label("level1_only", num_groups)
+                )
+                labels.append(
+                    self._cascade_graph_variant_label(
+                        "level0_level1", num_groups
+                    )
+                )
+        # Preserve order while removing duplicates for bs=1/2 corner cases.
+        return list(dict.fromkeys(labels))
+
+    def get_cuda_graph_variant_label(
+        self,
+        forward_batch: ForwardBatch,
+        cuda_graph_bs: Optional[int] = None,
+    ) -> Optional[str]:
+        bs = int(getattr(forward_batch, "batch_size", 0) or 0)
+        if bs <= 0:
+            return None
+        common = 0
+        try:
+            common = self._detect_common_prefix_from_rpi(
+                bs, forward_batch.req_pool_indices, forward_batch.seq_lens_cpu
+            )
+        except Exception:
+            common = 0
+        meta = self._build_three_level_metadata(
+            bs=bs,
+            req_pool_indices=forward_batch.req_pool_indices,
+            seq_lens_cpu=getattr(forward_batch, "seq_lens_cpu", None),
+            rids=getattr(forward_batch, "rids", None),
+            prefix_ref_rids=getattr(forward_batch, "cascade_prefix_ref_rids", None),
+            shared_prefix_lens=getattr(
+                forward_batch, "cascade_shared_prefix_lens_cpu", None
+            ),
+            system_prefix_lens=getattr(
+                forward_batch, "cascade_system_prefix_lens_cpu", None
+            ),
+            fallback_common_prefix=common,
+            fallback_seq_lens=getattr(forward_batch, "seq_lens", None),
+        )
+        if meta is None:
+            return self._cascade_graph_variant_label("no_prefix")
+        return self._classify_cascade_graph_variant_from_meta(meta, bs)
+
+    def prepare_cuda_graph_capture_forward_batch(
+        self, forward_batch: ForwardBatch, variant_label: Optional[str]
+    ) -> None:
+        """Populate cascade metadata on capture dummy batches.
+
+        The decode runner creates generic dummy batches; this hook makes their
+        metadata match the graph variant being captured.
+        """
+        layout_kind, group_bucket = self._parse_cascade_graph_variant_label(
+            variant_label
+        )
+        bs = int(forward_batch.batch_size)
+        if group_bucket is None or group_bucket <= 0:
+            group_bucket = bs
+        group_bucket = max(1, min(group_bucket, bs))
+
+        if layout_kind == "level0_level1":
+            seq_len = 3
+            system_prefix = 1
+            shared_prefix = 2
+        elif layout_kind == "level0_only":
+            seq_len = 2
+            system_prefix = 1
+            shared_prefix = 1
+        elif layout_kind == "level1_only":
+            seq_len = 2
+            system_prefix = 0
+            shared_prefix = 1
+        else:
+            seq_len = 2
+            system_prefix = 0
+            shared_prefix = 0
+
+        forward_batch.seq_lens.fill_(seq_len)
+        if forward_batch.seq_lens_cpu is not None:
+            forward_batch.seq_lens_cpu.fill_(seq_len)
+        forward_batch.seq_lens_sum = seq_len * bs
+
+        rids = [f"cg_req{i}" for i in range(bs)]
+        refs: list[Optional[str]] = [None] * bs
+        shared_lens: list[Optional[int]] = [shared_prefix] * bs
+        system_lens: list[Optional[int]] = [system_prefix] * bs
+
+        if layout_kind in ("level1_only", "level0_level1"):
+            groups = [[] for _ in range(group_bucket)]
+            for i in range(bs):
+                groups[i % group_bucket].append(i)
+            for members in groups:
+                if not members:
+                    continue
+                anchor = members[0]
+                for member in members[1:]:
+                    refs[member] = rids[anchor]
+        elif layout_kind == "no_prefix":
+            shared_lens = [0] * bs
+            system_lens = [0] * bs
+
+        forward_batch.rids = rids
+        forward_batch.cascade_prefix_ref_rids = refs
+        forward_batch.cascade_shared_prefix_lens_cpu = shared_lens
+        forward_batch.cascade_system_prefix_lens_cpu = system_lens
+
     def _set_cg_cascade_plan_failure(self, reason: str) -> bool:
         self._last_cg_cascade_plan_failure = reason
         if self._dbg_enabled:
@@ -300,6 +494,37 @@ class FlashInferCascadeAttnBackend(FlashInferAttnBackend):
             return
         self._dbg_kernel_inputs_count += 1
         logger.info("%s #%d: %s", message, self._dbg_kernel_inputs_count, payload)
+
+    def _log_cg_graph_key_decision(
+        self,
+        phase: str,
+        bs: int,
+        graph_key: Any,
+        variant_label: Optional[str],
+        common_prefix_tokens: int,
+    ) -> None:
+        if not self._dbg_enabled:
+            return
+        if (
+            self._dbg_cg_graph_key_log_limit >= 0
+            and self._dbg_cg_graph_key_log_count
+            >= self._dbg_cg_graph_key_log_limit
+        ):
+            return
+        self._dbg_cg_graph_key_log_count += 1
+        payload = {
+            "phase": phase,
+            "bs": int(bs),
+            "graph_key": graph_key,
+            "variant_label": variant_label,
+            "common_prefix_tokens": int(common_prefix_tokens),
+        }
+        payload.update(self._last_cg_cascade_plan_debug)
+        logger.info(
+            "CG cascade graph key decision #%d: %s",
+            self._dbg_cg_graph_key_log_count,
+            payload,
+        )
 
     # ------------------------------------------------------------------
     # Detection helpers (host-side; used in both eager and CG paths)
@@ -809,7 +1034,7 @@ class FlashInferCascadeAttnBackend(FlashInferAttnBackend):
     # CG-mode cascade plan
     # ------------------------------------------------------------------
 
-    def _allocate_cg_cascade_for_bs(self, bs: int) -> None:
+    def _allocate_cg_cascade_for_key(self, graph_key: Any, bs: int) -> None:
         """Allocate per-bs cascade wrapper + indptr/indices buffers. Called
         lazily on first capture for each cuda_graph_bs entry.
 
@@ -823,7 +1048,7 @@ class FlashInferCascadeAttnBackend(FlashInferAttnBackend):
                 paged_kv_indices [bs * _cg_max_pages_per_req],
                 paged_kv_last_page_len [bs]
         """
-        if bs in self._cg_cascade_wrappers:
+        if graph_key in self._cg_cascade_wrappers:
             return
         d = self._device
 
@@ -867,8 +1092,8 @@ class FlashInferCascadeAttnBackend(FlashInferAttnBackend):
             ],
         )
 
-        self._cg_cascade_wrappers[bs] = wrapper
-        self._cg_cascade_buffers[bs] = {
+        self._cg_cascade_wrappers[graph_key] = wrapper
+        self._cg_cascade_buffers[graph_key] = {
             "qo_indptr_l0": qo_indptr_l0,
             "qo_indptr_l1": qo_indptr_l1,
             "qo_indptr_l2": qo_indptr_l2,
@@ -888,6 +1113,7 @@ class FlashInferCascadeAttnBackend(FlashInferAttnBackend):
     def _fill_cg_cascade_plan(
         self,
         bs: int,
+        graph_key: Any,
         req_pool_indices: torch.Tensor,
         seq_lens_cpu: Optional[torch.Tensor],
         common_prefix_tokens: int,
@@ -906,11 +1132,12 @@ class FlashInferCascadeAttnBackend(FlashInferAttnBackend):
         from these same addresses).
         """
         self._last_cg_cascade_plan_failure = ""
-        wrapper = self._cg_cascade_wrappers.get(bs)
-        bufs = self._cg_cascade_buffers.get(bs)
+        self._last_cg_cascade_plan_debug = {}
+        wrapper = self._cg_cascade_wrappers.get(graph_key)
+        bufs = self._cg_cascade_buffers.get(graph_key)
         if wrapper is None or bufs is None:
             return self._set_cg_cascade_plan_failure(
-                f"missing wrapper/buffers for bs={bs}"
+                f"missing wrapper/buffers for graph_key={graph_key}, bs={bs}"
             )
 
         meta = self._build_three_level_metadata(
@@ -1019,6 +1246,23 @@ class FlashInferCascadeAttnBackend(FlashInferAttnBackend):
             cum += ul
             kv_indptr_l1_cpu.append(cum)
         total_unique = cum
+        self._last_cg_cascade_plan_debug = {
+            "layout_source": meta.get("layout_source", "unknown"),
+            "system_prefix_tokens": int(system_prefix),
+            "num_groups": int(num_groups),
+            "group_shared_prefixes": [
+                int(group["shared_prefix"]) for group in groups
+            ],
+            "group_member_counts": [
+                len(group["members"]) for group in groups
+            ],
+            "per_req_shared": [int(x) for x in per_req_shared],
+            "seq_lens": [int(x) for x in seq_lens_list],
+            "total_middle": int(total_middle),
+            "total_unique": int(total_unique),
+            "perm": [int(x) for x in perm_list],
+            "inv_perm": [int(x) for x in inv_perm_list],
+        }
         bufs["kv_indptr_l2"].copy_(
             torch.tensor(kv_indptr_l1_cpu, dtype=torch.int32),
             non_blocking=True,
@@ -1208,6 +1452,10 @@ class FlashInferCascadeAttnBackend(FlashInferAttnBackend):
         bs = forward_batch.batch_size
         req_pool_indices = forward_batch.req_pool_indices
         seq_lens_cpu = forward_batch.seq_lens_cpu
+        variant_label = getattr(forward_batch, "cuda_graph_variant_label", None)
+        if variant_label is None:
+            variant_label = self.get_cuda_graph_variant_label(forward_batch)
+        graph_key = (int(bs), variant_label)
 
         if bs < self.cascade_min_batch_size:
             # bs too small to ever fire cascade; the parent's per-request
@@ -1222,46 +1470,68 @@ class FlashInferCascadeAttnBackend(FlashInferAttnBackend):
             # ids may point at zero-filled req_to_token rows; that is fine --
             # the captured kernel only records the launch, and replay overwrites
             # the buffers in place.
-            self._allocate_cg_cascade_for_bs(bs)
+            self.prepare_cuda_graph_capture_forward_batch(forward_batch, variant_label)
+            seq_lens_cpu = forward_batch.seq_lens_cpu
+            self._allocate_cg_cascade_for_key(graph_key, bs)
             synth_seq_lens_cpu = (
                 seq_lens_cpu
                 if seq_lens_cpu is not None
                 else forward_batch.seq_lens.cpu()
             )
+            capture_common = self._detect_common_prefix_from_rpi(
+                bs, req_pool_indices, synth_seq_lens_cpu
+            )
             ok = self._fill_cg_cascade_plan(
                 bs,
+                graph_key,
                 req_pool_indices,
                 synth_seq_lens_cpu,
-                1,
+                capture_common,
+                rids=forward_batch.rids,
+                prefix_ref_rids=getattr(
+                    forward_batch, "cascade_prefix_ref_rids", None
+                ),
+                shared_prefix_lens=getattr(
+                    forward_batch, "cascade_shared_prefix_lens_cpu", None
+                ),
+                system_prefix_lens=getattr(
+                    forward_batch, "cascade_system_prefix_lens_cpu", None
+                ),
                 fallback_seq_lens=forward_batch.seq_lens,
             )
             if ok:
                 # Arm so forward_decode takes the cascade path during the
                 # capture run; the captured graph then permanently invokes
                 # wrapper.run(...) for this bs.
-                bufs = self._cg_cascade_buffers[bs]
+                bufs = self._cg_cascade_buffers[graph_key]
                 self._cg_cascade_plan = _CascadePlanState(
-                    common_prefix_tokens=1,
+                    common_prefix_tokens=capture_common,
                     bs=bs,
+                    graph_key=graph_key,
                     perm=bufs["perm"],
                     inv_perm=bufs["inv_perm"],
+                )
+                self._log_cg_graph_key_decision(
+                    "capture", bs, graph_key, variant_label, capture_common
                 )
             else:
                 # Capture-time plan failure: drop cascade for this bs and let
                 # the captured graph use the parent's per-request decode.
-                self._cg_cascade_wrappers.pop(bs, None)
-                self._cg_cascade_buffers.pop(bs, None)
+                self._cg_cascade_wrappers.pop(graph_key, None)
+                self._cg_cascade_buffers.pop(graph_key, None)
                 if self._dbg_enabled:
                     logger.warning(
-                        "CG cascade capture-plan failed at bs=%d; falling back "
-                        "to parent's per-request decode for this bs. reason=%s",
+                        "CG cascade capture-plan failed at bs=%d, graph_key=%s; "
+                        "falling back to parent's per-request decode for this "
+                        "graph. reason=%s",
                         bs,
+                        graph_key,
                         self._last_cg_cascade_plan_failure,
                     )
             return
 
         # ---- Replay: detect actual common prefix + refill buffers in place ----
-        if bs not in self._cg_cascade_wrappers:
+        if graph_key not in self._cg_cascade_wrappers:
             # Cascade not captured for this bs (capture-plan failed, or
             # bs < min_batch_size at capture); the parent's path runs.
             self._dbg_skip_in_cg += 1
@@ -1274,6 +1544,7 @@ class FlashInferCascadeAttnBackend(FlashInferAttnBackend):
         # no-op level-0 launch, so always arm under CG.
         ok = self._fill_cg_cascade_plan(
             bs,
+            graph_key,
             req_pool_indices,
             seq_lens_cpu,
             common,
@@ -1299,12 +1570,16 @@ class FlashInferCascadeAttnBackend(FlashInferAttnBackend):
                 )
             return
 
-        bufs = self._cg_cascade_buffers[bs]
+        bufs = self._cg_cascade_buffers[graph_key]
         self._cg_cascade_plan = _CascadePlanState(
             common_prefix_tokens=common,
             bs=bs,
+            graph_key=graph_key,
             perm=bufs["perm"],
             inv_perm=bufs["inv_perm"],
+        )
+        self._log_cg_graph_key_decision(
+            "replay", bs, graph_key, variant_label, common
         )
         self._dbg_cascade_run_cg += 1
         if common >= self.cascade_min_prefix_tokens:
@@ -1347,7 +1622,7 @@ class FlashInferCascadeAttnBackend(FlashInferAttnBackend):
         # specific wrapper instance every replay.
         if self._in_cuda_graph and self._cg_cascade_plan is not None:
             plan = self._cg_cascade_plan
-            wrapper = self._cg_cascade_wrappers.get(self._cg_cascade_plan.bs)
+            wrapper = self._cg_cascade_wrappers.get(self._cg_cascade_plan.graph_key)
         elif (not self._in_cuda_graph) and self._cascade_plan is not None:
             plan = self._cascade_plan
             wrapper = self._cascade_decode_wrapper
