@@ -131,6 +131,21 @@ MM_PAD_SHIFT_VALUE = 1_000_000
 logger = logging.getLogger(__name__)
 
 
+def _optional_int(value: Any) -> Optional[int]:
+    if value is None:
+        return None
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return None
+
+
+def _optional_str(value: Any) -> Optional[str]:
+    if value is None:
+        return None
+    return str(value)
+
+
 @lru_cache(maxsize=1)
 def sanity_check_mm_pad_shift_value(vocab_size: int) -> None:
     if vocab_size > MM_PAD_SHIFT_VALUE:
@@ -770,6 +785,22 @@ class Req(ReqDllmMixin):
                 "__req__": self
             }
         self.sampling_params = sampling_params
+        cascade_params = (
+            sampling_params.custom_params.get("cascade")
+            if isinstance(sampling_params.custom_params, dict)
+            else None
+        )
+        if not isinstance(cascade_params, dict):
+            cascade_params = {}
+        self.cascade_prefix_ref_rid = _optional_str(
+            cascade_params.get("prefix_ref_rid")
+        )
+        self.cascade_shared_prefix_len = _optional_int(
+            cascade_params.get("shared_prefix_len")
+        )
+        self.cascade_system_prefix_len = _optional_int(
+            cascade_params.get("system_prefix_len")
+        )
         self.custom_logit_processor = custom_logit_processor
         self.return_hidden_states = return_hidden_states
 

@@ -490,6 +490,11 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
     dp_local_num_tokens: Optional[torch.Tensor] = None  # cached info at runtime
     global_dp_buffer_len: Optional[int] = None
 
+    # For FlashInfer cascade attention: request-declared shared-prefix metadata.
+    cascade_prefix_ref_rids: Optional[List[Optional[str]]] = None
+    cascade_shared_prefix_lens_cpu: Optional[List[Optional[int]]] = None
+    cascade_system_prefix_lens_cpu: Optional[List[Optional[int]]] = None
+
     # For padding
     padded_static_len: int = -1  # -1 if not padded
 
@@ -709,6 +714,15 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
             encoder_lens_cpu=batch.encoder_lens_cpu,
             lora_ids=[req.lora_id for req in batch.reqs],
             rids=[req.rid for req in batch.reqs],
+            cascade_prefix_ref_rids=[
+                getattr(req, "cascade_prefix_ref_rid", None) for req in batch.reqs
+            ],
+            cascade_shared_prefix_lens_cpu=[
+                getattr(req, "cascade_shared_prefix_len", None) for req in batch.reqs
+            ],
+            cascade_system_prefix_lens_cpu=[
+                getattr(req, "cascade_system_prefix_len", None) for req in batch.reqs
+            ],
             # Compound (carry their own device tensors)
             sampling_info=batch.sampling_info,
             spec_info=batch.spec_info,
