@@ -412,6 +412,11 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
     # Pre-computed delimiter indices for multi-item scoring (CPU tensors, one per request)
     multi_item_delimiter_indices: Optional[List[torch.Tensor]] = None
 
+    # For FlashInfer cascade attention: request-declared shared-prefix metadata.
+    cascade_prefix_ref_rids: Optional[List[Optional[str]]] = None
+    cascade_shared_prefix_lens_cpu: Optional[List[Optional[int]]] = None
+    cascade_system_prefix_lens_cpu: Optional[List[Optional[int]]] = None
+
     # === Borrowed from ScheduleBatch: compound (carry their own device tensors) ===
     # Sampling info
     sampling_info: SamplingBatchInfo = None
@@ -710,6 +715,15 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
             mm_inputs=batch.multimodal_inputs,
             encoder_cached=batch.encoder_cached,
             encoder_lens_cpu=batch.encoder_lens_cpu,
+            cascade_prefix_ref_rids=[
+                getattr(req, "cascade_prefix_ref_rid", None) for req in batch.reqs
+            ],
+            cascade_shared_prefix_lens_cpu=[
+                getattr(req, "cascade_shared_prefix_len", None) for req in batch.reqs
+            ],
+            cascade_system_prefix_lens_cpu=[
+                getattr(req, "cascade_system_prefix_len", None) for req in batch.reqs
+            ],
             lora_ids=[req.lora_id for req in batch.reqs],
             rids=[req.rid for req in batch.reqs],
             # Compound (carry their own device tensors)

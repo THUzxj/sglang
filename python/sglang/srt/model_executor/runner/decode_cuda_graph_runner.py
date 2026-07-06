@@ -157,6 +157,16 @@ def build_replay_fb_view(
         out_cache_loc=getattr(forward_batch, "out_cache_loc", None),
         out_cache_loc_dsv4=getattr(forward_batch, "out_cache_loc_dsv4", None),
         spec_info=forward_batch.spec_info,
+        rids=getattr(forward_batch, "rids", None),
+        cascade_prefix_ref_rids=getattr(
+            forward_batch, "cascade_prefix_ref_rids", None
+        ),
+        cascade_shared_prefix_lens_cpu=getattr(
+            forward_batch, "cascade_shared_prefix_lens_cpu", None
+        ),
+        cascade_system_prefix_lens_cpu=getattr(
+            forward_batch, "cascade_system_prefix_lens_cpu", None
+        ),
     )
 
 
@@ -608,6 +618,18 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
         else:
             assert self.enable_pdmux
             attn_backend = self.model_runner.decode_attn_backend_group[stream_idx]
+
+        if (
+            getattr(attn_backend, "decode_attention_backend_str", None)
+            == "flashinfer-cascade"
+        ):
+            # The cascade backend's capture-time synthetic plan needs at least
+            # one shared prefix token and one per-request tail token. FlashInfer
+            # normally captures decode with seq_len=1, which is too short for
+            # that three-level plan; replay still overwrites these buffers with
+            # the real request lengths before graph replay.
+            seq_lens.fill_(2)
+            seq_lens_cpu.fill_(2)
 
         forward_batch = ForwardBatch(
             forward_mode=self.capture_forward_mode,
