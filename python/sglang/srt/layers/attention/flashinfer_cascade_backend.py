@@ -290,6 +290,10 @@ class FlashInferCascadeAttnBackend(FlashInferAttnBackend):
                 continue
         return "no_prefix", None
 
+    def _should_cg_no_prefix_fallback(self, variant_label: Optional[str]) -> bool:
+        layout_kind, _ = self._parse_cascade_graph_variant_label(variant_label)
+        return layout_kind == "no_prefix" and not self._force_no_prefix_cascade
+
     @staticmethod
     def _cascade_group_count_buckets(bs: int) -> list[int]:
         half = max(1, (bs + 1) // 2)
@@ -525,6 +529,35 @@ class FlashInferCascadeAttnBackend(FlashInferAttnBackend):
             "CG cascade graph key decision #%d: %s",
             self._dbg_cg_graph_key_log_count,
             payload,
+        )
+
+    def _log_cg_no_prefix_fallback(
+        self,
+        phase: str,
+        bs: int,
+        graph_key: Any,
+        variant_label: Optional[str],
+    ) -> None:
+        if not self._dbg_enabled:
+            return
+        if (
+            self._dbg_cg_graph_key_log_limit >= 0
+            and self._dbg_cg_graph_key_log_count
+            >= self._dbg_cg_graph_key_log_limit
+        ):
+            return
+        self._dbg_cg_graph_key_log_count += 1
+        logger.info(
+            "CG cascade graph key decision #%d: %s",
+            self._dbg_cg_graph_key_log_count,
+            {
+                "phase": phase,
+                "bs": int(bs),
+                "graph_key": graph_key,
+                "variant_label": variant_label,
+                "path": "flashinfer_parent",
+                "reason": "no_prefix_fallback",
+            },
         )
 
     # ------------------------------------------------------------------
@@ -1453,6 +1486,13 @@ class FlashInferCascadeAttnBackend(FlashInferAttnBackend):
             variant_label = self.get_cuda_graph_variant_label(capture_batch)
         graph_key = (int(bs), variant_label)
 
+        if self._should_cg_no_prefix_fallback(variant_label):
+            self._dbg_skip_in_cg += 1
+            self._log_cg_no_prefix_fallback(
+                "capture", bs, graph_key, variant_label
+            )
+            return
+
         self._allocate_cg_cascade_for_key(graph_key, bs)
         synth_seq_lens_cpu = (
             capture_batch.seq_lens_cpu
@@ -1541,6 +1581,11 @@ class FlashInferCascadeAttnBackend(FlashInferAttnBackend):
         if variant_label is None and replay_batch is not None:
             variant_label = self.get_cuda_graph_variant_label(replay_batch)
         graph_key = (int(bs), variant_label)
+
+        if self._should_cg_no_prefix_fallback(variant_label):
+            self._dbg_skip_in_cg += 1
+            self._log_cg_no_prefix_fallback("replay", bs, graph_key, variant_label)
+            return
 
         if graph_key not in self._cg_cascade_wrappers:
             self._dbg_skip_in_cg += 1
@@ -1657,6 +1702,16 @@ class FlashInferCascadeAttnBackend(FlashInferAttnBackend):
             # bs too small to ever fire cascade; the parent's per-request
             # decode handles this captured graph.
             self._dbg_skip_in_cg += 1
+            return
+
+        if self._should_cg_no_prefix_fallback(variant_label):
+            self._dbg_skip_in_cg += 1
+            self._log_cg_no_prefix_fallback(
+                "capture" if in_capture else "replay",
+                bs,
+                graph_key,
+                variant_label,
+            )
             return
 
         if in_capture:
