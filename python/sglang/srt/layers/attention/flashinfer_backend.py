@@ -14,7 +14,7 @@ import os
 from dataclasses import dataclass
 from enum import Enum, auto
 from functools import partial
-from typing import TYPE_CHECKING, Callable, List, Optional, Union
+from typing import TYPE_CHECKING, Any, Callable, List, Optional, Union
 
 import torch
 
@@ -478,6 +478,119 @@ class FlashInferAttnBackend(AttentionBackend):
         self.prefill_cuda_graph_metadata = {}  # For verify
         self.draft_extend_cuda_graph_metadata = {}  # For draft extend
 
+        # Set SGLANG_FLASHINFER_DEBUG_KERNEL_INPUTS=1 to inspect eager
+        # FlashInfer plan/run inputs. This mirrors the cascade backend logging
+        # and intentionally skips CUDA graph paths to avoid noisy syncs there.
+        self._dbg_kernel_inputs_enabled: bool = (
+            os.environ.get("SGLANG_FLASHINFER_DEBUG_KERNEL_INPUTS", "0") == "1"
+        )
+        self._dbg_kernel_inputs_limit: int = int(
+            os.environ.get("SGLANG_FLASHINFER_DEBUG_KERNEL_INPUTS_LIMIT", "16")
+        )
+        self._dbg_kernel_inputs_count: int = 0
+        self._dbg_kernel_inputs_sample: int = int(
+            os.environ.get("SGLANG_FLASHINFER_DEBUG_KERNEL_INPUTS_SAMPLE", "16")
+        )
+        self._dbg_kernel_inputs_plan_only: bool = (
+            os.environ.get("SGLANG_FLASHINFER_DEBUG_KERNEL_INPUTS_PLAN_ONLY", "0")
+            == "1"
+        )
+
+        if self._is_tp_rank0_for_kernel_input_logs():
+            logger.info(
+                "FlashInferAttnBackend initialized "
+                "(num_wrappers=%d, dispatch_reason=%s, decode_backend=%s, "
+                "prefill_backend=%s, decode_use_tensor_cores=%s, "
+                "debug_kernel_inputs=%s, debug_kernel_inputs_limit=%d)",
+                self.num_wrappers,
+                self.dispatch_reason,
+                self.decode_backend,
+                self.prefill_backend,
+                self.decode_use_tensor_cores,
+                self._dbg_kernel_inputs_enabled,
+                self._dbg_kernel_inputs_limit,
+            )
+
+    def _is_tp_rank0_for_kernel_input_logs(self) -> bool:
+        try:
+            return get_parallel().tp_rank == 0
+        except Exception:
+            return True
+
+    def _should_log_eager_kernel_inputs(self, is_cuda_graph: bool = False) -> bool:
+        if (
+            not self._dbg_kernel_inputs_enabled
+            or is_cuda_graph
+            or self._dbg_kernel_inputs_plan_only
+            or not self._is_tp_rank0_for_kernel_input_logs()
+        ):
+            return False
+        return (
+            self._dbg_kernel_inputs_limit < 0
+            or self._dbg_kernel_inputs_count < self._dbg_kernel_inputs_limit
+        )
+
+    def _should_log_eager_plan_inputs(self, is_cuda_graph: bool = False) -> bool:
+        if (
+            not self._dbg_kernel_inputs_enabled
+            or is_cuda_graph
+            or not self._is_tp_rank0_for_kernel_input_logs()
+        ):
+            return False
+        return (
+            self._dbg_kernel_inputs_limit < 0
+            or self._dbg_kernel_inputs_count < self._dbg_kernel_inputs_limit
+        )
+
+    def _tensor_debug_summary(
+        self,
+        tensor: Optional[torch.Tensor],
+        active_numel: Optional[int] = None,
+    ) -> dict:
+        if tensor is None:
+            return {"is_none": True}
+
+        numel = int(tensor.numel())
+        if active_numel is None:
+            active_numel = numel
+        active_numel = max(0, min(int(active_numel), numel))
+        sample_n = max(0, min(self._dbg_kernel_inputs_sample, active_numel))
+
+        flat = tensor.detach().reshape(-1)
+        head = flat[:sample_n].cpu().tolist() if sample_n > 0 else []
+        tail = []
+        if active_numel > sample_n:
+            tail = flat[active_numel - sample_n : active_numel].cpu().tolist()
+
+        return {
+            "shape": tuple(tensor.shape),
+            "stride": tuple(tensor.stride()),
+            "dtype": str(tensor.dtype),
+            "device": str(tensor.device),
+            "numel": numel,
+            "active_numel": active_numel,
+            "head": head,
+            "tail": tail,
+        }
+
+    def _log_eager_kernel_inputs(
+        self, message: str, payload: dict, is_cuda_graph: bool = False
+    ) -> None:
+        if not FlashInferAttnBackend._should_log_eager_kernel_inputs(
+            self, is_cuda_graph
+        ):
+            return
+        self._dbg_kernel_inputs_count += 1
+        logger.info("%s #%d: %s", message, self._dbg_kernel_inputs_count, payload)
+
+    def _log_eager_plan_inputs(
+        self, message: str, payload: dict, is_cuda_graph: bool = False
+    ) -> None:
+        if not self._should_log_eager_plan_inputs(is_cuda_graph):
+            return
+        self._dbg_kernel_inputs_count += 1
+        logger.info("%s #%d: %s", message, self._dbg_kernel_inputs_count, payload)
+
     @staticmethod
     def _resolve_swa_kv_pool(model_runner: ModelRunner) -> Optional[BaseSWAKVPool]:
         """Return the SWA KV pool to translate against, or None for non-SWA models.
@@ -637,6 +750,7 @@ class FlashInferAttnBackend(AttentionBackend):
         in_capture: bool = False,
     ):
         bs = forward_batch.batch_size
+        metadata_key = self._cuda_graph_metadata_key(forward_batch, bs)
         req_pool_indices = forward_batch.req_pool_indices
         seq_lens = forward_batch.seq_lens
         seq_lens_cpu = forward_batch.seq_lens_cpu
@@ -647,7 +761,9 @@ class FlashInferAttnBackend(AttentionBackend):
 
         if in_capture:
             num_tokens = forward_batch.positions.numel()
-            self._prepare_cuda_graph_metadata(bs, num_tokens, forward_mode, spec_info)
+            self._prepare_cuda_graph_metadata(
+                bs, num_tokens, forward_mode, spec_info, metadata_key
+            )
 
         if forward_mode.is_decode_or_idle():
             self.indices_updater_decode.update(
@@ -655,7 +771,7 @@ class FlashInferAttnBackend(AttentionBackend):
                 seq_lens[:bs],
                 seq_lens_cpu[:bs] if seq_lens_cpu is not None else None,
                 seq_lens_sum,
-                decode_wrappers=self.decode_cuda_graph_metadata[bs],
+                decode_wrappers=self.decode_cuda_graph_metadata[metadata_key],
                 encoder_lens=encoder_lens[:bs] if encoder_lens is not None else None,
                 spec_info=spec_info,
                 fixed_split_size=None,
@@ -668,7 +784,7 @@ class FlashInferAttnBackend(AttentionBackend):
                 seq_lens_cpu[:bs] if seq_lens_cpu is not None else None,
                 seq_lens_sum,
                 prefix_lens=None,
-                prefill_wrappers=self.prefill_cuda_graph_metadata[bs],
+                prefill_wrappers=self.prefill_cuda_graph_metadata[metadata_key],
                 use_ragged=False,
                 encoder_lens=encoder_lens[:bs] if encoder_lens is not None else None,
                 spec_info=spec_info,
@@ -680,7 +796,7 @@ class FlashInferAttnBackend(AttentionBackend):
                 seq_lens_cpu[:bs] if seq_lens_cpu is not None else None,
                 seq_lens_sum,
                 prefix_lens=seq_lens - self.dllm_config.block_size,
-                prefill_wrappers=self.prefill_cuda_graph_metadata[bs],
+                prefill_wrappers=self.prefill_cuda_graph_metadata[metadata_key],
                 use_ragged=not self.use_paged,
                 encoder_lens=encoder_lens[:bs] if encoder_lens is not None else None,
                 spec_info=None,
@@ -692,7 +808,7 @@ class FlashInferAttnBackend(AttentionBackend):
                 seq_lens_cpu[:bs] if seq_lens_cpu is not None else None,
                 seq_lens_sum,
                 prefix_lens=None,
-                prefill_wrappers=self.draft_extend_cuda_graph_metadata[bs],
+                prefill_wrappers=self.draft_extend_cuda_graph_metadata[metadata_key],
                 use_ragged=False,
                 encoder_lens=encoder_lens[:bs] if encoder_lens is not None else None,
                 spec_info=spec_info,
@@ -703,7 +819,7 @@ class FlashInferAttnBackend(AttentionBackend):
         if in_capture and forward_mode.is_decode_or_idle():
             # fast_decode_plan needs _cached_module from the initial begin_forward
             # above, so install it only after that first plan has run.
-            for w in self.decode_cuda_graph_metadata[bs]:
+            for w in self.decode_cuda_graph_metadata[metadata_key]:
                 w.begin_forward = partial(fast_decode_plan, w)
 
         if (
@@ -717,7 +833,7 @@ class FlashInferAttnBackend(AttentionBackend):
             # Like decode: swap in fast_prefill_plan for replay, after the real
             # plan() above set up _cached_module (host metadata supplied per-replay
             # in call_begin_forward).
-            for w in self.draft_extend_cuda_graph_metadata[bs]:
+            for w in self.draft_extend_cuda_graph_metadata[metadata_key]:
                 w.begin_forward = partial(fast_prefill_plan, w)
 
         # Refill the SWA write-target buffer from the live out_cache_loc before
@@ -915,16 +1031,24 @@ class FlashInferAttnBackend(AttentionBackend):
             )
         return wrappers
 
+    def _cuda_graph_metadata_key(self, forward_batch: ForwardBatch, bs: int) -> Any:
+        # A captured CUDA graph closes over concrete wrapper objects. Backends
+        # with multiple graph variants for the same bs must update the wrapper
+        # for the selected variant, not whichever wrapper was captured last.
+        variant_label = getattr(forward_batch, "cuda_graph_variant_label", None)
+        return (int(bs), variant_label) if variant_label is not None else int(bs)
+
     def _prepare_cuda_graph_metadata(
         self,
         bs: int,
         num_tokens: int,
         forward_mode: ForwardMode,
         spec_info: Optional[SpecInput],
+        metadata_key: Any,
     ) -> None:
         if forward_mode.is_decode_or_idle():
             decode_wrappers = self._create_decode_wrappers(bs, num_tokens)
-            self.decode_cuda_graph_metadata[bs] = decode_wrappers
+            self.decode_cuda_graph_metadata[metadata_key] = decode_wrappers
             self.forward_metadata = DecodeMetadata(decode_wrappers)
         elif forward_mode.is_target_verify() or forward_mode.is_dllm_extend():
             use_custom_mask = (
@@ -933,14 +1057,14 @@ class FlashInferAttnBackend(AttentionBackend):
                 and getattr(spec_info, "custom_mask", None) is not None
             )
             prefill_wrappers = self._create_prefill_wrappers(bs, use_custom_mask)
-            self.prefill_cuda_graph_metadata[bs] = prefill_wrappers
+            self.prefill_cuda_graph_metadata[metadata_key] = prefill_wrappers
             self.forward_metadata = PrefillMetadata(
                 prefill_wrappers, forward_mode.is_dllm_extend(), False
             )
         elif forward_mode.is_draft_extend_v2():
             # Draft-extend: causal paged prefill over the full sequence (no mask).
             prefill_wrappers = self._create_prefill_wrappers(bs, use_custom_mask=False)
-            self.draft_extend_cuda_graph_metadata[bs] = prefill_wrappers
+            self.draft_extend_cuda_graph_metadata[metadata_key] = prefill_wrappers
             self.forward_metadata = PrefillMetadata(prefill_wrappers, False, False)
         else:
             raise ValueError(f"Invalid mode: {forward_mode=}")
@@ -987,9 +1111,46 @@ class FlashInferAttnBackend(AttentionBackend):
                 not layer.is_cross_attention
                 and layer.attn_type != AttentionType.ENCODER_ONLY
             )
+            window_left = (
+                layer.sliding_window_size
+                if not (
+                    self.forward_metadata.multi_item_params
+                    and self.forward_metadata.multi_item_params.is_enabled()
+                )
+                else -1
+            )
+            q_for_run = q.view(-1, layer.tp_q_head_num, layer.head_dim)
+            kv_for_run = self.token_to_kv_pool.get_kv_buffer(layer.layer_id)
+            is_cuda_graph = bool(
+                getattr(prefill_wrapper_paged, "is_cuda_graph_enabled", False)
+            )
+            if FlashInferAttnBackend._should_log_eager_kernel_inputs(
+                self, is_cuda_graph
+            ):
+                self._log_eager_kernel_inputs(
+                    "FlashInfer eager prefill paged run kernel inputs",
+                    {
+                        "layer_id": layer.layer_id,
+                        "use_ragged": False,
+                        "save_kv_cache": save_kv_cache,
+                        "cache_loc": self._tensor_debug_summary(cache_loc),
+                        "q_original": self._tensor_debug_summary(q),
+                        "k_current": self._tensor_debug_summary(k),
+                        "v_current": self._tensor_debug_summary(v),
+                        "q_for_run": self._tensor_debug_summary(q_for_run),
+                        "k_cache_for_run": self._tensor_debug_summary(kv_for_run[0]),
+                        "v_cache_for_run": self._tensor_debug_summary(kv_for_run[1]),
+                        "causal": causal,
+                        "window_left": window_left,
+                        "sm_scale": layer.scaling,
+                        "logits_soft_cap": logits_soft_cap,
+                        "k_scale": layer.k_scale_float,
+                        "v_scale": layer.v_scale_float,
+                    },
+                )
             o = prefill_wrapper_paged.forward(
-                q.view(-1, layer.tp_q_head_num, layer.head_dim),
-                self.token_to_kv_pool.get_kv_buffer(layer.layer_id),
+                q_for_run,
+                kv_for_run,
                 causal=causal,
                 sm_scale=layer.scaling,
                 # Disable sliding window attention for multi-item scoring:
@@ -998,14 +1159,7 @@ class FlashInferAttnBackend(AttentionBackend):
                 # - Specialized multi-item parameters (prefix_len_ptr, token_pos_in_items_ptr)
                 #   provide more precise attention control than simple sliding windows
                 # - Item-aware masking takes precedence over window-based masking
-                window_left=(
-                    layer.sliding_window_size
-                    if not (
-                        self.forward_metadata.multi_item_params
-                        and self.forward_metadata.multi_item_params.is_enabled()
-                    )
-                    else -1
-                ),
+                window_left=window_left,
                 logits_soft_cap=logits_soft_cap,
                 # Must use _float to avoid device-to-host copy that breaks cuda graph capture.
                 k_scale=layer.k_scale_float,
@@ -1032,10 +1186,38 @@ class FlashInferAttnBackend(AttentionBackend):
                 # NOTE: FlashInfer currently has limitations with head_dim = 32 or other dimensions
                 # The FlashInfer head_dim limitation itself is tracked here:
                 # https://github.com/flashinfer-ai/flashinfer/issues/1048
+                q_for_run = q.view(-1, layer.tp_q_head_num, layer.head_dim)
+                k_for_run = k.view(-1, layer.tp_k_head_num, layer.head_dim)
+                v_for_run = v.view(-1, layer.tp_v_head_num, layer.head_dim)
+                is_cuda_graph = bool(
+                    getattr(self.prefill_wrapper_ragged, "is_cuda_graph_enabled", False)
+                )
+                if FlashInferAttnBackend._should_log_eager_kernel_inputs(
+                    self, is_cuda_graph
+                ):
+                    self._log_eager_kernel_inputs(
+                        "FlashInfer eager prefill ragged run kernel inputs",
+                        {
+                            "layer_id": layer.layer_id,
+                            "use_ragged": True,
+                            "extend_no_prefix": True,
+                            "save_kv_cache": save_kv_cache,
+                            "cache_loc": self._tensor_debug_summary(cache_loc),
+                            "q_original": self._tensor_debug_summary(q),
+                            "k_current": self._tensor_debug_summary(k),
+                            "v_current": self._tensor_debug_summary(v),
+                            "q_for_run": self._tensor_debug_summary(q_for_run),
+                            "k_for_run": self._tensor_debug_summary(k_for_run),
+                            "v_for_run": self._tensor_debug_summary(v_for_run),
+                            "causal": causal,
+                            "sm_scale": layer.scaling,
+                            "logits_soft_cap": logits_soft_cap,
+                        },
+                    )
                 o = self.prefill_wrapper_ragged.forward(
-                    q.view(-1, layer.tp_q_head_num, layer.head_dim),
-                    k.view(-1, layer.tp_k_head_num, layer.head_dim),
-                    v.view(-1, layer.tp_v_head_num, layer.head_dim),
+                    q_for_run,
+                    k_for_run,
+                    v_for_run,
                     causal=causal,
                     sm_scale=layer.scaling,
                     logits_soft_cap=logits_soft_cap,
@@ -1050,18 +1232,76 @@ class FlashInferAttnBackend(AttentionBackend):
                     )
                     else -1
                 )
+                q_for_run = q.view(-1, layer.tp_q_head_num, layer.head_dim)
+                k_for_run = k.view(-1, layer.tp_k_head_num, layer.head_dim)
+                v_for_run = v.view(-1, layer.tp_v_head_num, layer.head_dim)
+                is_ragged_cuda_graph = bool(
+                    getattr(self.prefill_wrapper_ragged, "is_cuda_graph_enabled", False)
+                )
+                if FlashInferAttnBackend._should_log_eager_kernel_inputs(
+                    self, is_ragged_cuda_graph
+                ):
+                    self._log_eager_kernel_inputs(
+                        "FlashInfer eager prefill ragged-lse run kernel inputs",
+                        {
+                            "layer_id": layer.layer_id,
+                            "use_ragged": True,
+                            "extend_no_prefix": False,
+                            "save_kv_cache": save_kv_cache,
+                            "cache_loc": self._tensor_debug_summary(cache_loc),
+                            "q_original": self._tensor_debug_summary(q),
+                            "k_current": self._tensor_debug_summary(k),
+                            "v_current": self._tensor_debug_summary(v),
+                            "q_for_run": self._tensor_debug_summary(q_for_run),
+                            "k_for_run": self._tensor_debug_summary(k_for_run),
+                            "v_for_run": self._tensor_debug_summary(v_for_run),
+                            "causal": causal,
+                            "window_left": swa_window_left,
+                            "sm_scale": layer.scaling,
+                            "logits_soft_cap": logits_soft_cap,
+                        },
+                    )
                 o1, s1 = self.prefill_wrapper_ragged.forward_return_lse(
-                    q.view(-1, layer.tp_q_head_num, layer.head_dim),
-                    k.view(-1, layer.tp_k_head_num, layer.head_dim),
-                    v.view(-1, layer.tp_v_head_num, layer.head_dim),
+                    q_for_run,
+                    k_for_run,
+                    v_for_run,
                     causal=causal,
                     sm_scale=layer.scaling,
                     window_left=swa_window_left,
                     logits_soft_cap=logits_soft_cap,
                 )
+                kv_for_run = self.token_to_kv_pool.get_kv_buffer(layer.layer_id)
+                is_paged_cuda_graph = bool(
+                    getattr(prefill_wrapper_paged, "is_cuda_graph_enabled", False)
+                )
+                if FlashInferAttnBackend._should_log_eager_kernel_inputs(
+                    self, is_paged_cuda_graph
+                ):
+                    self._log_eager_kernel_inputs(
+                        "FlashInfer eager prefill paged-lse run kernel inputs",
+                        {
+                            "layer_id": layer.layer_id,
+                            "use_ragged": True,
+                            "extend_no_prefix": False,
+                            "save_kv_cache": save_kv_cache,
+                            "cache_loc": self._tensor_debug_summary(cache_loc),
+                            "q_original": self._tensor_debug_summary(q),
+                            "q_for_run": self._tensor_debug_summary(q_for_run),
+                            "k_cache_for_run": self._tensor_debug_summary(
+                                kv_for_run[0]
+                            ),
+                            "v_cache_for_run": self._tensor_debug_summary(
+                                kv_for_run[1]
+                            ),
+                            "causal": False,
+                            "window_left": swa_window_left,
+                            "sm_scale": layer.scaling,
+                            "logits_soft_cap": logits_soft_cap,
+                        },
+                    )
                 o2, s2 = prefill_wrapper_paged.forward_return_lse(
-                    q.view(-1, layer.tp_q_head_num, layer.head_dim),
-                    self.token_to_kv_pool.get_kv_buffer(layer.layer_id),
+                    q_for_run,
+                    kv_for_run,
                     causal=False,
                     sm_scale=layer.scaling,
                     window_left=swa_window_left,
@@ -1113,10 +1353,33 @@ class FlashInferAttnBackend(AttentionBackend):
                     layer.v_scale,
                 )
 
+        q_for_run = q.contiguous().view(-1, layer.tp_q_head_num, layer.head_dim)
+        kv_for_run = self.token_to_kv_pool.get_kv_buffer(layer.layer_id)
+        is_cuda_graph = bool(getattr(decode_wrapper, "is_cuda_graph_enabled", False))
+        if FlashInferAttnBackend._should_log_eager_kernel_inputs(self, is_cuda_graph):
+            self._log_eager_kernel_inputs(
+                "FlashInfer eager decode run kernel inputs",
+                {
+                    "layer_id": layer.layer_id,
+                    "save_kv_cache": save_kv_cache,
+                    "cache_loc": self._tensor_debug_summary(cache_loc),
+                    "q_original": self._tensor_debug_summary(q),
+                    "k_current": self._tensor_debug_summary(k),
+                    "v_current": self._tensor_debug_summary(v),
+                    "q_for_run": self._tensor_debug_summary(q_for_run),
+                    "k_cache_for_run": self._tensor_debug_summary(kv_for_run[0]),
+                    "v_cache_for_run": self._tensor_debug_summary(kv_for_run[1]),
+                    "sm_scale": layer.scaling,
+                    "logits_soft_cap": layer.logit_cap,
+                    "k_scale": layer.k_scale_float,
+                    "v_scale": layer.v_scale_float,
+                },
+            )
+
         # Call the wrapped function
         o = decode_wrapper.forward(
-            q.contiguous().view(-1, layer.tp_q_head_num, layer.head_dim),
-            self.token_to_kv_pool.get_kv_buffer(layer.layer_id),
+            q_for_run,
+            kv_for_run,
             sm_scale=layer.scaling,
             logits_soft_cap=layer.logit_cap,
             # Must use _float to avoid device-to-host copy that breaks cuda graph capture.
@@ -1363,6 +1626,69 @@ class FlashInferIndicesUpdaterDecode:
             hasattr(wrapper.begin_forward, "func")
             and wrapper.begin_forward.func == fast_decode_plan
         )
+
+        if self.attn_backend._should_log_eager_plan_inputs(
+            wrapper.is_cuda_graph_enabled
+        ):
+            kv_indices_active_numel = (
+                int(kv_indptr[-1].item()) if kv_indptr.numel() > 0 else 0
+            )
+            self.attn_backend._log_eager_plan_inputs(
+                "FlashInfer eager decode plan kernel inputs",
+                {
+                    "bs": bs,
+                    "paged_kernel_lens": (
+                        paged_kernel_lens.detach().cpu().tolist()
+                        if paged_kernel_lens is not None
+                        else None
+                    ),
+                    "paged_kernel_lens_sum": paged_kernel_lens_sum,
+                    "seq_lens_cpu": (
+                        seq_lens_cpu.detach().cpu().tolist()
+                        if seq_lens_cpu is not None
+                        else None
+                    ),
+                    "req_pool_indices": (
+                        req_pool_indices.detach().cpu().tolist()
+                        if req_pool_indices is not None
+                        else None
+                    ),
+                    "kv_start_idx": self.attn_backend._tensor_debug_summary(
+                        kv_start_idx
+                    ),
+                    "kv_indptr": self.attn_backend._tensor_debug_summary(kv_indptr),
+                    "kv_indices": self.attn_backend._tensor_debug_summary(
+                        kv_indices, max(1, kv_indices_active_numel)
+                    ),
+                    "kv_last_page_len": self.attn_backend._tensor_debug_summary(
+                        self.kv_last_page_len[:bs]
+                    ),
+                    "global_override_indptr_cpu": (
+                        self.attn_backend._tensor_debug_summary(
+                            global_override_indptr_cpu
+                        )
+                        if wrapper_uses_fast_decode_plan
+                        else None
+                    ),
+                    "num_qo_heads": self.num_qo_heads,
+                    "num_kv_heads": self.num_kv_heads,
+                    "head_dim": self.head_dim,
+                    "page_size": 1,
+                    "data_type": str(self.data_type),
+                    "q_data_type": str(self.q_data_type),
+                    "use_sliding_window_kv_pool": use_sliding_window_kv_pool,
+                    "fixed_split_size": fixed_split_size,
+                    "disable_split_kv": (
+                        disable_split_kv if disable_split_kv is not None else False
+                    ),
+                    "uses_fast_decode_plan": wrapper_uses_fast_decode_plan,
+                    "spec_info_type": (
+                        None
+                        if spec_info is None
+                        else str(getattr(spec_info, "spec_input_type", type(spec_info)))
+                    ),
+                },
+            )
 
         if wrapper_uses_fast_decode_plan:
             # When begin_forward is replaced with fast_decode_plan, pass global_override_indptr_cpu
@@ -1807,6 +2133,96 @@ class FlashInferIndicesUpdaterPrefill:
                 kv_lens_host=seq_lens_cpu_i32,
                 max_q_len=num_tokens_per_req,
                 max_kv_len=int(seq_lens_cpu_i32.max()),
+            )
+
+        is_cuda_graph = bool(
+            getattr(wrapper_paged, "is_cuda_graph_enabled", False)
+            or (use_ragged and getattr(wrapper_ragged, "is_cuda_graph_enabled", False))
+        )
+        if self.attn_backend._should_log_eager_plan_inputs(is_cuda_graph):
+            kv_indices_active_numel = (
+                int(kv_indptr[-1].item()) if kv_indptr.numel() > 0 else 0
+            )
+            qo_active_numel = int(qo_indptr[-1].item()) if qo_indptr.numel() > 0 else 0
+            self.attn_backend._log_eager_plan_inputs(
+                "FlashInfer eager prefill plan kernel inputs",
+                {
+                    "bs": bs,
+                    "use_ragged": use_ragged,
+                    "paged_kernel_lens": (
+                        paged_kernel_lens.detach().cpu().tolist()
+                        if paged_kernel_lens is not None
+                        else None
+                    ),
+                    "paged_kernel_lens_sum": paged_kernel_lens_sum,
+                    "seq_lens": (
+                        seq_lens.detach().cpu().tolist()
+                        if seq_lens is not None
+                        else None
+                    ),
+                    "seq_lens_cpu": (
+                        seq_lens_cpu.detach().cpu().tolist()
+                        if seq_lens_cpu is not None
+                        else None
+                    ),
+                    "prefix_lens": (
+                        prefix_lens.detach().cpu().tolist()
+                        if prefix_lens is not None
+                        else None
+                    ),
+                    "req_pool_indices": (
+                        req_pool_indices.detach().cpu().tolist()
+                        if req_pool_indices is not None
+                        else None
+                    ),
+                    "kv_start_idx": self.attn_backend._tensor_debug_summary(
+                        kv_start_idx
+                    ),
+                    "qo_indptr": self.attn_backend._tensor_debug_summary(qo_indptr),
+                    "kv_indptr": self.attn_backend._tensor_debug_summary(kv_indptr),
+                    "kv_indices": self.attn_backend._tensor_debug_summary(
+                        kv_indices, max(1, kv_indices_active_numel)
+                    ),
+                    "kv_last_page_len": self.attn_backend._tensor_debug_summary(
+                        self.kv_last_page_len[:bs]
+                    ),
+                    "custom_mask": self.attn_backend._tensor_debug_summary(
+                        use_custom_mask
+                    ),
+                    "prefix_len_ptr": self.attn_backend._tensor_debug_summary(
+                        prefix_len_ptr
+                    ),
+                    "token_pos_in_items_ptr": self.attn_backend._tensor_debug_summary(
+                        token_pos_in_items_ptr
+                    ),
+                    "token_pos_in_items_len": token_pos_in_items_len,
+                    "max_item_len_ptr": self.attn_backend._tensor_debug_summary(
+                        max_item_len_ptr
+                    ),
+                    "num_qo_heads": self.num_qo_heads,
+                    "num_kv_heads": self.num_kv_heads,
+                    "head_dim": self.head_dim,
+                    "page_size": 1,
+                    "q_data_type": str(self.q_data_type),
+                    "kv_data_type": str(self.data_type),
+                    "use_sliding_window_kv_pool": use_sliding_window_kv_pool,
+                    "fixed_split_size": fixed_split_size,
+                    "uses_fast_prefill_plan": uses_fast_prefill,
+                    "paged_plan_kwargs": {
+                        key: (
+                            self.attn_backend._tensor_debug_summary(value)
+                            if isinstance(value, torch.Tensor)
+                            else value
+                        )
+                        for key, value in paged_plan_kwargs.items()
+                    },
+                    "spec_info_type": (
+                        None
+                        if spec_info is None
+                        else str(getattr(spec_info, "spec_input_type", type(spec_info)))
+                    ),
+                    "qo_active_numel": qo_active_numel,
+                },
             )
 
         wrapper_paged.begin_forward(

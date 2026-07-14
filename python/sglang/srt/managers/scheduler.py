@@ -280,6 +280,11 @@ else:
 
 
 logger = logging.getLogger(__name__)
+_DEBUG_PREFILL_ADMISSION = get_bool_env_var("SGLANG_DEBUG_PREFILL_ADMISSION")
+
+
+def _debug_len(value):
+    return len(value) if value is not None else None
 
 # Test retract decode for debugging purposes
 TEST_RETRACT = envs.SGLANG_TEST_RETRACT.get()
@@ -2738,10 +2743,45 @@ class Scheduler(
         if (
             self.running_batch.batch_is_full or len(self.waiting_queue) == 0
         ) and self.chunked_req is None:
+            if _DEBUG_PREFILL_ADMISSION and (
+                self.running_batch.batch_is_full or len(self.waiting_queue) > 0
+            ):
+                logger.info(
+                    "Prefill admission skip: batch_is_full=%s waiting=%d chunked_req=%s",
+                    self.running_batch.batch_is_full,
+                    len(self.waiting_queue),
+                    self.chunked_req is not None,
+                )
             return None
 
         running_bs = len(self.running_batch.reqs)
+        if _DEBUG_PREFILL_ADMISSION:
+            logger.info(
+                "Prefill admission start: running_bs=%d waiting=%d batch_is_full=%s "
+                "chunked_req=%s allocatable=%d max_running_requests=%d "
+                "pp_max_micro_batch_size=%d max_prefill_tokens=%d "
+                "chunked_prefill_size=%s req_pool_available=%d token_pool_available=%d "
+                "tree_evictable=%d mixed_chunk=%s",
+                running_bs,
+                len(self.waiting_queue),
+                self.running_batch.batch_is_full,
+                self.chunked_req is not None,
+                self.get_num_allocatable_reqs(running_bs),
+                self.max_running_requests,
+                get_global_server_args().pp_max_micro_batch_size,
+                self.max_prefill_tokens,
+                self.chunked_prefill_size,
+                self.req_to_token_pool.available_size(),
+                self.token_to_kv_pool_allocator.available_size(),
+                self.tree_cache.evictable_size(),
+                self.is_mixed_chunk,
+            )
         if self._should_delay_dflash_prefill_for_batching(running_bs):
+            if _DEBUG_PREFILL_ADMISSION:
+                logger.info(
+                    "Prefill admission skip: delayed by dflash batching running_bs=%d",
+                    running_bs,
+                )
             return None
 
         # Ignore the check if self.chunked_req is not None.
@@ -2755,6 +2795,15 @@ class Scheduler(
             and not self.enable_priority_preemption
         ):
             self.running_batch.batch_is_full = True
+            if _DEBUG_PREFILL_ADMISSION:
+                logger.info(
+                    "Prefill admission skip: no allocatable req slots running_bs=%d "
+                    "allocatable=%d req_pool_available=%d pp_max_micro_batch_size=%d",
+                    running_bs,
+                    self.get_num_allocatable_reqs(running_bs),
+                    self.req_to_token_pool.available_size(),
+                    get_global_server_args().pp_max_micro_batch_size,
+                )
             return None
 
         # Get priority queue
@@ -2814,24 +2863,49 @@ class Scheduler(
         if mamba_allocator is not None:
             mamba_allocator.alloc_group_begin(len(self.waiting_queue))
         # Get requests from the waiting queue to a new prefill batch
-        for req in self.waiting_queue:
+        for queue_idx, req in enumerate(self.waiting_queue):
             if self.enable_lora and not self._can_schedule_lora_req(req, running_loras):
                 continue
 
             running_bs = len(self.running_batch.reqs)
             if len(adder.can_run_list) >= self.get_num_allocatable_reqs(running_bs):
                 self.running_batch.batch_is_full = True
+                if _DEBUG_PREFILL_ADMISSION:
+                    logger.info(
+                        "Prefill admission mark full: queue_idx=%d can_run=%d "
+                        "running_bs=%d allocatable=%d",
+                        queue_idx,
+                        len(adder.can_run_list),
+                        running_bs,
+                        self.get_num_allocatable_reqs(running_bs),
+                    )
             if self.disaggregation_mode == DisaggregationMode.PREFILL:
                 # In prefill mode, prealloc queue and transfer queue can also take memory,
                 # so we need to check if the available size for the actual available size.
                 if len(adder.can_run_list) >= self.req_to_token_pool.available_size():
                     self.running_batch.batch_is_full = True
+                    if _DEBUG_PREFILL_ADMISSION:
+                        logger.info(
+                            "Prefill admission mark full: queue_idx=%d can_run=%d "
+                            "req_pool_available=%d disaggregation_prefill=True",
+                            queue_idx,
+                            len(adder.can_run_list),
+                            self.req_to_token_pool.available_size(),
+                        )
 
             if self.running_batch.batch_is_full:
                 if (
                     not self.enable_priority_preemption
                     or not adder.preempt_to_schedule(req, self.server_args)
                 ):
+                    if _DEBUG_PREFILL_ADMISSION:
+                        logger.info(
+                            "Prefill admission break: batch_is_full queue_idx=%d "
+                            "can_run=%d waiting=%d",
+                            queue_idx,
+                            len(adder.can_run_list),
+                            len(self.waiting_queue),
+                        )
                     break
 
             if self.enable_hicache_storage:
@@ -2845,11 +2919,53 @@ class Scheduler(
                 )
 
             req.init_next_round_input(self.tree_cache)
+            if _DEBUG_PREFILL_ADMISSION:
+                logger.info(
+                    "Prefill admission try: queue_idx=%d rid=%s can_run=%d "
+                    "extend_input_len=%d prefix_len=%d full_len=%s origin_len=%s "
+                    "host_hit=%s swa_host_hit=%s rem_input=%d rem_chunk=%s "
+                    "rem_total=%d cur_rem=%d rem_swa=%s",
+                    queue_idx,
+                    getattr(req, "rid", None),
+                    len(adder.can_run_list),
+                    req.extend_input_len,
+                    len(req.prefix_indices),
+                    _debug_len(getattr(req, "full_untruncated_fill_ids", None)),
+                    _debug_len(getattr(req, "origin_input_ids", None)),
+                    getattr(req, "host_hit_length", None),
+                    getattr(req, "swa_host_hit_length", None),
+                    adder.rem_input_tokens,
+                    adder.rem_chunk_tokens,
+                    int(adder.rem_total_tokens),
+                    int(adder.cur_rem_tokens),
+                    int(adder.rem_swa_tokens) if adder.is_hybrid_swa else None,
+                )
             res = adder.add_one_req(
                 req,
                 has_chunked_req=(self.chunked_req is not None),
                 truncation_align_size=self.truncation_align_size,
             )
+            if _DEBUG_PREFILL_ADMISSION:
+                logger.info(
+                    "Prefill admission result: queue_idx=%d rid=%s result=%s "
+                    "can_run=%d new_chunked=%s extend_input_len=%d prefix_len=%d "
+                    "fill_len=%s rem_input=%d rem_chunk=%s rem_total=%d "
+                    "cur_rem=%d rem_swa=%s batch_is_full=%s",
+                    queue_idx,
+                    getattr(req, "rid", None),
+                    res.name,
+                    len(adder.can_run_list),
+                    adder.new_chunked_req is req,
+                    req.extend_input_len,
+                    len(req.prefix_indices),
+                    getattr(req, "fill_len", None),
+                    adder.rem_input_tokens,
+                    adder.rem_chunk_tokens,
+                    int(adder.rem_total_tokens),
+                    int(adder.cur_rem_tokens),
+                    int(adder.rem_swa_tokens) if adder.is_hybrid_swa else None,
+                    self.running_batch.batch_is_full,
+                )
 
             if self.enable_lora:
                 running_loras.add(req.lora_id)
@@ -2877,6 +2993,15 @@ class Scheduler(
                         req.mamba_pool_idx.unsqueeze(-1)
                     )
                     req.mamba_pool_idx = None
+                if _DEBUG_PREFILL_ADMISSION:
+                    logger.info(
+                        "Prefill admission break: add_one_req returned %s "
+                        "queue_idx=%d rid=%s can_run=%d",
+                        res.name,
+                        queue_idx,
+                        getattr(req, "rid", None),
+                        len(adder.can_run_list),
+                    )
                 break
 
         if mamba_allocator is not None:
@@ -2885,10 +3010,32 @@ class Scheduler(
         # Update waiting queue
         can_run_list: List[Req] = adder.can_run_list
         if len(can_run_list) == 0:
+            if _DEBUG_PREFILL_ADMISSION:
+                logger.info(
+                    "Prefill admission empty: waiting=%d batch_is_full=%s "
+                    "chunked_req=%s rem_input=%d rem_chunk=%s rem_total=%d cur_rem=%d",
+                    len(self.waiting_queue),
+                    self.running_batch.batch_is_full,
+                    self.chunked_req is not None,
+                    adder.rem_input_tokens,
+                    adder.rem_chunk_tokens,
+                    int(adder.rem_total_tokens),
+                    int(adder.cur_rem_tokens),
+                )
             return None
 
         can_run_set = set(can_run_list)
         self.waiting_queue = [x for x in self.waiting_queue if x not in can_run_set]
+        if _DEBUG_PREFILL_ADMISSION:
+            logger.info(
+                "Prefill admission selected: can_run=%d remaining_waiting=%d "
+                "new_chunked_req=%s chunked_req_before_update=%s rids=%s",
+                len(can_run_list),
+                len(self.waiting_queue),
+                adder.new_chunked_req is not None,
+                self.chunked_req is not None,
+                [getattr(req, "rid", None) for req in can_run_list],
+            )
         if adder.preempt_list:
             for req in adder.preempt_list:
                 self._add_request_to_queue(req)

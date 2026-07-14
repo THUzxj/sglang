@@ -219,25 +219,26 @@ class FlashInferCascadeAttnBackend(FlashInferAttnBackend):
         if self._auto_detect_scan_cap <= 0:
             self._auto_detect_scan_cap = int(self.max_context_len)
 
-        logger.info(
-            "FlashInferCascadeAttnBackend initialized "
-            "(min_prefix_tokens=%d, min_batch_size=%d, num_qo_heads=%d, "
-            "num_kv_heads=%d, head_dim=%d, cg_disabled=%s, "
-            "debug_kernel_inputs=%s, debug_kernel_inputs_limit=%d, "
-            "auto_detect_level1=%s, auto_detect_scan_cap=%d, "
-            "force_no_prefix_cascade=%s)",
-            self.cascade_min_prefix_tokens,
-            self.cascade_min_batch_size,
-            self.num_qo_heads,
-            self.num_kv_heads_local,
-            self.head_dim_local,
-            self._cg_disabled,
-            self._dbg_kernel_inputs_enabled,
-            self._dbg_kernel_inputs_limit,
-            self._auto_detect_level1_enabled,
-            self._auto_detect_scan_cap,
-            self._force_no_prefix_cascade,
-        )
+        if self._is_tp_rank0_for_kernel_input_logs():
+            logger.info(
+                "FlashInferCascadeAttnBackend initialized "
+                "(min_prefix_tokens=%d, min_batch_size=%d, num_qo_heads=%d, "
+                "num_kv_heads=%d, head_dim=%d, cg_disabled=%s, "
+                "debug_kernel_inputs=%s, debug_kernel_inputs_limit=%d, "
+                "auto_detect_level1=%s, auto_detect_scan_cap=%d, "
+                "force_no_prefix_cascade=%s)",
+                self.cascade_min_prefix_tokens,
+                self.cascade_min_batch_size,
+                self.num_qo_heads,
+                self.num_kv_heads_local,
+                self.head_dim_local,
+                self._cg_disabled,
+                self._dbg_kernel_inputs_enabled,
+                self._dbg_kernel_inputs_limit,
+                self._auto_detect_level1_enabled,
+                self._auto_detect_scan_cap,
+                self._force_no_prefix_cascade,
+            )
 
     def cascade_debug_counters(self) -> dict:
         """Snapshot of debug counters; used by tests to assert fire/skip
@@ -451,12 +452,19 @@ class FlashInferCascadeAttnBackend(FlashInferAttnBackend):
 
     def _set_cg_cascade_plan_failure(self, reason: str) -> bool:
         self._last_cg_cascade_plan_failure = reason
-        if self._dbg_enabled:
+        if self._should_log_debug():
             logger.warning("CG cascade plan failure reason: %s", reason)
         return False
 
+    def _should_log_debug(self) -> bool:
+        return self._dbg_enabled and self._is_tp_rank0_for_kernel_input_logs()
+
     def _should_log_eager_kernel_inputs(self) -> bool:
-        if not self._dbg_kernel_inputs_enabled or self._in_cuda_graph:
+        if (
+            not self._dbg_kernel_inputs_enabled
+            or self._in_cuda_graph
+            or not self._is_tp_rank0_for_kernel_input_logs()
+        ):
             return False
         return (
             self._dbg_kernel_inputs_limit < 0
@@ -508,7 +516,7 @@ class FlashInferCascadeAttnBackend(FlashInferAttnBackend):
         variant_label: Optional[str],
         common_prefix_tokens: int,
     ) -> None:
-        if not self._dbg_enabled:
+        if not self._should_log_debug():
             return
         if (
             self._dbg_cg_graph_key_log_limit >= 0
@@ -538,7 +546,7 @@ class FlashInferCascadeAttnBackend(FlashInferAttnBackend):
         graph_key: Any,
         variant_label: Optional[str],
     ) -> None:
-        if not self._dbg_enabled:
+        if not self._should_log_debug():
             return
         if (
             self._dbg_cg_graph_key_log_limit >= 0
@@ -1056,7 +1064,7 @@ class FlashInferCascadeAttnBackend(FlashInferAttnBackend):
                 kv_data_type=self.kv_dtype,
             )
         except Exception as e:
-            if self._dbg_enabled:
+            if self._should_log_debug():
                 logger.warning("Cascade plan failed, falling through: %s", e)
             return None
 
@@ -1423,7 +1431,7 @@ class FlashInferCascadeAttnBackend(FlashInferAttnBackend):
             return
         self._cascade_plan = plan
         self._dbg_cascade_fired += 1
-        if self._dbg_enabled:
+        if self._should_log_debug():
             logger.info("Cascade fires: bs=%d, common_prefix_tokens=%d", bs, common)
 
     def init_cuda_graph_state(
@@ -1533,7 +1541,7 @@ class FlashInferCascadeAttnBackend(FlashInferAttnBackend):
         else:
             self._cg_cascade_wrappers.pop(graph_key, None)
             self._cg_cascade_buffers.pop(graph_key, None)
-            if self._dbg_enabled:
+            if self._should_log_debug():
                 logger.warning(
                     "CG cascade capture-plan failed at bs=%d, graph_key=%s; "
                     "falling back to parent's per-request decode for this "
@@ -1611,7 +1619,7 @@ class FlashInferCascadeAttnBackend(FlashInferAttnBackend):
             fallback_seq_lens=seq_lens[:bs],
         )
         if not ok:
-            if self._dbg_enabled:
+            if self._should_log_debug():
                 logger.warning(
                     "CG cascade replay-plan failed at bs=%d, common=%d "
                     "(captured graph may produce incorrect output for this "
@@ -1636,7 +1644,7 @@ class FlashInferCascadeAttnBackend(FlashInferAttnBackend):
         self._dbg_cascade_run_cg += 1
         if common >= self.cascade_min_prefix_tokens:
             self._dbg_cascade_fired_cg += 1
-            if self._dbg_enabled:
+            if self._should_log_debug():
                 logger.info(
                     "Cascade fires (CG): bs=%d, common_prefix_tokens=%d",
                     bs,
@@ -1644,7 +1652,7 @@ class FlashInferCascadeAttnBackend(FlashInferAttnBackend):
                 )
         else:
             self._dbg_skip_below_prefix_cg += 1
-            if self._dbg_enabled:
+            if self._should_log_debug():
                 logger.info(
                     "Cascade ran (CG, below threshold): bs=%d, "
                     "common_prefix_tokens=%d",
@@ -1770,7 +1778,7 @@ class FlashInferCascadeAttnBackend(FlashInferAttnBackend):
                 # the captured graph use the parent's per-request decode.
                 self._cg_cascade_wrappers.pop(graph_key, None)
                 self._cg_cascade_buffers.pop(graph_key, None)
-                if self._dbg_enabled:
+                if self._should_log_debug():
                     logger.warning(
                         "CG cascade capture-plan failed at bs=%d, graph_key=%s; "
                         "falling back to parent's per-request decode for this "
@@ -1810,7 +1818,7 @@ class FlashInferCascadeAttnBackend(FlashInferAttnBackend):
             fallback_seq_lens=forward_batch.seq_lens,
         )
         if not ok:
-            if self._dbg_enabled:
+            if self._should_log_debug():
                 logger.warning(
                     "CG cascade replay-plan failed at bs=%d, common=%d "
                     "(captured graph may produce incorrect output for this "
@@ -1835,7 +1843,7 @@ class FlashInferCascadeAttnBackend(FlashInferAttnBackend):
         self._dbg_cascade_run_cg += 1
         if common >= self.cascade_min_prefix_tokens:
             self._dbg_cascade_fired_cg += 1
-            if self._dbg_enabled:
+            if self._should_log_debug():
                 logger.info(
                     "Cascade fires (CG): bs=%d, common_prefix_tokens=%d",
                     bs,
@@ -1843,7 +1851,7 @@ class FlashInferCascadeAttnBackend(FlashInferAttnBackend):
                 )
         else:
             self._dbg_skip_below_prefix_cg += 1
-            if self._dbg_enabled:
+            if self._should_log_debug():
                 logger.info(
                     "Cascade ran (CG, below threshold): bs=%d, "
                     "common_prefix_tokens=%d",

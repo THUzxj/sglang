@@ -8,6 +8,7 @@ from sglang.srt.managers.prefill_delayer import PrefillDelayerSinglePassExecutor
 from sglang.srt.utils import get_bool_env_var
 
 _ROUTING_KEY_POLICY_DEBUG_LOG = get_bool_env_var("SGLANG_ROUTING_KEY_POLICY_DEBUG_LOG")
+_DEBUG_PREFILL_ADMISSION = get_bool_env_var("SGLANG_DEBUG_PREFILL_ADMISSION")
 logger = logging.getLogger(__name__)
 
 # Copyright 2023-2024 SGLang Team
@@ -867,14 +868,41 @@ class PrefillAdder:
                 waiting_queue_len=self.waiting_queue_len,
             )
         ):
+            if _DEBUG_PREFILL_ADMISSION:
+                logger.info(
+                    "PrefillAdder reject: rid=%s reason=prefill_delayer "
+                    "can_run=%d running_bs=%d max_prefill_bs=%d "
+                    "max_running_requests=%s waiting_queue_len=%d",
+                    getattr(req, "rid", None),
+                    len(self.can_run_list),
+                    self.running_batch.batch_size(),
+                    self.max_prefill_bs,
+                    self.max_running_requests,
+                    self.waiting_queue_len,
+                )
             return AddReqResult.OTHER
         # TODO support cp with multiple requests
         # Enabling context parallelism currently presents precision issues;
         # therefore, the prefill-batch setting is temporarily set to 1.
         if (self.dsa_prefill_cp_in_seq_split) and len(self.can_run_list) >= 1:
+            if _DEBUG_PREFILL_ADMISSION:
+                logger.info(
+                    "PrefillAdder reject: rid=%s reason=dsa_prefill_cp_single_req "
+                    "can_run=%d",
+                    getattr(req, "rid", None),
+                    len(self.can_run_list),
+                )
             return AddReqResult.OTHER
 
         if (x := self.prefill_max_requests) is not None and len(self.can_run_list) >= x:
+            if _DEBUG_PREFILL_ADMISSION:
+                logger.info(
+                    "PrefillAdder reject: rid=%s reason=prefill_max_requests "
+                    "can_run=%d prefill_max_requests=%d",
+                    getattr(req, "rid", None),
+                    len(self.can_run_list),
+                    x,
+                )
             return AddReqResult.OTHER
 
         if req.sampling_params.ignore_eos and getattr(self.tree_cache, "disable", True):
@@ -896,7 +924,41 @@ class PrefillAdder:
         real_input_tokens = self.ceil_paged_tokens(real_input_tokens)
         prefix_len = len(req.prefix_indices)
 
+        if _DEBUG_PREFILL_ADMISSION:
+            logger.info(
+                "PrefillAdder check: rid=%s can_run=%d extend=%d prefix=%d "
+                "host_hit=%d real_input=%d max_new=%d total_tokens=%d "
+                "rem_input=%d rem_chunk=%s rem_total=%d cur_rem=%d "
+                "rem_swa=%s page_size=%d has_chunked_req=%s",
+                getattr(req, "rid", None),
+                len(self.can_run_list),
+                req.extend_input_len,
+                prefix_len,
+                req.host_hit_length,
+                real_input_tokens,
+                max_new,
+                total_tokens,
+                self.rem_input_tokens,
+                self.rem_chunk_tokens,
+                int(self.rem_total_tokens),
+                int(self.cur_rem_tokens),
+                int(self.rem_swa_tokens) if self.is_hybrid_swa else None,
+                self.page_size,
+                has_chunked_req,
+            )
+
         if total_tokens >= self.rem_total_tokens:
+            if _DEBUG_PREFILL_ADMISSION:
+                logger.info(
+                    "PrefillAdder reject: rid=%s reason=prelock_total_tokens "
+                    "total_tokens=%d rem_total=%d extend=%d max_new=%d page_size=%d",
+                    getattr(req, "rid", None),
+                    total_tokens,
+                    int(self.rem_total_tokens),
+                    req.extend_input_len,
+                    max_new,
+                    self.page_size,
+                )
             return AddReqResult.NO_TOKEN
 
         if self.is_hybrid_swa:
@@ -904,6 +966,16 @@ class PrefillAdder:
                 req.extend_input_len, swa_host_hit_length=req.swa_host_hit_length
             )
             if swa_needed >= self.rem_swa_tokens:
+                if _DEBUG_PREFILL_ADMISSION:
+                    logger.info(
+                        "PrefillAdder reject: rid=%s reason=prelock_swa_tokens "
+                        "swa_needed=%d rem_swa=%d extend=%d swa_host_hit=%d",
+                        getattr(req, "rid", None),
+                        swa_needed,
+                        int(self.rem_swa_tokens),
+                        req.extend_input_len,
+                        req.swa_host_hit_length,
+                    )
                 return AddReqResult.NO_TOKEN
 
         if (
@@ -914,11 +986,31 @@ class PrefillAdder:
             # If without chunked prefill:
             # - if the can_run_list is not empty, we satisfy the constraint of (max_prefill_tokens)
             # - if the can_run_list is empty, always accept the first prefill request
+            if _DEBUG_PREFILL_ADMISSION:
+                logger.info(
+                    "PrefillAdder reject: rid=%s reason=prelock_max_prefill_tokens "
+                    "real_input=%d rem_input=%d can_run=%d rem_chunk=None",
+                    getattr(req, "rid", None),
+                    real_input_tokens,
+                    self.rem_input_tokens,
+                    len(self.can_run_list),
+                )
             return AddReqResult.OTHER
 
         with self._lock_node(req.last_node):
             # self.rem_total_tokens may decrease after the lock acquisition
             if total_tokens >= self.rem_total_tokens:
+                if _DEBUG_PREFILL_ADMISSION:
+                    logger.info(
+                        "PrefillAdder reject: rid=%s reason=postlock_total_tokens "
+                        "total_tokens=%d rem_total=%d extend=%d max_new=%d page_size=%d",
+                        getattr(req, "rid", None),
+                        total_tokens,
+                        int(self.rem_total_tokens),
+                        req.extend_input_len,
+                        max_new,
+                        self.page_size,
+                    )
                 return AddReqResult.NO_TOKEN
 
             if self.is_hybrid_swa:
@@ -926,6 +1018,16 @@ class PrefillAdder:
                     req.extend_input_len, swa_host_hit_length=req.swa_host_hit_length
                 )
                 if swa_needed >= self.rem_swa_tokens:
+                    if _DEBUG_PREFILL_ADMISSION:
+                        logger.info(
+                            "PrefillAdder reject: rid=%s reason=postlock_swa_tokens "
+                            "swa_needed=%d rem_swa=%d extend=%d swa_host_hit=%d",
+                            getattr(req, "rid", None),
+                            swa_needed,
+                            int(self.rem_swa_tokens),
+                            req.extend_input_len,
+                            req.swa_host_hit_length,
+                        )
                     return AddReqResult.NO_TOKEN
 
             if req.needs_host_load_back():
@@ -953,10 +1055,26 @@ class PrefillAdder:
                 # If without chunked prefill:
                 # - if the can_run_list is not empty, we satisfy the constraint of (max_prefill_tokens)
                 # - if the can_run_list is empty, always accept the first prefill request
+                if _DEBUG_PREFILL_ADMISSION:
+                    logger.info(
+                        "PrefillAdder reject: rid=%s reason=postlock_max_prefill_tokens "
+                        "input_tokens=%d rem_input=%d can_run=%d rem_chunk=None",
+                        getattr(req, "rid", None),
+                        input_tokens,
+                        self.rem_input_tokens,
+                        len(self.can_run_list),
+                    )
                 return AddReqResult.OTHER
 
             if self.dllm_config is not None:
                 if self.rem_dllm_tokens <= 0:
+                    if _DEBUG_PREFILL_ADMISSION:
+                        logger.info(
+                            "PrefillAdder reject: rid=%s reason=dllm_tokens "
+                            "rem_dllm_tokens=%d",
+                            getattr(req, "rid", None),
+                            self.rem_dllm_tokens,
+                        )
                     return AddReqResult.OTHER
 
                 assert (
@@ -988,6 +1106,14 @@ class PrefillAdder:
                 trunc_len = self.rem_chunk_tokens // self.page_size * self.page_size
 
                 if trunc_len <= 0:
+                    if _DEBUG_PREFILL_ADMISSION:
+                        logger.info(
+                            "PrefillAdder reject: rid=%s reason=chunk_trunc_len_zero "
+                            "rem_chunk=%s page_size=%d",
+                            getattr(req, "rid", None),
+                            self.rem_chunk_tokens,
+                            self.page_size,
+                        )
                     return AddReqResult.OTHER
 
                 # When truncation align size is set, we want to assert that the prefill prefix length is multiple of truncation align size
@@ -995,6 +1121,15 @@ class PrefillAdder:
                 # we need the prefill prefix length to be multiple of attention split size
                 if truncation_align_size is not None:
                     if trunc_len < truncation_align_size:
+                        if _DEBUG_PREFILL_ADMISSION:
+                            logger.info(
+                                "PrefillAdder reject: rid=%s reason=truncation_align_size "
+                                "trunc_len=%d truncation_align_size=%d rem_chunk=%s",
+                                getattr(req, "rid", None),
+                                trunc_len,
+                                truncation_align_size,
+                                self.rem_chunk_tokens,
+                            )
                         return AddReqResult.OTHER
                     else:
                         trunc_len = truncation_align_size * (
@@ -1006,6 +1141,15 @@ class PrefillAdder:
                 trunc_len = now_input_len - len(req.prefix_indices)
 
                 if trunc_len <= 0:
+                    if _DEBUG_PREFILL_ADMISSION:
+                        logger.info(
+                            "PrefillAdder reject: rid=%s reason=aligned_trunc_len_zero "
+                            "now_input_len=%d prefix_len=%d page_size=%d",
+                            getattr(req, "rid", None),
+                            now_input_len,
+                            len(req.prefix_indices),
+                            self.page_size,
+                        )
                     return AddReqResult.OTHER
 
                 # Chunked prefill
