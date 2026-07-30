@@ -772,8 +772,12 @@ class SchedulerMetricsReporter:
         if ENABLE_METRICS_DEVICE_TIMER:
             msg += f", fwd occupancy: {self.fwd_occupancy:.2f}%"
 
+        batch_time_ms = 0.0
+        if batch is not None and batch.decode_start_time > 0:
+            batch_time_ms = (time.perf_counter() - batch.decode_start_time) * 1000
+
         if self.is_stats_logging_rank:
-            logger.info(msg)
+            logger.info(f"{msg}, batch time (ms): {batch_time_ms:.2f}")
         if self.current_scheduler_metrics_enabled:
             priority_enabled = self.scheduler.enable_priority_scheduling
 

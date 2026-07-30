@@ -1749,6 +1749,7 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
 
     # Forward-pass metrics
     fpm_start_time: float = 0.0
+    decode_start_time: float = 0.0
 
     # hicache pointer for synchronizing data loading from CPU to GPU
     hicache_consumer_index: int = -1
@@ -2877,6 +2878,7 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
             dp_cooperation_info=self.dp_cooperation_info,
             prefill_stats=self.prefill_stats,
             fpm_start_time=self.fpm_start_time,
+            decode_start_time=self.decode_start_time,
             forward_iter=self.forward_iter,
         )
 
