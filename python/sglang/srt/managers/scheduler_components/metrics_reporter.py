@@ -7,6 +7,7 @@ import tempfile
 import time
 from collections import defaultdict
 from dataclasses import dataclass
+from datetime import datetime
 from typing import (
     TYPE_CHECKING,
     List,
@@ -123,6 +124,7 @@ class SchedulerMetricsReporter:
         self.forward_ct_decode = 0
         self.num_generated_tokens = 0
         self.last_decode_stats_tic = time.perf_counter()
+        self.last_decode_log_time = self.last_decode_stats_tic
         self.last_prefill_stats_tic = time.perf_counter()
         self.last_gen_throughput: float = 0.0
         self.last_input_throughput: float = 0.0
@@ -733,8 +735,11 @@ class SchedulerMetricsReporter:
         ):
             return
 
-        gap_latency = time.perf_counter() - self.last_decode_stats_tic
-        self.last_decode_stats_tic = time.perf_counter()
+        now = time.perf_counter()
+        gap_latency = now - self.last_decode_stats_tic
+        log_time_delta = now - self.last_decode_log_time
+        self.last_decode_stats_tic = now
+        self.last_decode_log_time = now
         self.last_gen_throughput = self.num_generated_tokens / gap_latency
 
         self.num_generated_tokens = 0
@@ -859,7 +864,11 @@ class SchedulerMetricsReporter:
             msg += f", fwd occupancy: {self.fwd_occupancy:.2f}%"
 
         if self.is_stats_logging_rank:
-            logger.info(msg)
+            server_time = datetime.now().isoformat(timespec="milliseconds")
+            logger.info(
+                f"{msg}, server time: {server_time}, "
+                f"log interval (s): {log_time_delta:.3f}"
+            )
         if self.current_scheduler_metrics_enabled:
             priority_enabled = self.scheduler.enable_priority_scheduling
 
