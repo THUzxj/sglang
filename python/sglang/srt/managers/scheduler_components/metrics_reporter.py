@@ -807,7 +807,7 @@ class SchedulerMetricsReporter:
             server_time = datetime.now().isoformat(timespec="milliseconds")
             logger.info(
                 f"{msg}, server time: {server_time}, "
-                f"log interval (s): {log_time_delta:.3f}"
+                f"log interval (ms): {log_time_delta * 1000:.3f}"
             )
         if self.current_scheduler_metrics_enabled:
             priority_enabled = self.scheduler.enable_priority_scheduling
