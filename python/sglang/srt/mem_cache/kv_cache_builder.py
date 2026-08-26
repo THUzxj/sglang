@@ -183,22 +183,24 @@ def build_kv_cache(
             "Transformers backend to avoid multimodal prefix-cache mismatches."
         )
 
-    # Decode radix cache is unsupported with hybrid SWA/SSM models —
-    # these use specialized memory pools incompatible with the
-    # prefix-match-and-lock allocation path.
+    # Decode radix cache is experimental with hybrid SWA/SSM models. These use
+    # specialized memory pools, so keep a loud warning for benchmark coverage
+    # instead of rejecting the configuration before the server can start.
     if (
         server_args.disaggregation_decode_enable_radix_cache
         and server_args.disaggregation_mode == "decode"
     ):
         if is_hybrid_swa:
-            raise ValueError(
+            logger.warning(
                 "--disaggregation-decode-enable-radix-cache is incompatible "
-                "with sliding window attention (SWA) models"
+                "with sliding window attention (SWA) models; continuing for "
+                "experimental benchmark coverage"
             )
         if is_hybrid_ssm:
-            raise ValueError(
+            logger.warning(
                 "--disaggregation-decode-enable-radix-cache is incompatible "
-                "with Mamba/SSM models"
+                "with Mamba/SSM models; continuing for experimental benchmark "
+                "coverage"
             )
 
     effective_chunked_prefill_size = server_args.chunked_prefill_size

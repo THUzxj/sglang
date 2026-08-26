@@ -290,6 +290,10 @@ class GenerateReqInput:
     no_logs: bool = False
     # For custom metric labels
     custom_labels: Optional[Dict[str, str]] = None
+    # Generic request metadata accepted for compatibility with trace-replay
+    # clients. TokenizerManager maps this to custom_labels when no explicit
+    # custom_labels are supplied.
+    metadata: Optional[Dict[str, Any]] = None
 
     # (Internal) Whether to return bytes for image generation
     return_bytes: bool = False
@@ -829,6 +833,7 @@ class GenerateReqInput:
             extra_key=self.extra_key[i] if self.extra_key is not None else None,
             no_logs=self.no_logs,
             custom_labels=self.custom_labels,
+            metadata=self.metadata,
             return_bytes=self.return_bytes,
             return_entropy=self.return_entropy,
             return_prompt_token_ids=self.return_prompt_token_ids,
@@ -920,6 +925,9 @@ class TokenizedGenerateReqInput(BaseReq, kw_only=True):
 
     # Whether to disallow logging for this request (e.g. due to ZDR)
     no_logs: bool = False
+    # Custom request labels propagated to scheduler-side Req. Context-engineering
+    # experiments use these labels to distinguish main and compact requests.
+    custom_labels: Optional[Dict[str, str]] = None
 
     # (Internal) Whether to return bytes for image generation
     return_bytes: bool = False

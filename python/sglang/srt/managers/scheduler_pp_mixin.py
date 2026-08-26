@@ -1439,6 +1439,11 @@ class SchedulerPPMixin:
                 retract_rids
             )
             self.waiting_queue.extend(resumed_reqs)
+            self._log_context_engineering_resume(
+                reason="pp_decode_retracted_queue",
+                stage="decode",
+                resumed_reqs=resumed_reqs,
+            )
             return [req.rid for req in resumed_reqs]
         return None
 

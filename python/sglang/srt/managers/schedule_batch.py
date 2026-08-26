@@ -808,6 +808,7 @@ class Req(ReqDllmMixin):
         metrics_collector: Optional[SchedulerMetricsCollector] = None,
         extra_key: Optional[str] = None,
         routing_key: Optional[str] = None,
+        custom_labels: Optional[Dict[str, str]] = None,
         dimensions: Optional[int] = None,
         http_worker_ipc: Optional[str] = None,
         time_stats: Optional[
@@ -894,6 +895,9 @@ class Req(ReqDllmMixin):
         self.extra_key = extra_key
         self.lora_id = lora_id
         self.routing_key = routing_key
+        self.custom_labels = custom_labels or {}
+        self.context_engineering_kind = self._derive_context_engineering_kind()
+        self.context_engineering_pair_key = self._derive_context_engineering_pair_key()
 
         # Memory pool info
         self.req_pool_idx: Optional[int] = None
@@ -1153,6 +1157,45 @@ class Req(ReqDllmMixin):
 
         # For hisparse
         self.hisparse_staging = False
+
+    def _derive_context_engineering_kind(self) -> str:
+        labels = self.custom_labels if isinstance(self.custom_labels, dict) else {}
+        request_class = str(labels.get("request_class") or "").lower()
+        call_kind = str(labels.get("call_kind") or "").lower()
+        if request_class in {"compact", "compaction", "context_engineering"}:
+            return "compact"
+        if request_class in {"main", "agent", "agent_run"}:
+            return "main"
+        if call_kind == "context_engineering":
+            return "compact"
+        if call_kind == "agent_run":
+            return "main"
+        return ""
+
+    def _derive_context_engineering_pair_key(self) -> Optional[str]:
+        labels = self.custom_labels if isinstance(self.custom_labels, dict) else {}
+        for key in (
+            "context_engineering_pair_key",
+            "compact_pair_key",
+            "pair_key",
+            "session_id",
+            "run_id",
+        ):
+            value = labels.get(key)
+            if value is not None and str(value):
+                return str(value)
+        if self.session_id:
+            return str(self.session_id)
+        return None
+
+    def is_context_engineering_main(self) -> bool:
+        return self.context_engineering_kind == "main"
+
+    def is_context_engineering_compact(self) -> bool:
+        return self.context_engineering_kind == "compact"
+
+    def is_context_engineering_request(self) -> bool:
+        return self.context_engineering_kind in {"main", "compact"}
 
     @property
     def seqlen(self) -> int:
@@ -1663,54 +1706,6 @@ class Req(ReqDllmMixin):
             self.kv_cache_cpu, token_indices, mamba_indices=self.mamba_pool_idx
         )
         del self.kv_cache_cpu
-
-    def build_rebootstrap_payload(self) -> dict:
-        """Build the prefill ``/generate`` payload that asks the original prefill
-        worker to recompute this request's prefix KV under the current weights
-        (PD true-retraction rebootstrap).
-
-        ``input_ids`` are coerced to plain ``int`` so the payload is always
-        JSON-serializable even when ``origin_input_ids``/``output_ids`` hold
-        numpy scalars. The sampling-param allow-list forces ``max_new_tokens=1``
-        and drops stop/grammar/min_new_tokens so the recompute only re-derives
-        the prefix KV and samples a single handoff token. The already-emitted
-        boundary token is replayed on the *decode* side (the transfer commit
-        overrides the sampled handoff with it), so it is intentionally not sent
-        to the prefill here.
-        """
-        # TODO: multi-modal requests are not supported here. The payload only
-        # carries token ``input_ids`` and drops any image/audio/video inputs, so
-        # the rebootstrap recompute would not reproduce the original prefix KV
-        # for multi-modal requests. Add multi-modal support before enabling it.
-        sp = self.sampling_params
-        return {
-            "input_ids": [int(x) for x in self.origin_input_ids]
-            + [int(x) for x in self.output_ids],
-            "sampling_params": {
-                "max_new_tokens": 1,
-                "temperature": sp.temperature,
-                "top_p": sp.top_p,
-                "top_k": sp.top_k,
-                "min_p": sp.min_p,
-                "frequency_penalty": sp.frequency_penalty,
-                "presence_penalty": sp.presence_penalty,
-                "repetition_penalty": sp.repetition_penalty,
-                "ignore_eos": sp.ignore_eos,
-                "skip_special_tokens": sp.skip_special_tokens,
-                "spaces_between_special_tokens": sp.spaces_between_special_tokens,
-                "no_stop_trim": sp.no_stop_trim,
-            },
-            "return_logprob": False,
-            "stream": False,
-            "rid": self.rid,
-            "bootstrap_host": self.bootstrap_host,
-            "bootstrap_port": self.bootstrap_port,
-            "bootstrap_room": self.bootstrap_room,
-            "priority": self.priority,
-            "extra_key": self.extra_key,
-            "routing_key": self.routing_key,
-            "disagg_prefill_dp_rank": self.disagg_prefill_dp_rank,
-        }
 
     def log_time_stats(self):
         # If overlap schedule, we schedule one decode batch ahead so this gets called twice.
@@ -2749,9 +2744,31 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
             first_iter = False
             idx = sorted_indices.pop()
             req = self.reqs[idx]
-            retracted_reqs.append(req)
-            # release memory and don't insert into the tree because we need the space instantly
-            self.release_req(idx, len(sorted_indices), server_args)
+            retract_indices = [idx]
+            # Context-engineering main and its compact are admitted as a decode
+            # pair. Retract the pair atomically so neither side keeps the
+            # other's shared prefix resident.
+            if server_args.enable_context_engineering_scheduler and req.is_context_engineering_request():
+                pair_key = req.context_engineering_pair_key
+                if pair_key:
+                    paired_idx = next(
+                        (
+                            candidate
+                            for candidate in reversed(sorted_indices)
+                            if self.reqs[candidate].context_engineering_pair_key == pair_key
+                            and self.reqs[candidate].is_context_engineering_request()
+                            and self.reqs[candidate].is_context_engineering_main()
+                            != req.is_context_engineering_main()
+                        ),
+                        None,
+                    )
+                    if paired_idx is not None:
+                        sorted_indices.remove(paired_idx)
+                        retract_indices.append(paired_idx)
+            for retract_idx in retract_indices:
+                retracted_reqs.append(self.reqs[retract_idx])
+                # release memory and don't insert into the tree because we need the space instantly
+                self.release_req(retract_idx, len(sorted_indices), server_args)
 
         reqs_to_abort: List[Req] = []
         if len(sorted_indices) <= 1 and not self.check_decode_mem(
@@ -2780,47 +2797,6 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
         )
 
         return retracted_reqs, new_estimate_ratio, reqs_to_abort
-
-    @staticmethod
-    def _get_decode_retraction_order(
-        reqs: List[Req], server_args: ServerArgs
-    ) -> List[int]:
-        """Return indices ordered from most-preferred to least-preferred to keep.
-
-        The retraction loop pops from the end of this list, so the least-preferred
-        request is retracted first.
-        """
-        sorted_indices = list(range(len(reqs)))
-
-        # TODO(lsyin): improve retraction policy for radix cache
-
-        def length_key(req: Req) -> Tuple[int, int]:
-            return (len(req.output_ids), -len(req.origin_input_ids))
-
-        if server_args.retraction_policy == "priority":
-            priority_sign = 1 if server_args.schedule_low_priority_values_first else -1
-
-            def retraction_key(req: Req) -> Tuple[int, int, int]:
-                priority = req.priority
-                if priority is None:
-                    priority = (
-                        sys.maxsize
-                        if server_args.schedule_low_priority_values_first
-                        else -sys.maxsize - 1
-                    )
-                return (priority * (-priority_sign), *length_key(req))
-
-            sorted_indices.sort(
-                key=lambda i: retraction_key(reqs[i]),
-                reverse=True,
-            )
-            return sorted_indices
-
-        sorted_indices.sort(
-            key=lambda i: length_key(reqs[i]),
-            reverse=True,
-        )
-        return sorted_indices
 
     def release_req(self, idx: int, remaing_req_count: int, server_args: ServerArgs):
         release_req(
@@ -3173,7 +3149,13 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
             extend_lens=self.extend_lens,
             prefix_lens=self.prefix_lens,
             req_to_token_pool=self.req_to_token_pool,
+            token_to_kv_pool_allocator=self.token_to_kv_pool_allocator,
+            tree_cache=self.tree_cache,
             req_pool_indices=self.req_pool_indices,
+            req_pool_indices_cpu=self.req_pool_indices_cpu,
+            seq_lens=self.seq_lens,
+            orig_seq_lens=self.orig_seq_lens,
+            input_ids=self.input_ids,
             model_config=self.model_config,
             forward_mode=self.forward_mode,
             out_cache_loc=self.out_cache_loc,

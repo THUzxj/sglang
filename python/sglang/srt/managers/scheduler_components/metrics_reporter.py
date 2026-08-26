@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import dataclasses
+import json
 import logging
 import math
 import tempfile
@@ -18,6 +19,10 @@ from typing import (
 
 from sglang.srt.disaggregation.utils import DisaggregationMode
 from sglang.srt.environ import envs
+from sglang.srt.managers.context_engineering_scheduler import (
+    batch_context_engineering_observation,
+    batch_context_engineering_stats,
+)
 from sglang.srt.managers.schedule_batch import ScheduleBatch
 from sglang.srt.managers.utils import GenerationBatchResult
 from sglang.srt.observability.metrics_collector import (
@@ -113,6 +118,39 @@ class SchedulerMetricsReporter:
         )
         self._init_metrics(self.tp_rank, self.pp_rank, self.dp_rank)
         self._install_device_timer_on_runners()
+
+    def _log_context_engineering_batch(
+        self,
+        *,
+        stage: str,
+        batch: ScheduleBatch,
+        batch_iter: int,
+        extra: Optional[dict] = None,
+    ) -> None:
+        # The structured batch event describes compact-aware (joint) scheduling
+        # decisions. Normal/background scheduler runs may still carry the same
+        # request metadata, but must not emit this event as if CE scheduling was
+        # active.
+        if not self.scheduler.server_args.enable_context_engineering_scheduler:
+            return
+        observation = batch_context_engineering_observation(batch.reqs)
+        if not observation["main"] and not observation["compact"]:
+            return
+        payload = {
+            "event": "context_engineering_batch",
+            "stage": stage,
+            "forward_iter": batch_iter,
+            "scheduler_enabled": bool(
+                self.scheduler.server_args.enable_context_engineering_scheduler
+            ),
+            "tp_rank": self.tp_rank,
+            "pp_rank": self.pp_rank,
+            "dp_rank": self.dp_rank,
+            **observation,
+        }
+        if extra:
+            payload.update(extra)
+        logger.info("context_engineering_batch %s", json.dumps(payload, sort_keys=True))
 
     def _init_metrics(
         self,
@@ -570,6 +608,24 @@ class SchedulerMetricsReporter:
             f"#queue-req: {len(self.scheduler.waiting_queue)}, "
             f"#pending-token: {prefill_stats.num_pending_tokens}, "
         )
+        if batch is not None:
+            context_stats = batch_context_engineering_stats(batch.reqs)
+            if context_stats["main"] or context_stats["compact"]:
+                msg += (
+                    f"#ce-main: {context_stats['main']}, "
+                    f"#ce-compact: {context_stats['compact']}, "
+                    f"#ce-paired-compact: {context_stats['paired_compact']}, "
+                )
+                self._log_context_engineering_batch(
+                    stage="prefill",
+                    batch=batch,
+                    batch_iter=batch_iter,
+                    extra={
+                        "num_new_seqs": prefill_stats.num_new_seqs,
+                        "log_input_tokens": prefill_stats.log_input_tokens,
+                        "log_hit_tokens": prefill_stats.log_hit_tokens,
+                    },
+                )
 
         if self.scheduler.disaggregation_mode == DisaggregationMode.PREFILL:
             msg += f"#bootstrap-req: {len(self.scheduler.disagg_prefill_bootstrap_queue.queue)}, "
@@ -839,6 +895,24 @@ class SchedulerMetricsReporter:
             f"gen throughput (token/s): {self.last_gen_throughput:.2f}, "
             f"#queue-req: {len(self.scheduler.waiting_queue)}"
         )
+        context_stats = batch_context_engineering_stats(batch.reqs)
+        if context_stats["main"] or context_stats["compact"]:
+            msg += (
+                f", #ce-main: {context_stats['main']}, "
+                f"#ce-compact: {context_stats['compact']}, "
+                f"#ce-paired-compact: {context_stats['paired_compact']}"
+            )
+            self._log_context_engineering_batch(
+                stage="decode",
+                batch=batch,
+                batch_iter=batch.forward_iter
+                if batch.forward_iter is not None
+                else self.scheduler.forward_ct,
+                extra={
+                    "batch_size": batch.batch_size(),
+                    "num_retracted_reqs": self.num_retracted_reqs,
+                },
+            )
 
         if self.enable_mfu_metrics and gap_latency > 0:
             flops_per_s = self._mfu_log_flops / gap_latency
