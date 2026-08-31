@@ -4,7 +4,7 @@ import json
 import logging
 import threading
 import time
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Optional
 
 import torch
 
@@ -13,11 +13,25 @@ from sglang.srt.environ import envs
 from sglang.srt.managers.cache_controller import HiCacheController
 from sglang.srt.mem_cache.allocator import BaseTokenToKVPoolAllocator
 from sglang.srt.mem_cache.base_prefix_cache import BasePrefixCache
+from sglang.srt.mem_cache.hicache_storage import (
+    PoolHitPolicy,
+    PoolName,
+    PoolTransfer,
+)
+from sglang.srt.mem_cache.hybrid_cache.hybrid_cache_controller import (
+    HybridCacheController,
+)
+from sglang.srt.mem_cache.hybrid_cache.hybrid_pool_assembler import (
+    build_kv_host_pool,
+    build_pool_entry,
+)
 from sglang.srt.mem_cache.memory_pool import (
+    HybridLinearKVPool,
     MHATokenToKVPool,
     MLATokenToKVPool,
     ReqToTokenPool,
 )
+from sglang.srt.mem_cache.memory_pool_host import HostPoolGroup, MambaPoolHost
 from sglang.srt.mem_cache.pool_host.common import get_allocator_type
 from sglang.srt.mem_cache.pool_host.mha import get_mha_host_pool_cls
 from sglang.srt.mem_cache.pool_host.mla import MLATokenToKVPoolHost
@@ -28,6 +42,19 @@ if TYPE_CHECKING:
     from sglang.srt.managers.schedule_batch import Req
 
 logger = logging.getLogger(__name__)
+
+
+def _pool_size_bytes(pool) -> int:
+    size_bytes = pool.get_kv_size_bytes()
+    return sum(size_bytes) if isinstance(size_bytes, tuple) else size_bytes
+
+
+def _split_hicache_size(hicache_size: int, pools: tuple) -> tuple[float, ...]:
+    pool_sizes = [_pool_size_bytes(pool) for pool in pools]
+    total_size = sum(pool_sizes)
+    if total_size <= 0:
+        raise ValueError("Cannot split HiCache host size across empty device pools.")
+    return tuple(hicache_size * size / total_size for size in pool_sizes)
 
 
 class DecodeKVCacheOffloadManager:
@@ -56,8 +83,17 @@ class DecodeKVCacheOffloadManager:
             )
         kv_cache = self.token_to_kv_pool_allocator.get_kvcache()
         allocator_type = get_allocator_type(server_args)
+        self.is_hybrid_linear_kv_pool = isinstance(kv_cache, HybridLinearKVPool)
+        self.mamba_pool_host = None
+        transfer_layer_num = None
 
-        if isinstance(kv_cache, MHATokenToKVPool):
+        logger.info(f"kv cache dtype: {kv_cache}")
+
+        if self.is_hybrid_linear_kv_pool:
+            self.decode_host_mem_pool, transfer_layer_num = (
+                self._init_hybrid_host_mem_pool(kv_cache, allocator_type)
+            )
+        elif isinstance(kv_cache, MHATokenToKVPool):
             self.decode_host_mem_pool = get_mha_host_pool_cls(kv_cache)(
                 kv_cache,
                 server_args.hicache_ratio,
@@ -92,7 +128,15 @@ class DecodeKVCacheOffloadManager:
                     f"Invalid hicache storage backend extra config JSON: {e}"
                 )
 
-        self.cache_controller = HiCacheController(
+        controller_cls = (
+            HybridCacheController
+            if self.is_hybrid_linear_kv_pool
+            else HiCacheController
+        )
+        controller_kwargs = {}
+        if self.is_hybrid_linear_kv_pool:
+            controller_kwargs["transfer_layer_num"] = transfer_layer_num
+        self.cache_controller = controller_cls(
             token_to_kv_pool_allocator=self.token_to_kv_pool_allocator,
             mem_pool_host=self.decode_host_mem_pool,
             page_size=self.page_size,
@@ -102,13 +146,84 @@ class DecodeKVCacheOffloadManager:
             storage_backend=server_args.hicache_storage_backend,
             model_name=server_args.served_model_name,
             storage_backend_extra_config=hicache_storage_backend_extra_config,
+            **controller_kwargs,
         )
+        if self.is_hybrid_linear_kv_pool:
+            kv_cache.register_layer_transfer_counter(
+                self.cache_controller.layer_done_counter
+            )
+            if hasattr(self.req_to_token_pool, "register_layer_transfer_counter"):
+                self.req_to_token_pool.register_layer_transfer_counter(
+                    self.cache_controller.layer_done_counter
+                )
 
         self.ongoing_offload = {}
         self.ongoing_backup = {}
         self.offloaded_state = {}
         self.offload_inflight = {}
         logger.info("Enable offload kv cache for decode side")
+
+    def _init_hybrid_host_mem_pool(
+        self, kv_cache: HybridLinearKVPool, allocator_type: str
+    ) -> tuple[HostPoolGroup, int]:
+        full_kv_pool = kv_cache.full_kv_pool
+        mamba_pool = getattr(self.req_to_token_pool, "mamba_pool", None)
+        mamba_allocator = getattr(self.req_to_token_pool, "mamba_allocator", None)
+        mamba_map = getattr(self.req_to_token_pool, "mamba_map", None)
+        if mamba_pool is None or mamba_allocator is None or mamba_map is None:
+            raise ValueError(
+                "HybridLinearKVPool decode offload requires HybridReqToTokenPool "
+                "with mamba_pool, mamba_allocator, and mamba_map."
+            )
+
+        full_host_size = None
+        mamba_host_size = 0
+        if self.server_args.hicache_size > 0:
+            full_host_size, mamba_host_size = _split_hicache_size(
+                self.server_args.hicache_size,
+                (full_kv_pool, mamba_pool),
+            )
+
+        full_host_pool = build_kv_host_pool(
+            kv_pool=full_kv_pool,
+            page_size=self.page_size,
+            server_args=self.server_args,
+            use_mla=kv_cache.use_mla,
+            host_size=full_host_size,
+        )
+        self.mamba_pool_host = MambaPoolHost(
+            mamba_pool,
+            self.server_args.hicache_ratio,
+            mamba_host_size,
+            allocator_type=allocator_type,
+            layout=self.server_args.hicache_mem_layout,
+        )
+
+        full_layer_mapping = dict(kv_cache.full_attention_layer_id_mapping)
+        mamba_layer_mapping = dict(mamba_map)
+        transfer_layer_num = len(full_layer_mapping | mamba_layer_mapping)
+        host_pool_group = HostPoolGroup(
+            [
+                build_pool_entry(
+                    name=PoolName.KV,
+                    host_pool=full_host_pool,
+                    device_pool=full_kv_pool,
+                    layer_mapping=full_layer_mapping,
+                    transfer_layer_num=transfer_layer_num,
+                    is_anchor=True,
+                ),
+                build_pool_entry(
+                    name=PoolName.MAMBA,
+                    host_pool=self.mamba_pool_host,
+                    device_pool=mamba_pool,
+                    layer_mapping=mamba_layer_mapping,
+                    transfer_layer_num=transfer_layer_num,
+                    device_alloc_fn=mamba_allocator.alloc,
+                    device_free_fn=mamba_allocator.free,
+                ),
+            ]
+        )
+        return host_pool_group, transfer_layer_num
 
     def release_host_resources(self) -> None:
         self.decode_host_mem_pool.destroy()
@@ -182,9 +297,14 @@ class DecodeKVCacheOffloadManager:
         # Asynchronously offload incremental KV cache from device to host
         self.request_counter += 1
         ack_id = self.request_counter
+        extra_pools = self._build_mamba_backup_transfers(req, end)
+        write_kwargs = (
+            {"extra_pools": extra_pools} if self.is_hybrid_linear_kv_pool else {}
+        )
         host_indices = self.cache_controller.write(
             device_indices=incremental_indices.long(),
             node_id=ack_id,
+            **write_kwargs,
         )
         if host_indices is None:
             logger.error(f"Not enough host memory for request {req.rid}")
@@ -198,9 +318,55 @@ class DecodeKVCacheOffloadManager:
             time.time(),
             start,
             end,
+            extra_pools,
         )
         state.inc_len += incremental_aligned_len
         return True
+
+    def _build_mamba_backup_transfers(
+        self, req: Req, chunk_end: int
+    ) -> Optional[list[PoolTransfer]]:
+        if not self.is_hybrid_linear_kv_pool:
+            return None
+        if req.mamba_pool_idx is None:
+            return None
+
+        mamba_device_index = None
+        enable_extra_buffer = getattr(
+            self.req_to_token_pool, "enable_mamba_extra_buffer", False
+        )
+        if enable_extra_buffer:
+            if not getattr(req, "mamba_lazy_is_insert", True):
+                return None
+            if req.mamba_ping_pong_track_buffer is None:
+                return None
+            if req.mamba_last_track_seqlen != chunk_end:
+                return None
+            keep_idx = self.req_to_token_pool.get_mamba_ping_pong_keep_idx(req)
+            mamba_device_index = req.mamba_ping_pong_track_buffer[keep_idx]
+            if int(mamba_device_index.item()) < 0:
+                return None
+        elif req.finished() and chunk_end == req.effective_kv_committed_len():
+            write_pos_buf = getattr(
+                self.req_to_token_pool.mamba_pool, "replayssm_write_pos", None
+            )
+            if (
+                write_pos_buf is not None
+                and int(write_pos_buf[req.mamba_pool_idx].item()) != 0
+            ):
+                return None
+            mamba_device_index = req.mamba_pool_idx
+
+        if mamba_device_index is None:
+            return None
+
+        return [
+            PoolTransfer(
+                name=PoolName.MAMBA,
+                device_indices=mamba_device_index.reshape(1),
+                hit_policy=PoolHitPolicy.TRAILING_PAGES,
+            )
+        ]
 
     def check_offload_progress(self):
         """Check the progress of offload from device to host and backup from host to storage."""
@@ -235,6 +401,7 @@ class DecodeKVCacheOffloadManager:
                     start_time,
                     start,
                     end,
+                    extra_pools,
                 ) = self.ongoing_offload.pop(ack_id)
 
                 self._mark_offload_finished(req.rid)
@@ -244,7 +411,12 @@ class DecodeKVCacheOffloadManager:
                     else None
                 )
                 last_hash = self._trigger_backup(
-                    req, host_indices, incremental_tokens, start_time, prior_hash
+                    req,
+                    host_indices,
+                    incremental_tokens,
+                    start_time,
+                    prior_hash,
+                    extra_pools,
                 )
                 if req.rid in self.offloaded_state:
                     self.offloaded_state[req.rid].last_hash = last_hash
@@ -293,6 +465,12 @@ class DecodeKVCacheOffloadManager:
             ]
             self.token_to_kv_pool_allocator.free(overalloc_indices)
 
+        if (
+            self.is_hybrid_linear_kv_pool
+            and hasattr(self.req_to_token_pool, "free_mamba_cache")
+            and req.mamba_pool_idx is not None
+        ):
+            self.req_to_token_pool.free_mamba_cache(req)
         self.req_to_token_pool.free(req)
         req.kv = None
         self.tree_cache.protected_size_ -= len(req.prefix_indices)
@@ -304,26 +482,66 @@ class DecodeKVCacheOffloadManager:
         for _ in range(finish_count):
             storage_operation = self.cache_controller.ack_backup_queue.get()
             ack_id = storage_operation.id
-            req_id, host_indices, start_time = self.ongoing_backup.pop(ack_id)
+            req_id, host_indices, start_time, extra_pools = self.ongoing_backup.pop(
+                ack_id
+            )
 
             # Release host memory
             self.decode_host_mem_pool.free(host_indices)
+            self._free_extra_host_indices(extra_pools)
 
             logger.debug(
                 f"Finished backup request {req_id}, free host memory, len:{len(host_indices)}, cost time:{time.time() - start_time:.2f} seconds."
             )
 
+    def _free_extra_host_indices(
+        self, extra_pools: Optional[list[PoolTransfer]]
+    ) -> None:
+        if not extra_pools or not isinstance(
+            self.decode_host_mem_pool, HostPoolGroup
+        ):
+            return
+        for transfer in extra_pools:
+            if (
+                transfer.host_indices is None
+                or transfer.indices_from_pool is not None
+            ):
+                continue
+            entry = self.decode_host_mem_pool.entry_map.get(transfer.name)
+            if entry is not None and not entry.is_primary_index_anchor:
+                entry.host_pool.free(transfer.host_indices)
+                transfer.host_indices = None
+
     def _trigger_backup(
-        self, req, host_indices, incremental_tokens, start_time, prior_hash
+        self,
+        req,
+        host_indices,
+        incremental_tokens,
+        start_time,
+        prior_hash,
+        extra_pools=None,
     ):
         """Trigger async backup from host to storage."""
         page_hashes = self._compute_prefix_hash(incremental_tokens, prior_hash)
+        if extra_pools and page_hashes:
+            for transfer in extra_pools:
+                if transfer.hit_policy == PoolHitPolicy.TRAILING_PAGES:
+                    transfer.keys = [page_hashes[-1]]
+        write_storage_kwargs = (
+            {"extra_pools": extra_pools} if self.is_hybrid_linear_kv_pool else {}
+        )
         ack_id = self.cache_controller.write_storage(
             host_indices,
             incremental_tokens,
             hash_value=page_hashes,
+            **write_storage_kwargs,
         )
-        self.ongoing_backup[ack_id] = (req.rid, host_indices, start_time)
+        self.ongoing_backup[ack_id] = (
+            req.rid,
+            host_indices,
+            start_time,
+            extra_pools,
+        )
         return page_hashes[-1] if len(page_hashes) > 0 else prior_hash
 
     def _compute_prefix_hash(self, tokens, prior_hash=""):
