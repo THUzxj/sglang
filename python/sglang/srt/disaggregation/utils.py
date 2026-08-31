@@ -544,6 +544,7 @@ class TransferBackend(Enum):
     NIXL = "nixl"
     ASCEND = "ascend"
     FAKE = "fake"
+    METADATA_ONLY = "metadata_only"
 
 
 class KVClassType(Enum):
@@ -662,6 +663,23 @@ def get_kv_class(
             KVClassType.MANAGER: FakeKVManager,
             KVClassType.SENDER: FakeKVSender,
             KVClassType.RECEIVER: (FakeKVReceiver),
+        }
+        return class_mapping.get(class_type)
+    elif transfer_backend == TransferBackend.METADATA_ONLY:
+        from sglang.srt.disaggregation.base import KVArgs
+        from sglang.srt.disaggregation.metadata_only import (
+            MetadataOnlyKVBootstrapServer,
+            MetadataOnlyKVManager,
+            MetadataOnlyKVReceiver,
+            MetadataOnlyKVSender,
+        )
+
+        class_mapping = {
+            KVClassType.KVARGS: KVArgs,
+            KVClassType.MANAGER: MetadataOnlyKVManager,
+            KVClassType.SENDER: MetadataOnlyKVSender,
+            KVClassType.RECEIVER: MetadataOnlyKVReceiver,
+            KVClassType.BOOTSTRAP_SERVER: MetadataOnlyKVBootstrapServer,
         }
         return class_mapping.get(class_type)
 

@@ -269,6 +269,8 @@ class PrefillBootstrapQueue:
             self.scheduler.server_args,
             self.is_mla_backend,
         )
+        if hasattr(kv_manager, "set_metadata_buffers"):
+            kv_manager.set_metadata_buffers(self.metadata_buffers)
         # Pass KV pool tensor refs to the manager for GPU gather (staging mode)
         if (
             envs.SGLANG_DISAGG_STAGING_BUFFER.get()
