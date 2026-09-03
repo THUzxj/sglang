@@ -1501,6 +1501,60 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
         )
         return num_new_pages * page_size
 
+    def _evict_for_mamba_request(self: Scheduler, req: Req) -> None:
+        """Evict radix-cached Mamba states before allocating a decode request.
+
+        ``HybridReqToTokenPool.alloc`` allocates the main state and the
+        extra-buffer slots together.  Decode preallocation must therefore
+        reclaim the complete request footprint before entering that method.
+        """
+        if not isinstance(self.req_to_token_pool, HybridReqToTokenPool):
+            return
+
+        mamba_allocator = self.req_to_token_pool.mamba_allocator
+        required_slots = 1  # running request main state
+        if self.req_to_token_pool.enable_mamba_extra_buffer:
+            required_slots += (
+                1
+                if self.req_to_token_pool.enable_mamba_extra_buffer_lazy
+                else self.req_to_token_pool.mamba_ping_pong_track_buffer_size
+            )
+
+        available_slots = mamba_allocator.available_size()
+        shortfall = required_slots - available_slots
+        if shortfall <= 0:
+            return
+
+        if self.tree_cache is None or not self.tree_cache.supports_mamba():
+            logger.warning(
+                "Decode Mamba preallocation is short by %d slot(s), but "
+                "the tree cache cannot evict Mamba states: req=%s "
+                "required=%d available=%d",
+                shortfall,
+                getattr(req, "rid", None),
+                required_slots,
+                available_slots,
+            )
+            return
+
+        evict_result = self.tree_cache.evict(
+            EvictParams(num_tokens=0, mamba_num=shortfall)
+        )
+        available_after = mamba_allocator.available_size()
+        if available_after < required_slots:
+            logger.warning(
+                "Decode Mamba eviction was insufficient: req=%s "
+                "required=%d available_before=%d requested_evict=%d "
+                "evicted=%d available_after=%d mamba_evictable=%d",
+                getattr(req, "rid", None),
+                required_slots,
+                available_slots,
+                shortfall,
+                evict_result.mamba_num_evicted,
+                available_after,
+                self.tree_cache.mamba_evictable_size(),
+            )
+
     def _pre_alloc(
         self,
         req: Req,
@@ -1521,6 +1575,7 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
         if total_prefix_len is None:
             total_prefix_len = prefix_len
 
+        self._evict_for_mamba_request(req)
         req_pool_indices = self.req_to_token_pool.alloc([req])
 
         assert (
