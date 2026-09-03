@@ -1157,6 +1157,36 @@ class UnifiedRadixCache(BasePrefixCache):
     def get_prefix_hash_values(self, node_id: NodeId) -> list[str]:
         return self.tree_core.get_prefix_hash_values(node_id)
 
+    def is_load_back_event_done(self, consumer_index: int) -> bool:
+        """Return True after the local load-back event is complete."""
+        if consumer_index < 0:
+            return True
+        if self.cache_controller is None:
+            return True
+
+        finish_event = self.cache_controller.layer_done_counter.events[
+            consumer_index
+        ].finish_event
+        if not finish_event.query():
+            return False
+
+        self.loading_check()
+        return True
+
+    def query_storage_hit_length(
+        self,
+        last_host_node_id: NodeId,
+        new_input_tokens: list[int],
+        last_hash: Optional[str] = None,
+        prefix_keys: Optional[list[str]] = None,
+    ) -> int:
+        if not self.enable_storage or self.cache_controller is None:
+            return 0
+        raise NotImplementedError(
+            "UnifiedRadixCache.query_storage_hit_length is not implemented for "
+            "enabled HiCache storage yet."
+        )
+
     def prefetch_from_storage(
         self,
         req_id: str,
