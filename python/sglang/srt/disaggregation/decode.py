@@ -25,7 +25,7 @@ import time
 from collections import deque
 from dataclasses import dataclass
 from http import HTTPStatus
-from typing import TYPE_CHECKING, Any, Dict, List, Optional, Tuple
+from typing import TYPE_CHECKING, Any, Callable, Dict, List, Optional, Tuple
 
 import numpy as np
 import torch
@@ -690,7 +690,9 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
             self.kv_manager.register_buffer_to_engine()
 
     def resume_retracted_reqs(
-        self, rids_to_check: Optional[List[str]] = None
+        self,
+        rids_to_check: Optional[List[str]] = None,
+        can_resume: Optional[Callable[[Req], bool]] = None,
     ) -> List[Req]:
         # TODO refactor the scheduling part, reuse with the unified engine logic as much as possible
 
@@ -709,6 +711,8 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
 
         for i, req in enumerate(self.retracted_queue):
             if rids_to_check is not None and req.rid not in rids_to_check:
+                continue
+            if can_resume is not None and not can_resume(req):
                 continue
 
             if self.req_to_token_pool.available_size() <= 0:
@@ -2374,7 +2378,14 @@ class SchedulerDisaggregationDecodeMixin:
             self.decode_offload_manager.check_offload_progress()
 
         # try to resume retracted requests if there are enough space for another `num_reserved_decode_tokens` decode steps
-        resumed_reqs = self.disagg_decode_prealloc_queue.resume_retracted_reqs()
+        can_resume = (
+            self._can_resume_context_engineering_retracted_req
+            if self._context_engineering_scheduler_active()
+            else None
+        )
+        resumed_reqs = self.disagg_decode_prealloc_queue.resume_retracted_reqs(
+            can_resume=can_resume
+        )
         self.waiting_queue.extend(resumed_reqs)
         if len(self.disagg_decode_prealloc_queue.retracted_queue) > 0:
             # if there are still retracted requests, we do not allocate new requests

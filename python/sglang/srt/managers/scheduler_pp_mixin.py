@@ -1435,8 +1435,14 @@ class SchedulerPPMixin:
     def process_retract_queue(self: Scheduler, retract_rids: Optional[List[str]]):
         if retract_rids is not None:
             # try to resume retracted requests if there are enough space for another `num_reserved_decode_tokens` decode steps
+            can_resume = (
+                self._can_resume_context_engineering_retracted_req
+                if self._context_engineering_scheduler_active()
+                else None
+            )
             resumed_reqs = self.disagg_decode_prealloc_queue.resume_retracted_reqs(
-                retract_rids
+                retract_rids,
+                can_resume=can_resume,
             )
             self.waiting_queue.extend(resumed_reqs)
             self._log_context_engineering_resume(

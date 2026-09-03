@@ -898,6 +898,7 @@ class Req(ReqDllmMixin):
         self.custom_labels = custom_labels or {}
         self.context_engineering_kind = self._derive_context_engineering_kind()
         self.context_engineering_pair_key = self._derive_context_engineering_pair_key()
+        self.allow_compact_drain = self._derive_allow_compact_drain()
 
         # Memory pool info
         self.req_pool_idx: Optional[int] = None
@@ -1175,11 +1176,11 @@ class Req(ReqDllmMixin):
     def _derive_context_engineering_pair_key(self) -> Optional[str]:
         labels = self.custom_labels if isinstance(self.custom_labels, dict) else {}
         for key in (
+            "pair_key",
+            "run_id",
             "context_engineering_pair_key",
             "compact_pair_key",
-            "pair_key",
             "session_id",
-            "run_id",
         ):
             value = labels.get(key)
             if value is not None and str(value):
@@ -1187,6 +1188,13 @@ class Req(ReqDllmMixin):
         if self.session_id:
             return str(self.session_id)
         return None
+
+    def _derive_allow_compact_drain(self) -> bool:
+        labels = self.custom_labels if isinstance(self.custom_labels, dict) else {}
+        value = labels.get("allow_compact_drain")
+        if isinstance(value, str):
+            return value.lower() in {"1", "true", "yes"}
+        return bool(value)
 
     def is_context_engineering_main(self) -> bool:
         return self.context_engineering_kind == "main"
@@ -1707,6 +1715,39 @@ class Req(ReqDllmMixin):
         )
         del self.kv_cache_cpu
 
+    def build_rebootstrap_payload(self) -> dict:
+        """Build the prefill request used to resume a PD true retraction."""
+        sp = self.sampling_params
+        return {
+            "input_ids": [int(x) for x in self.origin_input_ids]
+            + [int(x) for x in self.output_ids],
+            "sampling_params": {
+                "max_new_tokens": 1,
+                "temperature": sp.temperature,
+                "top_p": sp.top_p,
+                "top_k": sp.top_k,
+                "min_p": sp.min_p,
+                "frequency_penalty": sp.frequency_penalty,
+                "presence_penalty": sp.presence_penalty,
+                "repetition_penalty": sp.repetition_penalty,
+                "ignore_eos": sp.ignore_eos,
+                "skip_special_tokens": sp.skip_special_tokens,
+                "spaces_between_special_tokens": sp.spaces_between_special_tokens,
+                "no_stop_trim": sp.no_stop_trim,
+            },
+            "return_logprob": False,
+            "stream": False,
+            "rid": self.rid,
+            "bootstrap_host": self.bootstrap_host,
+            "bootstrap_port": self.bootstrap_port,
+            "bootstrap_room": self.bootstrap_room,
+            "priority": self.priority,
+            "extra_key": self.extra_key,
+            "routing_key": self.routing_key,
+            "disagg_prefill_dp_rank": self.disagg_prefill_dp_rank,
+            "custom_labels": dict(getattr(self, "custom_labels", {})),
+        }
+
     def log_time_stats(self):
         # If overlap schedule, we schedule one decode batch ahead so this gets called twice.
         if self.has_log_time_stats:
@@ -1974,6 +2015,7 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
     prefill_stats: Optional[PrefillStats] = None
     forward_iter: Optional[int] = None
     launch_ts: Optional[float] = None
+    finish_ts: Optional[float] = None
 
     # === GPU tensors crossing to ForwardBatch (clone targets for stream isolation) ===
     # Batched arguments to model runner
@@ -2765,13 +2807,13 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
                     if paired_idx is not None:
                         sorted_indices.remove(paired_idx)
                         retract_indices.append(paired_idx)
-            for retract_idx in retract_indices:
+            for retract_idx in sorted(retract_indices, reverse=True):
                 retracted_reqs.append(self.reqs[retract_idx])
                 # release memory and don't insert into the tree because we need the space instantly
                 self.release_req(retract_idx, len(sorted_indices), server_args)
 
         reqs_to_abort: List[Req] = []
-        if len(sorted_indices) <= 1 and not self.check_decode_mem(
+        if sorted_indices and len(sorted_indices) <= 1 and not self.check_decode_mem(
             selected_indices=sorted_indices
         ):
             # Even the last remaining request cannot fit in memory.
@@ -2797,6 +2839,39 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
         )
 
         return retracted_reqs, new_estimate_ratio, reqs_to_abort
+
+    @staticmethod
+    def _get_decode_retraction_order(
+        reqs: List[Req], server_args: ServerArgs
+    ) -> List[int]:
+        """Return indices from most-preferred to least-preferred to keep."""
+        sorted_indices = list(range(len(reqs)))
+
+        def length_key(req: Req) -> Tuple[int, int]:
+            return (len(req.output_ids), -len(req.origin_input_ids))
+
+        if server_args.retraction_policy == "priority":
+            priority_sign = (
+                1 if server_args.schedule_low_priority_values_first else -1
+            )
+
+            def retraction_key(req: Req) -> Tuple[int, int, int]:
+                priority = req.priority
+                if priority is None:
+                    priority = (
+                        sys.maxsize
+                        if server_args.schedule_low_priority_values_first
+                        else -sys.maxsize - 1
+                    )
+                return (priority * (-priority_sign), *length_key(req))
+
+            sorted_indices.sort(
+                key=lambda i: retraction_key(reqs[i]), reverse=True
+            )
+            return sorted_indices
+
+        sorted_indices.sort(key=lambda i: length_key(reqs[i]), reverse=True)
+        return sorted_indices
 
     def release_req(self, idx: int, remaing_req_count: int, server_args: ServerArgs):
         release_req(
@@ -3183,6 +3258,7 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
             fpm_start_time=self.fpm_start_time,
             forward_iter=self.forward_iter,
             launch_ts=self.launch_ts,
+            finish_ts=self.finish_ts,
             extend_num_tokens=self.extend_num_tokens,
         )
 

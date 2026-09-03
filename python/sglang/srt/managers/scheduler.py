@@ -73,6 +73,7 @@ from sglang.srt.disaggregation.decode import (
 from sglang.srt.disaggregation.decode_kvcache_offload_manager import (
     DecodeKVCacheOffloadManager,
 )
+from sglang.srt.managers.disagg_service import maybe_create_ascend_config_store
 from sglang.srt.disaggregation.encode_receiver import create_mm_receiver
 from sglang.srt.disaggregation.prefill import (
     PrefillBootstrapQueue,
@@ -101,6 +102,12 @@ from sglang.srt.layers.quantization.unquant import initialize_bf16_gemm_config
 from sglang.srt.lora.lora_drainer import LoRADrainer
 from sglang.srt.lora.lora_overlap_loader import LoRAOverlapLoader
 from sglang.srt.managers.hisparse_coordinator import HiSparseCoordinator
+from sglang.srt.managers.context_engineering_scheduler import (
+    can_resume_retracted_decode_req,
+    order_prefill_waiting_queue,
+    select_decode_keep_indices,
+    should_try_prefill_request,
+)
 from sglang.srt.managers.io_struct import (
     AbortReq,
     ActiveRanksOutput,
@@ -3140,7 +3147,9 @@ class Scheduler(
             return None, running_batch
 
         # Get priority queue
-        self.policy.calc_priority(self.waiting_queue, self.running_batch)
+        self.policy.calc_priority(self.waiting_queue, running_batch)
+        if self._context_engineering_scheduler_active(self.waiting_queue):
+            self._order_context_engineering_waiting_queue(self.waiting_queue)
 
         if TEST_RETRACT and running_bs > TEST_RETRACT_NO_PREFILL_BS:
             # If we are testing retraction and the running batch size exceeds
@@ -3200,7 +3209,7 @@ class Scheduler(
             if self.enable_lora and not self._can_schedule_lora_req(req, running_loras):
                 continue
 
-            running_bs = len(self.running_batch.reqs)
+            running_bs = len(running_batch.reqs)
             if len(adder.can_run_list) >= self.get_num_allocatable_reqs(running_bs):
                 running_batch.batch_is_full = True
             if self.disaggregation_mode == DisaggregationMode.PREFILL:
@@ -3225,6 +3234,24 @@ class Scheduler(
                 loaded_tokens = self.tree_cache.pop_prefetch_loaded_tokens(req.rid)
                 if loaded_tokens > 0:
                     req.storage_hit_length = loaded_tokens
+
+            if self._context_engineering_scheduler_active(self.waiting_queue):
+                if not should_try_prefill_request(
+                    req,
+                    can_run_reqs=adder.can_run_list,
+                    running_reqs=running_batch.reqs,
+                    waiting_queue=self.waiting_queue,
+                    max_batch_size=(
+                        self.server_args.context_engineering_prefill_max_batch_size
+                    ),
+                    attention_budget=(
+                        self.server_args.context_engineering_prefill_attention_token_budget
+                    ),
+                    compact_attention_cost_ratio=(
+                        self.server_args.context_engineering_compact_attention_cost_ratio
+                    ),
+                ):
+                    continue
 
             req.init_next_round_input(self.tree_cache)
             res = adder.add_one_req(
@@ -3364,6 +3391,12 @@ class Scheduler(
     def _order_context_engineering_waiting_queue(waiting_queue: List[Req]) -> None:
         waiting_queue[:] = order_prefill_waiting_queue(waiting_queue)
 
+    def _can_resume_context_engineering_retracted_req(self, req: Req) -> bool:
+        running_reqs = []
+        if self.running_batch is not None:
+            running_reqs.extend(self.running_batch.reqs)
+        return can_resume_retracted_decode_req(req, running_reqs)
+
     def _can_schedule_lora_req(
         self, req: Req, running_loras: set[Optional[str]]
     ) -> bool:
@@ -3405,6 +3438,15 @@ class Scheduler(
         # become evictable, improving batch scheduling headroom.
         if self.enable_hierarchical_cache:
             self.tree_cache.flush_write_through_acks()
+
+        retracted_reqs = self._retract_compact_decode_over_budget(batch)
+        if retracted_reqs:
+            self.metrics_reporter.num_retracted_reqs = len(retracted_reqs)
+            for req in retracted_reqs:
+                self._add_request_to_queue(req, is_retracted=True)
+            batch.batch_is_full = False
+            if batch.is_empty():
+                return batch
 
         # Check if decode out of memory
         if (kv_full_retract_flag := not batch.check_decode_mem()) or (
@@ -3533,6 +3575,36 @@ class Scheduler(
             batch=batch,
         )
         return retracted_reqs
+
+    def _log_context_engineering_retract(
+        self,
+        *,
+        reason: str,
+        stage: str,
+        retracted_reqs: List[Req],
+        batch: Optional[ScheduleBatch] = None,
+    ) -> None:
+        self.metrics_reporter.log_context_engineering_transition(
+            event="context_engineering_retract",
+            reason=reason,
+            stage=stage,
+            reqs=retracted_reqs,
+            batch=batch,
+        )
+
+    def _log_context_engineering_resume(
+        self,
+        *,
+        reason: str,
+        stage: str,
+        resumed_reqs: List[Req],
+    ) -> None:
+        self.metrics_reporter.log_context_engineering_transition(
+            event="context_engineering_resume",
+            reason=reason,
+            stage=stage,
+            reqs=resumed_reqs,
+        )
 
     def record_batch_in_overlap(self, batch: ScheduleBatch):
         # FIXME(lsyin): hacky way to keep a reference to avoid GPU tensors being freed by torch GC
@@ -3807,6 +3879,7 @@ class Scheduler(
                     can_run_cuda_graph=can_run_cuda_graph,
                 )
 
+        batch.finish_ts = time.monotonic()
         self._maybe_report_active_ranks()
 
         return ret
@@ -3889,7 +3962,6 @@ class Scheduler(
 
         if batch.forward_mode.is_decode():
             self.batch_result_processor.process_batch_result_decode(batch, result)
-            self._retract_compact_after_paired_main_finished(batch)
         elif batch.forward_mode.is_extend():
             if batch.is_dllm():
                 self.process_batch_result_dllm(batch, result)
@@ -3913,6 +3985,32 @@ class Scheduler(
         self._maybe_clear_mm_inputs(batch)
         self.maybe_send_health_check_signal()
         self.metrics_reporter.update_device_timer()
+
+    def _record_step_counters(
+        self, batch: ScheduleBatch, result: GenerationBatchResult
+    ) -> None:
+        mode = batch.forward_mode
+        is_prefill = mode.is_extend_without_speculative()
+        if not (is_prefill or mode.is_decode() or mode.is_target_verify()):
+            return
+        if all(is_health_check_generate_req(req) for req in batch.reqs):
+            return
+        if is_prefill:
+            span_us = int((time.monotonic() - batch.launch_ts) * 1e6)
+            self.total_prefill_busy_us += span_us
+            self.total_prefill_uncached_tokens += batch.extend_num_tokens
+        else:
+            batch_size = len(batch.reqs)
+            if self._prev_decode_launch_ts is not None:
+                step_us = int((batch.launch_ts - self._prev_decode_launch_ts) * 1e6)
+                if 0 < step_us < DECODE_STEP_MAX_US:
+                    _accumulate_decode_moment(
+                        self.decode_moment_totals,
+                        batch_size,
+                        step_us,
+                        batch_size + result.num_correct_drafts,
+                    )
+            self._prev_decode_launch_ts = batch.launch_ts
 
     def maybe_send_health_check_signal(self):
         if self.return_health_check_ipcs:

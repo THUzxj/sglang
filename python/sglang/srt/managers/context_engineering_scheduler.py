@@ -35,6 +35,33 @@ def context_engineering_pair_key(req: Any) -> Optional[str]:
     return str(key) if key is not None and str(key) else None
 
 
+def allow_compact_drain(req: Any) -> bool:
+    value = getattr(req, "allow_compact_drain", False)
+    if isinstance(value, str):
+        return value.lower() in {"1", "true", "yes"}
+    return bool(value)
+
+
+def can_resume_retracted_decode_req(req: Any, running_reqs: Iterable[Any]) -> bool:
+    if not is_context_engineering_compact(req):
+        return True
+
+    running_req_list = list(running_reqs)
+    pair_key = context_engineering_pair_key(req)
+    if pair_key and any(
+        is_context_engineering_main(running_req)
+        and context_engineering_pair_key(running_req) == pair_key
+        for running_req in running_req_list
+    ):
+        return True
+    if allow_compact_drain(req):
+        return not any(
+            is_context_engineering_main(running_req)
+            for running_req in running_req_list
+        )
+    return False
+
+
 def attention_tokens(req: Any) -> int:
     return max(
         int(getattr(req, "kv_committed_len", 0) or 0),
@@ -122,7 +149,27 @@ def select_decode_keep_indices(
         return []
 
     if all(is_context_engineering_compact(req) for req in batch_reqs):
-        return []
+        if not any(allow_compact_drain(req) for req in batch_reqs):
+            return []
+        keep_indices: List[int] = []
+        used_attention_tokens = 0
+        for idx, req in enumerate(batch_reqs):
+            if not allow_compact_drain(req):
+                continue
+            if max_batch_size and len(keep_indices) >= max_batch_size:
+                break
+            tokens = budget_attention_tokens(
+                req,
+                compact_attention_cost_ratio=compact_attention_cost_ratio,
+            )
+            if (
+                attention_budget is not None
+                and used_attention_tokens + tokens > attention_budget
+            ):
+                break
+            keep_indices.append(idx)
+            used_attention_tokens += tokens
+        return keep_indices
 
     keep_indices: List[int] = []
     keep_ids: set[int] = set()

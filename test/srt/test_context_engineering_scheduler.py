@@ -25,6 +25,7 @@ _scheduler = _load_context_engineering_scheduler()
 order_prefill_waiting_queue = _scheduler.order_prefill_waiting_queue
 should_try_prefill_request = _scheduler.should_try_prefill_request
 select_decode_keep_indices = _scheduler.select_decode_keep_indices
+can_resume_retracted_decode_req = _scheduler.can_resume_retracted_decode_req
 select_compact_indices_after_paired_main_finished = (
     _scheduler.select_compact_indices_after_paired_main_finished
 )
@@ -43,6 +44,7 @@ class FakeReq:
     kv_committed_len: int = 0
     finished_reason: object | None = None
     is_retracted: bool = False
+    allow_compact_drain: bool = False
 
     @property
     def rid(self):
@@ -369,6 +371,83 @@ def test_select_decode_keep_indices_retracts_compact_only_without_main():
     )
 
     assert keep == []
+
+
+def test_select_decode_keep_indices_allows_explicit_compact_drain():
+    compact_a = FakeReq(
+        "compact-a",
+        "compact",
+        "a",
+        seqlen=100,
+        allow_compact_drain=True,
+    )
+    compact_b = FakeReq("compact-b", "compact", "b", seqlen=100)
+
+    keep = select_decode_keep_indices(
+        [compact_a, compact_b],
+        [],
+        max_batch_size=256,
+        attention_budget=None,
+    )
+
+    assert keep == [0]
+
+
+def test_select_decode_keep_indices_applies_budget_to_compact_drain():
+    compact_a = FakeReq(
+        "compact-a",
+        "compact",
+        "a",
+        seqlen=100,
+        allow_compact_drain=True,
+    )
+
+    keep = select_decode_keep_indices(
+        [compact_a],
+        [],
+        max_batch_size=256,
+        attention_budget=50,
+    )
+
+    assert keep == []
+
+
+def test_can_resume_retracted_decode_req_allows_non_compact():
+    foreground = FakeReq("foreground")
+
+    assert can_resume_retracted_decode_req(foreground, [])
+
+
+def test_can_resume_retracted_decode_req_requires_running_pair_main_for_compact():
+    main_a = FakeReq("main-a", "main", "a")
+    compact_a = FakeReq("compact-a", "compact", "a")
+    compact_b = FakeReq("compact-b", "compact", "b")
+
+    assert can_resume_retracted_decode_req(compact_a, [main_a])
+    assert not can_resume_retracted_decode_req(compact_b, [main_a])
+
+
+def test_can_resume_retracted_decode_req_allows_compact_drain_without_running_main():
+    compact_a = FakeReq(
+        "compact-a",
+        "compact",
+        "a",
+        allow_compact_drain=True,
+    )
+
+    assert can_resume_retracted_decode_req(compact_a, [])
+
+
+def test_can_resume_retracted_decode_req_holds_compact_drain_behind_running_main():
+    main_b = FakeReq("main-b", "main", "b")
+    compact_a = FakeReq(
+        "compact-a",
+        "compact",
+        "a",
+        allow_compact_drain=True,
+    )
+
+    assert not can_resume_retracted_decode_req(compact_a, [main_b])
 
 
 def test_batch_context_engineering_stats_counts_pairs():

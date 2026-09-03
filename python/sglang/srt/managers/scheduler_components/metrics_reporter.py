@@ -152,6 +152,45 @@ class SchedulerMetricsReporter:
             payload.update(extra)
         logger.info("context_engineering_batch %s", json.dumps(payload, sort_keys=True))
 
+    def log_context_engineering_transition(
+        self,
+        *,
+        event: str,
+        reason: str,
+        stage: str,
+        reqs: list[Req],
+        batch: Optional[ScheduleBatch] = None,
+    ) -> None:
+        if not self.scheduler.server_args.enable_context_engineering_scheduler:
+            return
+        if not reqs:
+            return
+        payload = {
+            "event": event,
+            "reason": reason,
+            "stage": stage,
+            "forward_iter": self.scheduler.forward_ct,
+            "scheduler_enabled": True,
+            "tp_rank": self.tp_rank,
+            "pp_rank": self.pp_rank,
+            "dp_rank": self.dp_rank,
+            "requests": [
+                {
+                    "rid": str(getattr(req, "rid", "")),
+                    "kind": str(getattr(req, "context_engineering_kind", "") or ""),
+                    "pair_key": getattr(req, "context_engineering_pair_key", None),
+                    "seqlen": int(getattr(req, "seqlen", 0) or 0),
+                    "kv_committed_len": int(
+                        getattr(req, "kv_committed_len", 0) or 0
+                    ),
+                }
+                for req in reqs
+            ],
+        }
+        if batch is not None:
+            payload["batch"] = batch_context_engineering_observation(batch.reqs)
+        logger.info("%s %s", event, json.dumps(payload, sort_keys=True))
+
     def _init_metrics(
         self,
         tp_rank: int,
@@ -586,6 +625,13 @@ class SchedulerMetricsReporter:
         self.last_input_throughput = (
             prefill_stats.log_input_tokens / gap_latency if gap_latency > 0 else 0.0
         )
+        batch_start_end_latency = None
+        if (
+            batch is not None
+            and batch.launch_ts is not None
+            and batch.finish_ts is not None
+        ):
+            batch_start_end_latency = batch.finish_ts - batch.launch_ts
 
         pool_stats = self.scheduler.pool_stats_observer.get_pool_stats()
         token_usage_msg = ", ".join(pool_stats.get_prefill_usage_msg_parts()) + ", "
@@ -645,6 +691,9 @@ class SchedulerMetricsReporter:
             )
 
         msg += f"{self._graph_backend_label}: {can_run_cuda_graph}, "
+        msg += f"input-throughput-window (s): {gap_latency:.6f}, "
+        if batch_start_end_latency is not None:
+            msg += f"batch-start-end (s): {batch_start_end_latency:.6f}, "
         msg += f"input throughput (token/s): {self.last_input_throughput:.2f}"
 
         if self.enable_mfu_metrics and gap_latency > 0:
@@ -713,6 +762,10 @@ class SchedulerMetricsReporter:
             )
             self.stats.num_grammar_queue_reqs = len(self.scheduler.grammar_manager)
             self.stats.cache_hit_rate = cache_hit_rate
+            self.stats.prefill_input_throughput_window_s = gap_latency
+            self.stats.prefill_batch_start_end_s = (
+                batch_start_end_latency if batch_start_end_latency is not None else 0.0
+            )
 
             # Memory pool usage ratios / Absolute token counts
             pool_stats.update_scheduler_stats(self.stats)
