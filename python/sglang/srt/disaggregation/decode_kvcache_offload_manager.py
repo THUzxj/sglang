@@ -443,16 +443,20 @@ class DecodeKVCacheOffloadManager:
         # finish, where the request is guaranteed to no longer attend
         # to those slots.
         state = self.offloaded_state.get(req.rid)
+        cache_protected_len = getattr(req, "cache_protected_len", 0)
         if state is not None and state.prefill_len > 0:
+            prefill_free_start = min(cache_protected_len, state.prefill_len)
             prefill_indices = self.req_to_token_pool.req_to_token[
-                req.req_pool_idx, : state.prefill_len
+                req.req_pool_idx, prefill_free_start : state.prefill_len
             ]
-            self.token_to_kv_pool_allocator.free(prefill_indices)
-        start = start_offset
+            self.token_to_kv_pool_allocator.free_segment(
+                prefill_indices, start_pos=prefill_free_start
+            )
+        start = max(start_offset, cache_protected_len)
         end = kv_committed_len
         # Free the incremental part of the request (DSA-aware)
         kv_indices = self.req_to_token_pool.req_to_token[req.req_pool_idx, start:end]
-        self.token_to_kv_pool_allocator.free(kv_indices)
+        self.token_to_kv_pool_allocator.free_segment(kv_indices, start_pos=start)
 
         # Free over-allocated KV cache slots (e.g. from speculative decoding v2).
         # Without spec v2, start_p == end_p so this is a no-op.
@@ -463,7 +467,9 @@ class DecodeKVCacheOffloadManager:
             overalloc_indices = self.req_to_token_pool.req_to_token[
                 req.req_pool_idx, start_p:end_p
             ]
-            self.token_to_kv_pool_allocator.free(overalloc_indices)
+            self.token_to_kv_pool_allocator.free_segment(
+                overalloc_indices, start_pos=start_p
+            )
 
         if (
             self.is_hybrid_linear_kv_pool

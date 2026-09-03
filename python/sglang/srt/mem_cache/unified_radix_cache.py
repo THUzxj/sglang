@@ -31,6 +31,7 @@ from sglang.srt.mem_cache.hicache_storage import (
 )
 from sglang.srt.mem_cache.hybrid_cache.hybrid_cache_controller import (
     HybridCacheController,
+    PrefetchOperation,
 )
 from sglang.srt.mem_cache.radix_cache import RadixKey
 from sglang.srt.mem_cache.unified_cache.cache_action import (
@@ -288,6 +289,9 @@ class UnifiedRadixCache(BasePrefixCache):
         """Full reset: destroy entire tree and all state."""
         self.tree_core.reset()
         self.session_refs.reset()
+        # Compatibility bookkeeping for the legacy decode offload manager.
+        # UnifiedTreeCore owns the real component lock counters.
+        self._legacy_protected_size = 0
 
         # Reset Controller.
         self.session.slots.clear()
@@ -1182,10 +1186,48 @@ class UnifiedRadixCache(BasePrefixCache):
     ) -> int:
         if not self.enable_storage or self.cache_controller is None:
             return 0
-        raise NotImplementedError(
-            "UnifiedRadixCache.query_storage_hit_length is not implemented for "
-            "enabled HiCache storage yet."
+        if self.cache_controller.prefetch_rate_limited():
+            return 0
+
+        extra_key = self.tree_core.prefetch_anchor_info(last_host_node_id)
+        prefetch_key = RadixKey(
+            new_input_tokens,
+            extra_key=extra_key,
+            is_bigram=self.tree_core.is_eagle,
+        ).page_aligned(self.page_size)
+        if len(prefetch_key) < self.prefetch_threshold:
+            return 0
+
+        # Hybrid SSM checkpoints are stored for the trailing page of every
+        # backed-up prefix.  Include that requirement in the synchronous hit
+        # query so decode never reports a restorable KV prefix whose matching
+        # Mamba state is absent.  The key value itself is replaced by the
+        # controller with the hash at the candidate prefix boundary; only its
+        # cardinality is significant here.
+        extra_pools = None
+        if ComponentType.MAMBA in self.tree_components:
+            extra_pools = [
+                PoolTransfer(
+                    name=PoolName.MAMBA,
+                    keys=["__trailing_page__"],
+                    hit_policy=PoolHitPolicy.TRAILING_PAGES,
+                )
+            ]
+
+        operation = PrefetchOperation(
+            "__storage_hit_query__",
+            prefetch_key,
+            last_hash,
+            prefix_keys,
+            pool_transfers=extra_pools,
         )
+        _, storage_hit_count = self.cache_controller._storage_hit_query(operation)
+        storage_hit_count_tensor = torch.tensor(storage_hit_count, dtype=torch.int)
+        self._all_reduce_attn_groups(
+            storage_hit_count_tensor, torch.distributed.ReduceOp.MIN
+        )
+        storage_hit_count = storage_hit_count_tensor.item()
+        return storage_hit_count - (storage_hit_count % self.page_size)
 
     def prefetch_from_storage(
         self,
@@ -1883,6 +1925,10 @@ class UnifiedRadixCache(BasePrefixCache):
                 self._finish_write_through_ack(ack_id)
             finish_count -= 1
 
+    def flush_write_through_acks(self) -> None:
+        """Poll completed write-through acks without blocking the scheduler."""
+        self.writing_check(write_back=False)
+
     def loading_check(self, finish_count: Optional[int] = None) -> None:
         """Poll load-back completions."""
         cc = self.cache_controller
@@ -2075,13 +2121,30 @@ class UnifiedRadixCache(BasePrefixCache):
         return self.session.session_held_mamba_slots(active_pool_idxs)
 
     def evictable_size(self) -> int:
-        return self.tree_core.evictable_size()
+        raw_evictable_size = self.tree_core.evictable_size()
+        try:
+            available_size = self.token_to_kv_pool_allocator.available_size()
+            allocated_size = self.token_to_kv_pool_allocator.size - available_size
+            return max(0, min(raw_evictable_size, allocated_size))
+        except AttributeError:
+            return raw_evictable_size
 
     def protected_size(self) -> int:
         return self.tree_core.protected_size()
 
+    @property
+    def protected_size_(self) -> int:
+        return self._legacy_protected_size
+
+    @protected_size_.setter
+    def protected_size_(self, value: int) -> None:
+        if value < 0:
+            logger.debug("Clamp UnifiedRadixCache protected_size_ from %s to 0", value)
+            value = 0
+        self._legacy_protected_size = value
+
     def full_evictable_size(self) -> int:
-        return self.tree_core.full_evictable_size()
+        return self.evictable_size()
 
     def full_protected_size(self) -> int:
         return self.tree_core.full_protected_size()
@@ -2113,7 +2176,7 @@ class UnifiedRadixCache(BasePrefixCache):
             full_available_size = self.token_to_kv_pool_allocator.full_available_size()
         else:
             full_available_size = self.token_to_kv_pool_allocator.available_size()
-        full_evictable = self.tree_core.component_evictable_size(BASE_COMPONENT_TYPE)
+        full_evictable = self.evictable_size()
         lines = [
             f"Available full tokens: {full_available_size + full_evictable} "
             f"(full_available_size={full_available_size} + full_evictable_size_={full_evictable})"
