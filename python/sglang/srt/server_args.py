@@ -817,6 +817,55 @@ class ServerArgs:
         "The maximum number of requests in a prefill batch. If not specified, there is no limit.",
         NS("schedule"),
     ] = None
+    enable_context_engineering_scheduler: A[
+        bool,
+        "Enable compact-aware scheduling for context-engineering workloads. Main requests are scheduled before compact requests, and paired compact requests are admitted only with remaining budget.",
+        NS("schedule"),
+    ] = False
+    context_engineering_decode_attention_token_budget: A[
+        Optional[int],
+        Arg(
+            help=(
+                "Maximum sum of decode attention tokens for compact-aware decode batches. "
+                "If unset, only the batch-size budget is enforced."
+            ),
+            type_parser=human_readable_int,
+        ),
+        NS("schedule"),
+    ] = None
+    context_engineering_prefill_attention_token_budget: A[
+        Optional[int],
+        Arg(
+            help=(
+                "Maximum sum of prefill-batch attention tokens for compact-aware "
+                "prefill admission. Main/foreground requests are admitted by the "
+                "normal scheduler; compact requests can use only the remaining budget."
+            ),
+            type_parser=human_readable_int,
+        ),
+        NS("schedule"),
+    ] = None
+    context_engineering_decode_max_batch_size: A[
+        int,
+        "Maximum decode batch size for compact-aware scheduling.",
+        NS("schedule"),
+    ] = 256
+    context_engineering_prefill_max_batch_size: A[
+        int,
+        "Maximum prefill batch size for compact-aware compact admission.",
+        NS("schedule"),
+    ] = 256
+    context_engineering_compact_attention_cost_ratio: A[
+        float,
+        Arg(
+            help=(
+                "Multiplier applied to compact requests when accounting "
+                "compact-aware prefill/decode attention-token budgets. "
+                "This changes scheduler admission only, not the actual model work."
+            ),
+        ),
+        NS("schedule"),
+    ] = 1.0
     schedule_policy: A[
         str,
         Arg(

@@ -15,6 +15,7 @@
 
 import dataclasses
 import faulthandler
+import json
 import logging
 import os
 import signal
@@ -99,7 +100,6 @@ from sglang.srt.layers.quantization.fp8_utils import initialize_fp8_gemm_config
 from sglang.srt.layers.quantization.unquant import initialize_bf16_gemm_config
 from sglang.srt.lora.lora_drainer import LoRADrainer
 from sglang.srt.lora.lora_overlap_loader import LoRAOverlapLoader
-from sglang.srt.managers.disagg_service import maybe_create_ascend_config_store
 from sglang.srt.managers.hisparse_coordinator import HiSparseCoordinator
 from sglang.srt.managers.io_struct import (
     AbortReq,
@@ -2359,6 +2359,7 @@ class Scheduler(
                 ),
                 routing_key=recv_req.routing_key,
                 extra_key=recv_req.extra_key,
+                custom_labels=recv_req.custom_labels,
                 http_worker_ipc=recv_req.http_worker_ipc,
                 dllm_config=self.dllm_config,
                 time_stats=recv_req.time_stats,
@@ -3139,7 +3140,7 @@ class Scheduler(
             return None, running_batch
 
         # Get priority queue
-        self.policy.calc_priority(self.waiting_queue, running_batch)
+        self.policy.calc_priority(self.waiting_queue, self.running_batch)
 
         if TEST_RETRACT and running_bs > TEST_RETRACT_NO_PREFILL_BS:
             # If we are testing retraction and the running batch size exceeds
@@ -3199,7 +3200,7 @@ class Scheduler(
             if self.enable_lora and not self._can_schedule_lora_req(req, running_loras):
                 continue
 
-            running_bs = len(running_batch.reqs)
+            running_bs = len(self.running_batch.reqs)
             if len(adder.can_run_list) >= self.get_num_allocatable_reqs(running_bs):
                 running_batch.batch_is_full = True
             if self.disaggregation_mode == DisaggregationMode.PREFILL:
@@ -3261,6 +3262,8 @@ class Scheduler(
                             req.mamba_pool_idx.unsqueeze(-1)
                         )
                         req.mamba_pool_idx = None
+                    if req.is_context_engineering_compact():
+                        continue
                 break
 
         if mamba_allocator is not None:
@@ -3352,6 +3355,15 @@ class Scheduler(
 
         return new_batch, running_batch
 
+    def _context_engineering_scheduler_active(
+        self, reqs: Optional[List[Req]] = None
+    ) -> bool:
+        return bool(self.server_args.enable_context_engineering_scheduler)
+
+    @staticmethod
+    def _order_context_engineering_waiting_queue(waiting_queue: List[Req]) -> None:
+        waiting_queue[:] = order_prefill_waiting_queue(waiting_queue)
+
     def _can_schedule_lora_req(
         self, req: Req, running_loras: set[Optional[str]]
     ) -> bool:
@@ -3388,6 +3400,11 @@ class Scheduler(
         if batch.is_empty():
             batch.batch_is_full = False
             return batch
+
+        # Eagerly release lock_ref on completed write-through nodes so they
+        # become evictable, improving batch scheduling headroom.
+        if self.enable_hierarchical_cache:
+            self.tree_cache.flush_write_through_acks()
 
         # Check if decode out of memory
         if (kv_full_retract_flag := not batch.check_decode_mem()) or (
@@ -3464,6 +3481,58 @@ class Scheduler(
         # Update batch tensors
         batch.prepare_for_decode()
         return batch
+
+    def _retract_compact_decode_over_budget(self, batch: ScheduleBatch) -> List[Req]:
+        if not self._context_engineering_scheduler_active(batch.reqs):
+            return []
+
+        compact_only = bool(batch.reqs) and all(
+            req.is_context_engineering_compact() for req in batch.reqs
+        )
+        keep_indices = select_decode_keep_indices(
+            batch.reqs,
+            self.waiting_queue,
+            max_batch_size=self.server_args.context_engineering_decode_max_batch_size,
+            attention_budget=(
+                self.server_args.context_engineering_decode_attention_token_budget
+            ),
+            compact_attention_cost_ratio=(
+                self.server_args.context_engineering_compact_attention_cost_ratio
+            ),
+        )
+        if len(keep_indices) == len(batch.reqs):
+            return []
+
+        keep_set = set(keep_indices)
+        retracted_reqs = [
+            req
+            for idx, req in enumerate(batch.reqs)
+            if idx not in keep_set and req.is_context_engineering_compact()
+        ]
+        if not retracted_reqs:
+            return []
+
+        for idx in range(len(batch.reqs) - 1, -1, -1):
+            if idx in keep_set:
+                continue
+            req = batch.reqs[idx]
+            if req.is_context_engineering_compact():
+                batch.release_req(idx, len(keep_indices), self.server_args)
+
+        batch.filter_batch(keep_indices=keep_indices)
+        reason = "no_main" if compact_only else "decode_budget"
+        logger.debug(
+            "Context-engineering %s retracted %d compact requests.",
+            reason,
+            len(retracted_reqs),
+        )
+        self._log_context_engineering_retract(
+            reason=reason,
+            stage="decode",
+            retracted_reqs=retracted_reqs,
+            batch=batch,
+        )
+        return retracted_reqs
 
     def record_batch_in_overlap(self, batch: ScheduleBatch):
         # FIXME(lsyin): hacky way to keep a reference to avoid GPU tensors being freed by torch GC
@@ -3820,6 +3889,7 @@ class Scheduler(
 
         if batch.forward_mode.is_decode():
             self.batch_result_processor.process_batch_result_decode(batch, result)
+            self._retract_compact_after_paired_main_finished(batch)
         elif batch.forward_mode.is_extend():
             if batch.is_dllm():
                 self.process_batch_result_dllm(batch, result)
@@ -3843,33 +3913,6 @@ class Scheduler(
         self._maybe_clear_mm_inputs(batch)
         self.maybe_send_health_check_signal()
         self.metrics_reporter.update_device_timer()
-
-    def _record_step_counters(
-        self, batch: ScheduleBatch, result: GenerationBatchResult
-    ) -> None:
-        mode = batch.forward_mode
-        is_prefill = mode.is_extend_without_speculative()
-        if not (is_prefill or mode.is_decode() or mode.is_target_verify()):
-            return
-        if all(is_health_check_generate_req(req) for req in batch.reqs):
-            return
-        if is_prefill:
-            # Busy span = run_batch entry -> result processed.
-            span_us = int((time.monotonic() - batch.launch_ts) * 1e6)
-            self.total_prefill_busy_us += span_us
-            self.total_prefill_uncached_tokens += batch.extend_num_tokens
-        else:
-            batch_size = len(batch.reqs)
-            if self._prev_decode_launch_ts is not None:
-                step_us = int((batch.launch_ts - self._prev_decode_launch_ts) * 1e6)
-                if 0 < step_us < DECODE_STEP_MAX_US:
-                    _accumulate_decode_moment(
-                        self.decode_moment_totals,
-                        batch_size,
-                        step_us,
-                        batch_size + result.num_correct_drafts,
-                    )
-            self._prev_decode_launch_ts = batch.launch_ts
 
     def maybe_send_health_check_signal(self):
         if self.return_health_check_ipcs:

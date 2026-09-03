@@ -1345,6 +1345,13 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
             session_params = (
                 SessionParams(**obj.session_params) if obj.session_params else None
             )
+            custom_labels = obj.custom_labels
+            if custom_labels is None and isinstance(obj.metadata, dict):
+                custom_labels = {
+                    str(key): str(value)
+                    for key, value in obj.metadata.items()
+                    if value is not None
+                }
 
             bootstrap_room = obj.bootstrap_room
             if (
@@ -1386,6 +1393,7 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
                 disagg_prefill_dp_rank=obj.disagg_prefill_dp_rank,
                 priority=obj.priority,
                 extra_key=obj.extra_key,
+                custom_labels=custom_labels,
                 routing_key=obj.routing_key,
                 token_type_ids=token_type_ids,
                 need_wait_for_mm_inputs=obj.need_wait_for_mm_inputs,
