@@ -70,6 +70,8 @@ class SchedulerStats:
     gen_throughput: float = 0.0
     cache_hit_rate: float = 0.0
     decode_sum_seq_lens: int = 0
+    prefill_input_throughput_window_s: float = 0.0
+    prefill_batch_start_end_s: float = 0.0
 
     # Memory pool usage ratios (0.0–1.0).
     # Each pool tracks: used = total - available - evictable, usage = used / total.
@@ -299,6 +301,24 @@ class SchedulerMetricsCollector(_StatLoggerDIMixin):
         self.decode_sum_seq_lens = Gauge(
             name="sglang:decode_sum_seq_lens",
             documentation="The sum of all sequence lengths in decode.",
+            labelnames=labels.keys(),
+            multiprocess_mode="mostrecent",
+        )
+        self.prefill_input_throughput_window_s = Gauge(
+            name="sglang:prefill_input_throughput_window_s",
+            documentation=(
+                "The wall-clock window used to compute the most recent prefill "
+                "input throughput."
+            ),
+            labelnames=labels.keys(),
+            multiprocess_mode="mostrecent",
+        )
+        self.prefill_batch_start_end_s = Gauge(
+            name="sglang:prefill_batch_start_end_s",
+            documentation=(
+                "The elapsed time between scheduler.run_batch start and finish "
+                "for the most recent prefill batch."
+            ),
             labelnames=labels.keys(),
             multiprocess_mode="mostrecent",
         )
@@ -1291,6 +1311,14 @@ class SchedulerMetricsCollector(_StatLoggerDIMixin):
         self._log_gauge(self.gen_throughput, stats.gen_throughput)
         self._log_gauge(self.cache_hit_rate, stats.cache_hit_rate)
         self._log_gauge(self.decode_sum_seq_lens, stats.decode_sum_seq_lens)
+        self._log_gauge(
+            self.prefill_input_throughput_window_s,
+            stats.prefill_input_throughput_window_s,
+        )
+        self._log_gauge(
+            self.prefill_batch_start_end_s,
+            stats.prefill_batch_start_end_s,
+        )
 
         # Memory pool usage ratios
         self._log_gauge(self.token_usage, stats.token_usage)

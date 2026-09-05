@@ -2843,7 +2843,13 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
         custom_labels = getattr(state.obj, "custom_labels", None)
         labels = dict(self.metrics_collector.labels)
         if custom_labels:
-            labels.update(custom_labels)
+            labels.update(
+                {
+                    key: value
+                    for key, value in custom_labels.items()
+                    if key in self.metrics_collector.labels
+                }
+            )
         if self.enable_priority_scheduling:
             priority = getattr(state.obj, "priority", None)
             if priority is not None:
