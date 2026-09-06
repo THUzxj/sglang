@@ -2289,6 +2289,8 @@ class SchedulerDisaggregationDecodeMixin:
                 else:
                     running_batch.merge_batch(new_prebuilt_batch)
 
+        running_batch = self._resume_paused_compacts(running_batch)
+
         # Schedule decode batch
         if running_batch.is_empty():
             ret = None

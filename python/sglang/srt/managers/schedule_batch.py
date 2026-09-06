@@ -991,6 +991,9 @@ class Req(ReqDllmMixin):
 
         # For retraction
         self.is_retracted = False
+        # GPU-resident pair-scheduler pause. Unlike retraction, this preserves
+        # req_pool_idx, KV mappings, and decode progress.
+        self.is_context_engineering_paused = False
         # Indicates if the req has ever been retracted.
         self.retracted_stain = False
 
@@ -2769,48 +2772,97 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
         return self.token_to_kv_pool_allocator.available_size() >= num_tokens
 
     def retract_decode(
-        self, server_args: ServerArgs
+        self,
+        server_args: ServerArgs,
+        preferred_pair_key: Optional[str] = None,
     ) -> Tuple[List[Req], float, List[Req]]:
         """Retract the decoding requests when there is not enough memory."""
         sorted_indices = self._get_decode_retraction_order(self.reqs, server_args)
 
         retracted_reqs = []
         first_iter = True
+        # If retracting the compact side of a pair did not free enough KV,
+        # retract the matching main before moving to another pair. This makes
+        # pair eviction gradual (width 1 or 2) instead of unconditionally
+        # evicting both physical requests.
+        continue_pair_key = preferred_pair_key
         while first_iter or (
             not self.check_decode_mem(selected_indices=sorted_indices)
         ):
-            if len(sorted_indices) == 1:
-                # Always keep at least one request
+            if not sorted_indices:
                 break
 
             first_iter = False
-            idx = sorted_indices.pop()
-            req = self.reqs[idx]
-            retract_indices = [idx]
-            # Context-engineering main and its compact are admitted as a decode
-            # pair. Retract the pair atomically so neither side keeps the
-            # other's shared prefix resident.
-            if server_args.enable_pair_scheduler and req.is_context_engineering_request():
-                pair_key = req.context_engineering_pair_key
+            idx = None
+            if continue_pair_key is not None:
+                idx = next(
+                    (
+                        candidate
+                        for candidate in reversed(sorted_indices)
+                        if self.reqs[candidate].context_engineering_pair_key
+                        == continue_pair_key
+                    ),
+                    None,
+                )
+
+            if idx is None:
+                idx = sorted_indices[-1]
+                candidate_req = self.reqs[idx]
+                pair_key = (
+                    candidate_req.context_engineering_pair_key
+                    if server_args.enable_pair_scheduler
+                    and candidate_req.is_context_engineering_request()
+                    else None
+                )
+                # Compact is background work. When the selected victim belongs
+                # to a live pair, retract compact first and re-check memory
+                # before disturbing main.
                 if pair_key:
-                    paired_idx = next(
+                    idx = next(
                         (
                             candidate
                             for candidate in reversed(sorted_indices)
-                            if self.reqs[candidate].context_engineering_pair_key == pair_key
-                            and self.reqs[candidate].is_context_engineering_request()
-                            and self.reqs[candidate].is_context_engineering_main()
-                            != req.is_context_engineering_main()
+                            if self.reqs[candidate].context_engineering_pair_key
+                            == pair_key
+                            and self.reqs[candidate].is_context_engineering_compact()
                         ),
-                        None,
+                        idx,
                     )
-                    if paired_idx is not None:
-                        sorted_indices.remove(paired_idx)
-                        retract_indices.append(paired_idx)
-            for retract_idx in sorted(retract_indices, reverse=True):
-                retracted_reqs.append(self.reqs[retract_idx])
-                # release memory and don't insert into the tree because we need the space instantly
-                self.release_req(retract_idx, len(sorted_indices), server_args)
+
+            req = self.reqs[idx]
+            pair_key = (
+                req.context_engineering_pair_key
+                if server_args.enable_pair_scheduler
+                and req.is_context_engineering_request()
+                else None
+            )
+            pair_members_remaining = [
+                candidate
+                for candidate in sorted_indices
+                if candidate != idx
+                and pair_key is not None
+                and self.reqs[candidate].context_engineering_pair_key == pair_key
+                and self.reqs[candidate].is_context_engineering_request()
+            ]
+
+            # Preserve the generic scheduler's last-request safeguard. Pair
+            # continuation and a lone compact may be retracted to an empty
+            # batch because both have a recoverable queue path.
+            if (
+                len(sorted_indices) == 1
+                and continue_pair_key is None
+                and not req.is_context_engineering_compact()
+            ):
+                break
+
+            sorted_indices.remove(idx)
+            req = self.reqs[idx]
+            retracted_reqs.append(req)
+            # Release memory and don't insert into the tree because we need the
+            # space instantly. In PD decode this remains the real CPU-offload
+            # retraction path; GPU-resident parking never calls this method.
+            self.release_req(idx, len(sorted_indices), server_args)
+            continue_pair_key = pair_key if pair_members_remaining else None
 
         reqs_to_abort: List[Req] = []
         if sorted_indices and len(sorted_indices) <= 1 and not self.check_decode_mem(

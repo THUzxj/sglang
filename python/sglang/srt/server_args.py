@@ -822,6 +822,18 @@ class ServerArgs:
         "Enable pair scheduling for context-engineering workloads. Main requests are scheduled before compact requests, and paired compact requests are admitted only with remaining budget.",
         NS("schedule"),
     ] = False
+    context_engineering_compact_pause_mode: A[
+        Literal["retract", "gpu_resident"],
+        Arg(
+            help=(
+                "How pair scheduling pauses compact decode requests. 'retract' "
+                "uses the normal KV release/offload path; 'gpu_resident' parks "
+                "the request outside the running batch while retaining GPU KV."
+            ),
+            choices=["retract", "gpu_resident"],
+        ),
+        NS("schedule"),
+    ] = "retract"
     context_engineering_decode_attention_token_budget: A[
         Optional[int],
         Arg(

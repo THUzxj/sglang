@@ -197,6 +197,7 @@ from sglang.srt.managers.schedule_batch import (
     NextBatchPlan,
     Req,
     ScheduleBatch,
+    release_req,
     retract_all,
 )
 from sglang.srt.managers.schedule_policy import (
@@ -1122,6 +1123,10 @@ class Scheduler(
         # Set by the ShutdownReq handler to break the event loop for graceful shutdown.
         self.gracefully_exit = False
         self.waiting_queue: List[Req] = []
+        # Compact decode requests parked without releasing or offloading their
+        # GPU KV. This queue is intentionally separate from both the fresh
+        # prefill waiting queue and PD decode's CPU-backed retracted queue.
+        self.paused_compact_queue: List[Req] = []
         # The running decoding batch for continuous batching
         self.running_batch: ScheduleBatch = ScheduleBatch(reqs=[], batch_is_full=False)
         # The current forward batch
@@ -2064,6 +2069,7 @@ class Scheduler(
             spec_algorithm=self.spec_algorithm,
             get_running_batch=lambda: self.running_batch,
             get_waiting_queue=lambda: self.waiting_queue,
+            get_paused_compact_queue=lambda: self.paused_compact_queue,
             get_stats=lambda: self.metrics_reporter.stats,
             get_chunked_req=lambda: self.chunked_req,
             get_disagg_prefill_bootstrap_queue=lambda: self.disagg_prefill_bootstrap_queue,
@@ -2929,6 +2935,125 @@ class Scheduler(
         # todo hisparse, maybe other info to contain for the new batch
         return batch
 
+    def _build_gpu_resident_decode_batch(self, reqs: List[Req]) -> ScheduleBatch:
+        """Rebuild decode batch metadata for requests whose KV stayed on GPU."""
+        batch = ScheduleBatch.init_new(
+            reqs=reqs,
+            req_to_token_pool=self.req_to_token_pool,
+            token_to_kv_pool_allocator=self.token_to_kv_pool_allocator,
+            tree_cache=self.tree_cache,
+            model_config=self.model_config,
+            enable_overlap=self.enable_overlap,
+            spec_algorithm=self.spec_algorithm,
+        )
+
+        req_pool_indices = [req.req_pool_idx for req in reqs]
+        assert all(index is not None for index in req_pool_indices)
+        batch.req_pool_indices = torch.tensor(
+            req_pool_indices, dtype=torch.int64, device=self.device
+        )
+        batch.req_pool_indices_cpu = torch.tensor(req_pool_indices, dtype=torch.int64)
+        seq_lens = [int(req.kv_committed_len) for req in reqs]
+        batch.seq_lens = torch.tensor(seq_lens, dtype=torch.int64, device=self.device)
+        batch.seq_lens_cpu = torch.tensor(seq_lens, dtype=torch.int64)
+        batch.orig_seq_lens = torch.tensor(
+            seq_lens, dtype=torch.int32, device=self.device
+        )
+        batch.seq_lens_sum = sum(seq_lens)
+        # Multimodal-capable model runners require one list entry per request
+        # even for text-only requests (whose entry is None).
+        batch.multimodal_inputs = [req.multimodal_inputs for req in reqs]
+
+        # The sampled-but-not-yet-committed token is the next decode input.
+        last_tokens = [
+            req.output_ids[-1] if req.output_ids else req.origin_input_ids[-1]
+            for req in reqs
+        ]
+        self.future_map.stash(
+            batch.req_pool_indices,
+            RelayPayload(
+                bonus_tokens=torch.tensor(
+                    last_tokens, dtype=torch.int64, device=self.device
+                )
+            ),
+        )
+        batch.input_ids = None
+        if batch.return_logprob:
+            batch.top_logprobs_nums = [req.logprob.top_logprobs_num for req in reqs]
+            batch.token_ids_logprobs = [list(req.origin_input_ids) for req in reqs]
+        batch.sampling_info = SamplingBatchInfo.from_schedule_batch(
+            batch, self.model_config.vocab_size
+        )
+        return batch
+
+    def _resume_paused_compacts(
+        self, running_batch: ScheduleBatch
+    ) -> ScheduleBatch:
+        if not self._gpu_resident_compact_pause_enabled():
+            return running_batch
+        if not self.paused_compact_queue:
+            return running_batch
+
+        runnable = [
+            req
+            for req in self.paused_compact_queue
+            if can_resume_retracted_decode_req(req, running_batch.reqs)
+            and req.req_pool_idx is not None
+        ]
+        if not runnable:
+            return running_batch
+
+        available_batch_slots = max(
+            0, self.max_running_requests - len(running_batch.reqs)
+        )
+        runnable = runnable[:available_batch_slots]
+        if not runnable:
+            return running_batch
+
+        combined_reqs = running_batch.reqs + runnable
+        keep_indices = select_decode_keep_indices(
+            combined_reqs,
+            self.waiting_queue,
+            max_batch_size=(
+                self.server_args.context_engineering_decode_max_batch_size
+            ),
+            attention_budget=(
+                self.server_args.context_engineering_decode_attention_token_budget
+            ),
+            compact_attention_cost_ratio=(
+                self.server_args.context_engineering_compact_attention_cost_ratio
+            ),
+        )
+        running_len = len(running_batch.reqs)
+        keep_set = set(keep_indices)
+        resumed_reqs = [
+            req
+            for offset, req in enumerate(runnable, start=running_len)
+            if offset in keep_set
+        ]
+        if not resumed_reqs:
+            return running_batch
+
+        resumed_ids = {id(req) for req in resumed_reqs}
+        self.paused_compact_queue = [
+            req for req in self.paused_compact_queue if id(req) not in resumed_ids
+        ]
+        for req in resumed_reqs:
+            req.is_context_engineering_paused = False
+
+        resumed_batch = self._build_gpu_resident_decode_batch(resumed_reqs)
+        if running_batch.is_empty():
+            running_batch = resumed_batch
+        else:
+            running_batch.merge_batch(resumed_batch)
+        running_batch.batch_is_full = False
+        self._log_context_engineering_resume(
+            reason="gpu_resident_pause",
+            stage="decode",
+            resumed_reqs=resumed_reqs,
+        )
+        return running_batch
+
     @scheduler_nvtx_method("scheduler.get_next_batch_to_run")
     def get_next_batch_to_run(
         self, running_batch: ScheduleBatch, last_batch: Optional[ScheduleBatch]
@@ -3018,6 +3143,8 @@ class Scheduler(
             running_batch.filter_batch()
             if running_batch.is_empty():
                 running_batch.batch_is_full = False
+
+        running_batch = self._resume_paused_compacts(running_batch)
 
         if self.dllm_config is not None:
             new_batch = self.get_new_batch_dllm(running_batch)
@@ -3387,6 +3514,13 @@ class Scheduler(
     ) -> bool:
         return bool(self.server_args.enable_pair_scheduler)
 
+    def _gpu_resident_compact_pause_enabled(self) -> bool:
+        return bool(
+            self.server_args.enable_pair_scheduler
+            and self.server_args.context_engineering_compact_pause_mode
+            == "gpu_resident"
+        )
+
     @staticmethod
     def _order_context_engineering_waiting_queue(waiting_queue: List[Req]) -> None:
         waiting_queue[:] = order_prefill_waiting_queue(waiting_queue)
@@ -3425,6 +3559,51 @@ class Scheduler(
                 new_lora_set
             )
 
+    def _retract_paused_compact_for_kv_pressure(
+        self, batch: ScheduleBatch
+    ) -> Tuple[List[Req], Optional[str]]:
+        """Retract one GPU-paused compact, preferring a live pair in batch."""
+        if not self.paused_compact_queue:
+            return [], None
+
+        paused_by_pair = {
+            req.context_engineering_pair_key: req
+            for req in self.paused_compact_queue
+            if req.context_engineering_pair_key
+        }
+        victim = None
+        preferred_pair_key = None
+        for idx in reversed(
+            batch._get_decode_retraction_order(batch.reqs, self.server_args)
+        ):
+            pair_key = batch.reqs[idx].context_engineering_pair_key
+            if pair_key in paused_by_pair:
+                victim = paused_by_pair[pair_key]
+                preferred_pair_key = pair_key
+                break
+        if victim is None:
+            victim = self.paused_compact_queue[-1]
+            preferred_pair_key = victim.context_engineering_pair_key
+
+        self.paused_compact_queue.remove(victim)
+        victim.is_context_engineering_paused = False
+        release_req(
+            req=victim,
+            remaing_req_count=len(batch.reqs),
+            server_args=self.server_args,
+            req_to_token_pool=self.req_to_token_pool,
+            token_to_kv_pool_allocator=self.token_to_kv_pool_allocator,
+            tree_cache=self.tree_cache,
+            hisparse_coordinator=self.hisparse_coordinator,
+        )
+        self._log_context_engineering_retract(
+            reason="kv_pressure_paused_compact",
+            stage="decode",
+            retracted_reqs=[victim],
+            batch=batch,
+        )
+        return [victim], preferred_pair_key
+
     def update_running_batch(self, batch: ScheduleBatch) -> Optional[ScheduleBatch]:
         """Update the current running decoding batch."""
         initial_bs = batch.batch_size()
@@ -3462,9 +3641,32 @@ class Scheduler(
                 if mamba_allocator is not None
                 else None
             )
-            retracted_reqs, new_token_ratio, reqs_to_abort = batch.retract_decode(
-                self.server_args
-            )
+            paused_retracted_reqs = []
+            preferred_pair_key = None
+            if kv_full_retract_flag and self._gpu_resident_compact_pause_enabled():
+                (
+                    paused_retracted_reqs,
+                    preferred_pair_key,
+                ) = self._retract_paused_compact_for_kv_pressure(batch)
+
+            if kv_full_retract_flag and batch.check_decode_mem():
+                retracted_reqs = paused_retracted_reqs
+                new_token_ratio = (
+                    NewTokenRatioTracker.estimate_new_token_ratio_after_retract(
+                        batch.reqs
+                    )
+                )
+                reqs_to_abort = []
+            else:
+                (
+                    batch_retracted_reqs,
+                    new_token_ratio,
+                    reqs_to_abort,
+                ) = batch.retract_decode(
+                    self.server_args,
+                    preferred_pair_key=preferred_pair_key,
+                )
+                retracted_reqs = paused_retracted_reqs + batch_retracted_reqs
             new_available_tokens = self.token_to_kv_pool_allocator.available_size()
             new_token_gained = new_available_tokens - old_available_tokens
             mamba_num_gained = (
@@ -3554,6 +3756,32 @@ class Scheduler(
         if not retracted_reqs:
             return []
 
+        reason = "no_main" if compact_only else "decode_budget"
+        if self._gpu_resident_compact_pause_enabled():
+            paused_ids = {id(req) for req in self.paused_compact_queue}
+            for req in retracted_reqs:
+                if id(req) in paused_ids:
+                    raise AssertionError(
+                        f"Compact request {req.rid} is already GPU-paused"
+                    )
+                req.is_context_engineering_paused = True
+                self.paused_compact_queue.append(req)
+            self.metrics_reporter.num_paused_reqs += len(retracted_reqs)
+            batch.filter_batch(keep_indices=keep_indices)
+            logger.debug(
+                "Context-engineering %s GPU-paused %d compact requests.",
+                reason,
+                len(retracted_reqs),
+            )
+            self.metrics_reporter.log_context_engineering_transition(
+                event="context_engineering_park",
+                reason=reason,
+                stage="decode",
+                reqs=retracted_reqs,
+                batch=batch,
+            )
+            return []
+
         for idx in range(len(batch.reqs) - 1, -1, -1):
             if idx in keep_set:
                 continue
@@ -3562,7 +3790,6 @@ class Scheduler(
                 batch.release_req(idx, len(keep_indices), self.server_args)
 
         batch.filter_batch(keep_indices=keep_indices)
-        reason = "no_main" if compact_only else "decode_budget"
         logger.debug(
             "Context-engineering %s retracted %d compact requests.",
             reason,
@@ -4123,6 +4350,7 @@ class Scheduler(
 
         # Waiting queues: waiting + bootstrapping + preallocation + kv transfer (decode)
         idle &= len(self.waiting_queue) == 0
+        idle &= len(self.paused_compact_queue) == 0
 
         if (
             for_health_check
@@ -4469,6 +4697,19 @@ class Scheduler(
             if recv_req.abort_all or chunked_req.rid.startswith(recv_req.rid):
                 self._pending_chunked_abort_req = chunked_req
 
+        remaining_paused_compacts = []
+        for req in self.paused_compact_queue:
+            if recv_req.abort_all or req.rid.startswith(recv_req.rid):
+                req.is_context_engineering_paused = False
+                release_kv_cache(req, self.tree_cache, is_insert=False)
+                self.ipc_channels.send_to_tokenizer.send_output(
+                    AbortReq(rid=req.rid), req
+                )
+                logger.debug(f"Abort GPU-paused compact request. {req.rid=}")
+            else:
+                remaining_paused_compacts.append(req)
+        self.paused_compact_queue = remaining_paused_compacts
+
         # todo hisparse, release resources for abort requests in hisparse coordinator
         # Delete requests in the waiting queue
         to_del = []
@@ -4641,6 +4882,13 @@ class Scheduler(
             and self.disaggregation_mode != DisaggregationMode.PREFILL
         ):
             retract_reqs.append(self.chunked_req)
+
+        if self.paused_compact_queue:
+            for req in self.paused_compact_queue:
+                req.is_context_engineering_paused = False
+                if req not in retract_reqs:
+                    retract_reqs.append(req)
+            self.paused_compact_queue = []
 
         self.last_batch = None
         self.cur_batch_for_debug = None
