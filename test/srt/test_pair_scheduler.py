@@ -3,17 +3,17 @@ from dataclasses import dataclass
 from pathlib import Path
 
 
-def _load_context_engineering_scheduler():
+def _load_pair_scheduler():
     module_path = (
         Path(__file__).resolve().parents[2]
         / "python"
         / "sglang"
         / "srt"
         / "managers"
-        / "context_engineering_scheduler.py"
+        / "pair_scheduler.py"
     )
     spec = importlib.util.spec_from_file_location(
-        "context_engineering_scheduler", module_path
+        "pair_scheduler", module_path
     )
     module = importlib.util.module_from_spec(spec)
     assert spec.loader is not None
@@ -21,7 +21,7 @@ def _load_context_engineering_scheduler():
     return module
 
 
-_scheduler = _load_context_engineering_scheduler()
+_scheduler = _load_pair_scheduler()
 order_prefill_waiting_queue = _scheduler.order_prefill_waiting_queue
 should_try_prefill_request = _scheduler.should_try_prefill_request
 select_decode_keep_indices = _scheduler.select_decode_keep_indices

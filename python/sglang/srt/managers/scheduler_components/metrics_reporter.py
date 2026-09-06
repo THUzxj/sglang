@@ -19,7 +19,7 @@ from typing import (
 
 from sglang.srt.disaggregation.utils import DisaggregationMode
 from sglang.srt.environ import envs
-from sglang.srt.managers.context_engineering_scheduler import (
+from sglang.srt.managers.pair_scheduler import (
     batch_context_engineering_observation,
     batch_context_engineering_stats,
 )
@@ -129,9 +129,9 @@ class SchedulerMetricsReporter:
     ) -> None:
         # The structured batch event describes compact-aware (joint) scheduling
         # decisions. Normal/background scheduler runs may still carry the same
-        # request metadata, but must not emit this event as if CE scheduling was
+        # request metadata, but must not emit this event as if pair scheduling was
         # active.
-        if not self.scheduler.server_args.enable_context_engineering_scheduler:
+        if not self.scheduler.server_args.enable_pair_scheduler:
             return
         observation = batch_context_engineering_observation(batch.reqs)
         if not observation["main"] and not observation["compact"]:
@@ -140,8 +140,8 @@ class SchedulerMetricsReporter:
             "event": "context_engineering_batch",
             "stage": stage,
             "forward_iter": batch_iter,
-            "scheduler_enabled": bool(
-                self.scheduler.server_args.enable_context_engineering_scheduler
+            "pair_scheduler_enabled": bool(
+                self.scheduler.server_args.enable_pair_scheduler
             ),
             "tp_rank": self.tp_rank,
             "pp_rank": self.pp_rank,
@@ -161,7 +161,7 @@ class SchedulerMetricsReporter:
         reqs: list[Req],
         batch: Optional[ScheduleBatch] = None,
     ) -> None:
-        if not self.scheduler.server_args.enable_context_engineering_scheduler:
+        if not self.scheduler.server_args.enable_pair_scheduler:
             return
         if not reqs:
             return
@@ -170,7 +170,7 @@ class SchedulerMetricsReporter:
             "reason": reason,
             "stage": stage,
             "forward_iter": self.scheduler.forward_ct,
-            "scheduler_enabled": True,
+            "pair_scheduler_enabled": True,
             "tp_rank": self.tp_rank,
             "pp_rank": self.pp_rank,
             "dp_rank": self.dp_rank,

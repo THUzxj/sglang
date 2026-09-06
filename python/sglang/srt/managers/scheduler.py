@@ -102,7 +102,7 @@ from sglang.srt.layers.quantization.unquant import initialize_bf16_gemm_config
 from sglang.srt.lora.lora_drainer import LoRADrainer
 from sglang.srt.lora.lora_overlap_loader import LoRAOverlapLoader
 from sglang.srt.managers.hisparse_coordinator import HiSparseCoordinator
-from sglang.srt.managers.context_engineering_scheduler import (
+from sglang.srt.managers.pair_scheduler import (
     can_resume_retracted_decode_req,
     order_prefill_waiting_queue,
     select_decode_keep_indices,
@@ -3148,7 +3148,7 @@ class Scheduler(
 
         # Get priority queue
         self.policy.calc_priority(self.waiting_queue, running_batch)
-        if self._context_engineering_scheduler_active(self.waiting_queue):
+        if self._pair_scheduler_active(self.waiting_queue):
             self._order_context_engineering_waiting_queue(self.waiting_queue)
 
         if TEST_RETRACT and running_bs > TEST_RETRACT_NO_PREFILL_BS:
@@ -3235,7 +3235,7 @@ class Scheduler(
                 if loaded_tokens > 0:
                     req.storage_hit_length = loaded_tokens
 
-            if self._context_engineering_scheduler_active(self.waiting_queue):
+            if self._pair_scheduler_active(self.waiting_queue):
                 if not should_try_prefill_request(
                     req,
                     can_run_reqs=adder.can_run_list,
@@ -3382,10 +3382,10 @@ class Scheduler(
 
         return new_batch, running_batch
 
-    def _context_engineering_scheduler_active(
+    def _pair_scheduler_active(
         self, reqs: Optional[List[Req]] = None
     ) -> bool:
-        return bool(self.server_args.enable_context_engineering_scheduler)
+        return bool(self.server_args.enable_pair_scheduler)
 
     @staticmethod
     def _order_context_engineering_waiting_queue(waiting_queue: List[Req]) -> None:
@@ -3525,7 +3525,7 @@ class Scheduler(
         return batch
 
     def _retract_compact_decode_over_budget(self, batch: ScheduleBatch) -> List[Req]:
-        if not self._context_engineering_scheduler_active(batch.reqs):
+        if not self._pair_scheduler_active(batch.reqs):
             return []
 
         compact_only = bool(batch.reqs) and all(

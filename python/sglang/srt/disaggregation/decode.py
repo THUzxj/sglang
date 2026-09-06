@@ -2380,7 +2380,7 @@ class SchedulerDisaggregationDecodeMixin:
         # try to resume retracted requests if there are enough space for another `num_reserved_decode_tokens` decode steps
         can_resume = (
             self._can_resume_context_engineering_retracted_req
-            if self._context_engineering_scheduler_active()
+            if self._pair_scheduler_active()
             else None
         )
         resumed_reqs = self.disagg_decode_prealloc_queue.resume_retracted_reqs(

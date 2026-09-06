@@ -2790,7 +2790,7 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
             # Context-engineering main and its compact are admitted as a decode
             # pair. Retract the pair atomically so neither side keeps the
             # other's shared prefix resident.
-            if server_args.enable_context_engineering_scheduler and req.is_context_engineering_request():
+            if server_args.enable_pair_scheduler and req.is_context_engineering_request():
                 pair_key = req.context_engineering_pair_key
                 if pair_key:
                     paired_idx = next(

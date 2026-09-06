@@ -817,9 +817,9 @@ class ServerArgs:
         "The maximum number of requests in a prefill batch. If not specified, there is no limit.",
         NS("schedule"),
     ] = None
-    enable_context_engineering_scheduler: A[
+    enable_pair_scheduler: A[
         bool,
-        "Enable compact-aware scheduling for context-engineering workloads. Main requests are scheduled before compact requests, and paired compact requests are admitted only with remaining budget.",
+        "Enable pair scheduling for context-engineering workloads. Main requests are scheduled before compact requests, and paired compact requests are admitted only with remaining budget.",
         NS("schedule"),
     ] = False
     context_engineering_decode_attention_token_budget: A[
@@ -847,7 +847,7 @@ class ServerArgs:
     ] = None
     context_engineering_decode_max_batch_size: A[
         int,
-        "Maximum decode batch size for compact-aware scheduling.",
+        "Maximum decode batch size for pair scheduling.",
         NS("schedule"),
     ] = 256
     context_engineering_prefill_max_batch_size: A[
