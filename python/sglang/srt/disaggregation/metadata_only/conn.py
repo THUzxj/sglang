@@ -178,10 +178,13 @@ class MetadataOnlyKVManager(CommonKVManager):
     ):
         _apply_log_level_from_env()
         super().__init__(args, disaggregation_mode, server_args, is_mla_backend)
+        # Match scheduler batch logging: only attention TP rank 0 emits routine
+        # logs. Errors still use logger.error/exception on the rank that sees them.
+        self.is_stats_logging_rank = self.attn_tp_rank == 0
         self.agent_name = f"metadata_only_{uuid.uuid4()}"
         self.metadata_buffers = None
         self.enable_staging = False
-        logger.debug(
+        self.log_debug(
             "metadata_only manager initialized: mode=%s agent_name=%s "
             "rank_ip=%s rank_port=%s tp_rank=%s cp_rank=%s pp_rank=%s",
             self.disaggregation_mode,
@@ -203,9 +206,13 @@ class MetadataOnlyKVManager(CommonKVManager):
                 f"Unsupported DisaggregationMode: {self.disaggregation_mode}"
             )
 
+    def log_debug(self, msg: str, *args) -> None:
+        if self.is_stats_logging_rank:
+            logger.debug(msg, *args)
+
     def set_metadata_buffers(self, metadata_buffers) -> None:
         self.metadata_buffers = metadata_buffers
-        logger.debug(
+        self.log_debug(
             "metadata_only metadata buffers registered: mode=%s slots=%s "
             "sampling_mask=%s dsa_topk=%s",
             self.disaggregation_mode,
@@ -220,7 +227,7 @@ class MetadataOnlyKVManager(CommonKVManager):
         try:
             room = int(msg[1].decode("ascii"))
         except Exception:
-            logger.debug("Ignoring malformed metadata-only abort notification")
+            self.log_debug("Ignoring malformed metadata-only abort notification")
             return True
         if room in self.request_status and self.check_status(room) != KVPoll.Success:
             self.record_failure(room, "Aborted by peer notification.")
@@ -234,7 +241,7 @@ class MetadataOnlyKVManager(CommonKVManager):
                 if self._handle_abort_notification(msg):
                     continue
                 if not msg or msg[0] != GUARD:
-                    logger.debug("Ignoring non metadata-only bootstrap message")
+                    self.log_debug("Ignoring non metadata-only bootstrap message")
                     continue
 
                 waiting_req_bytes = msg[1:]
@@ -254,7 +261,7 @@ class MetadataOnlyKVManager(CommonKVManager):
                 required_dst_info_num = self.transfer_infos[room][
                     agent_name
                 ].required_dst_info_num
-                logger.debug(
+                self.log_debug(
                     "metadata_only received decode metadata: room=%s "
                     "agent=%s decode_endpoint=%s:%s dst_aux_index=%s "
                     "dst_pages=%s state_indices=%s decode_prefix_len=%s "
@@ -280,7 +287,7 @@ class MetadataOnlyKVManager(CommonKVManager):
                         ),
                         0,
                     )
-                    logger.debug(f"metadata_only {room=} is bootstrapped")
+                    self.log_debug("metadata_only room=%s is bootstrapped", room)
                     self.update_status(room, KVPoll.WaitingForInput)
 
         threading.Thread(target=bootstrap_thread, daemon=True).start()
@@ -292,7 +299,7 @@ class MetadataOnlyKVManager(CommonKVManager):
                 if self._handle_abort_notification(msg):
                     continue
                 if not msg or msg[0] != AUX_GUARD:
-                    logger.debug("Ignoring non metadata-only aux message")
+                    self.log_debug("Ignoring non metadata-only aux message")
                     continue
 
                 try:
@@ -300,7 +307,7 @@ class MetadataOnlyKVManager(CommonKVManager):
                     dst_aux_index = int(msg[2].decode("ascii"))
                     pp_rank = int(msg[3].decode("ascii"))
                     frames = msg[4:]
-                    logger.debug(
+                    self.log_debug(
                         "metadata_only received aux metadata: room=%s "
                         "dst_aux_index=%s pp_rank=%s frames=%s",
                         room,
@@ -320,7 +327,7 @@ class MetadataOnlyKVManager(CommonKVManager):
                         _copy_bytes_to_tensor(frame, slot)
                     self.metadata_buffers.bootstrap_room[dst_aux_index, 0] = room
                     self.update_status(room, KVPoll.Success)
-                    logger.debug(
+                    self.log_debug(
                         "metadata_only applied aux metadata: room=%s "
                         "dst_aux_index=%s status=%s",
                         room,
@@ -371,7 +378,7 @@ class MetadataOnlyKVSender(CommonKVSender):
         if self._transfer_start_time is None:
             self._transfer_start_time = time.perf_counter()
         self._record_transfer_indices(kv_indices, state_indices)
-        logger.debug(
+        self.kv_mgr.log_debug(
             "metadata_only skipped KV payload transfer: room=%s chunk_pages=%s "
             "state_indices=%s index_slice=(%s,%s) is_last_chunk=%s "
             "num_kv_tokens=%s",
@@ -405,7 +412,7 @@ class MetadataOnlyKVSender(CommonKVSender):
         ]
         for info in room_infos.values():
             endpoint = NetworkAddress(info.endpoint, info.dst_port).to_tcp()
-            logger.debug(
+            self.kv_mgr.log_debug(
                 "metadata_only sending aux metadata: room=%s src_aux_index=%s "
                 "dst_aux_index=%s endpoint=%s pp_rank=%s frames=%s",
                 self.bootstrap_room,
@@ -491,7 +498,7 @@ class MetadataOnlyKVReceiver(CommonKVReceiver):
         for bootstrap_info in self.bootstrap_infos:
             sock, lock = self._connect_to_bootstrap_server(bootstrap_info)
             is_dummy = bootstrap_info["is_dummy"]
-            logger.debug(
+            self.kv_mgr.log_debug(
                 "metadata_only sending decode metadata: room=%s "
                 "prefill_rank=%s:%s decode_rank=%s:%s aux_index=%s "
                 "dst_pages=%s state_indices=%s packed_state_bytes=%s "

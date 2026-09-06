@@ -127,6 +127,11 @@ class SchedulerMetricsReporter:
         batch_iter: int,
         extra: Optional[dict] = None,
     ) -> None:
+        # Keep structured context-engineering logs on the same rank as the
+        # human-readable prefill/decode batch logs. Metrics may be collected on
+        # every scheduler, but that must not duplicate log lines across TP ranks.
+        if not self.is_stats_logging_rank:
+            return
         # The structured batch event describes compact-aware (joint) scheduling
         # decisions. Normal/background scheduler runs may still carry the same
         # request metadata, but must not emit this event as if pair scheduling was
@@ -161,6 +166,8 @@ class SchedulerMetricsReporter:
         reqs: list[Req],
         batch: Optional[ScheduleBatch] = None,
     ) -> None:
+        if not self.is_stats_logging_rank:
+            return
         if not self.scheduler.server_args.enable_pair_scheduler:
             return
         if not reqs:
