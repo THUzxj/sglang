@@ -10,6 +10,10 @@ import torch
 
 from sglang.srt.distributed.communication_tags import P2PTag
 from sglang.srt.environ import envs
+from sglang.srt.managers.cache_controller import (
+    estimate_primary_kv_bytes,
+    log_load_back_finish,
+)
 from sglang.srt.mem_cache.base_prefix_cache import (
     BasePrefixCache,
     DecLockRefParams,
@@ -100,6 +104,10 @@ class _OngoingWriteThrough(NamedTuple):
     node_id: NodeId
     lock_params: Optional[DecLockRefParams]
     publish_node_ids: list[NodeId]
+    started_at: float = 0.0
+    num_tokens: int = 0
+    estimated_bytes: Optional[int] = None
+    write_back: bool = False
 
 
 class _OngoingLoadBack(NamedTuple):
@@ -517,26 +525,79 @@ class UnifiedRadixCache(BasePrefixCache):
                     backup_kv = self._evict_device_leaf(node_id, tracker)
                     if backup_kv is not None:
                         # Deferred demote: run the D->H backup, demote only on success.
+                        debug_write_back = logger.isEnabledFor(logging.DEBUG)
+                        write_back_start = (
+                            time.perf_counter() if debug_write_back else 0.0
+                        )
+                        if debug_write_back:
+                            node = self.tree_core.node_by_id(node_id)
+                            device_value = node.component_data[
+                                BASE_COMPONENT_TYPE
+                            ].value
+                            num_tokens = (
+                                len(device_value) if device_value is not None else 0
+                            )
+                            logger.debug(
+                                "HiCache L1->L2 write-back start: "
+                                "node_id=%d component=%s tokens=%d",
+                                node_id,
+                                ct.name,
+                                num_tokens,
+                            )
                         written = self._execute_and_commit_kv_backup(
                             backup_kv, write_back=True
                         )
                         if written > 0:
                             self.writing_check(write_back=True)
+                            if debug_write_back:
+                                elapsed = time.perf_counter() - write_back_start
+                                copied_bytes = estimate_primary_kv_bytes(
+                                    self.cache_controller.mem_pool_device, written
+                                )
+                                bandwidth = (
+                                    copied_bytes / elapsed / 1e9
+                                    if copied_bytes is not None and elapsed > 0
+                                    else None
+                                )
+                                logger.debug(
+                                    "HiCache L1->L2 write-back finish: "
+                                    "node_id=%d component=%s tokens=%d "
+                                    "estimated_bytes=%s elapsed_ms=%.3f "
+                                    "effective_bandwidth_gb_s=%s",
+                                    node_id,
+                                    ct.name,
+                                    written,
+                                    copied_bytes,
+                                    elapsed * 1e3,
+                                    f"{bandwidth:.3f}"
+                                    if bandwidth is not None
+                                    else "unknown",
+                                )
                             self._demote(node_id, tracker)
-                        elif self._drop_subtree_no_host(node_id, tracker):
-                            logger.warning(
-                                "write_back: KV subtree dropped without backup "
-                                "due to host memory pressure, root node %d",
-                                node_id,
-                            )
                         else:
-                            logger.warning(
-                                "write_back: backup failed under host memory "
-                                "pressure but subtree drop declined (node "
-                                "locked); root node %d stays device-resident "
-                                "until host space frees",
-                                node_id,
-                            )
+                            if debug_write_back:
+                                logger.debug(
+                                    "HiCache L1->L2 write-back finish: "
+                                    "node_id=%d component=%s status=failed "
+                                    "elapsed_ms=%.3f",
+                                    node_id,
+                                    ct.name,
+                                    (time.perf_counter() - write_back_start) * 1e3,
+                                )
+                            if self._drop_subtree_no_host(node_id, tracker):
+                                logger.warning(
+                                    "write_back: KV subtree dropped without backup "
+                                    "due to host memory pressure, root node %d",
+                                    node_id,
+                                )
+                            else:
+                                logger.warning(
+                                    "write_back: backup failed under host memory "
+                                    "pressure but subtree drop declined (node "
+                                    "locked); root node %d stays device-resident "
+                                    "until host space frees",
+                                    node_id,
+                                )
             finally:
                 self.tree_core.evict_device_end(ct)
 
@@ -878,16 +939,52 @@ class UnifiedRadixCache(BasePrefixCache):
                 continue
             device_value, comp_xfers = self.tree_core.build_backup_spec(node_id)
             sidecar_xfers = self._build_backup_sidecar(device_value, comp_xfers)
+            debug_write_through = (
+                not write_back and logger.isEnabledFor(logging.DEBUG)
+            )
+            started_at = time.perf_counter() if debug_write_through else 0.0
+            num_tokens = len(device_value)
+            estimated_bytes = (
+                estimate_primary_kv_bytes(
+                    self.cache_controller.mem_pool_device, num_tokens
+                )
+                if debug_write_through
+                else None
+            )
+            if debug_write_through:
+                logger.debug(
+                    "HiCache L1->L2 write-through start: "
+                    "node_id=%d policy=%s tokens=%d estimated_bytes=%s",
+                    node_id,
+                    self.cache_controller.write_policy,
+                    num_tokens,
+                    estimated_bytes,
+                )
             host_indices = self._execute_kv_backup(
                 node_id, device_value, comp_xfers, sidecar_xfers
             )
             if host_indices is None:
+                if debug_write_through:
+                    logger.debug(
+                        "HiCache L1->L2 write-through finish: "
+                        "node_id=%d policy=%s status=failed elapsed_ms=%.3f",
+                        node_id,
+                        self.cache_controller.write_policy,
+                        (time.perf_counter() - started_at) * 1e3,
+                    )
                 return 0
             self.tree_core.commit_backup(node_id, host_indices, comp_xfers)
             lock_params = None
             if not write_back:
                 lock_params = self.inc_lock_ref(node_id).to_dec_params()
-            self._track_write_through_node(node_id, lock_params)
+            self._track_write_through_node(
+                node_id,
+                lock_params,
+                started_at=started_at,
+                num_tokens=num_tokens,
+                estimated_bytes=estimated_bytes,
+                write_back=write_back,
+            )
             written = len(host_indices)
         return written
 
@@ -916,10 +1013,21 @@ class UnifiedRadixCache(BasePrefixCache):
         self,
         node_id: NodeId,
         lock_params: Optional[DecLockRefParams],
+        *,
+        started_at: float = 0.0,
+        num_tokens: int = 0,
+        estimated_bytes: Optional[int] = None,
+        write_back: bool = False,
     ) -> None:
         self.tree_core.mark_write_through_pending(node_id)
         self.ongoing_write_through[node_id] = _OngoingWriteThrough(
-            node_id, lock_params, [node_id]
+            node_id,
+            lock_params,
+            [node_id],
+            started_at,
+            num_tokens,
+            estimated_bytes,
+            write_back,
         )
 
     def _replace_pending_write_through_node(
@@ -929,7 +1037,7 @@ class UnifiedRadixCache(BasePrefixCache):
         if pending is None:
             return
 
-        lock_node_id, lock_params, publish_node_ids = pending
+        publish_node_ids = pending.publish_node_ids
         updated_node_ids = []
         replaced = False
         for node_id in publish_node_ids:
@@ -942,17 +1050,38 @@ class UnifiedRadixCache(BasePrefixCache):
         if not replaced:
             return
 
-        self.ongoing_write_through[ack_id] = _OngoingWriteThrough(
-            lock_node_id,
-            lock_params,
-            updated_node_ids,
+        self.ongoing_write_through[ack_id] = pending._replace(
+            publish_node_ids=updated_node_ids
         )
 
     def _finish_write_through_ack(self, ack_id: int) -> None:
-        lock_node_id, lock_params, publish_node_ids = self.ongoing_write_through.pop(
-            ack_id
-        )
+        pending = self.ongoing_write_through.pop(ack_id)
+        lock_node_id = pending.node_id
+        lock_params = pending.lock_params
+        publish_node_ids = pending.publish_node_ids
         self.tree_core.finish_write_through(publish_node_ids, ack_id)
+        if (
+            not pending.write_back
+            and pending.started_at > 0
+            and logger.isEnabledFor(logging.DEBUG)
+        ):
+            elapsed = time.perf_counter() - pending.started_at
+            bandwidth = (
+                pending.estimated_bytes / elapsed / 1e9
+                if pending.estimated_bytes is not None and elapsed > 0
+                else None
+            )
+            logger.debug(
+                "HiCache L1->L2 write-through finish: "
+                "node_id=%d policy=%s tokens=%d estimated_bytes=%s "
+                "elapsed_ms=%.3f effective_bandwidth_gb_s=%s",
+                ack_id,
+                self.cache_controller.write_policy,
+                pending.num_tokens,
+                pending.estimated_bytes,
+                elapsed * 1e3,
+                f"{bandwidth:.3f}" if bandwidth is not None else "unknown",
+            )
         if lock_params is not None:
             self.dec_lock_ref(lock_node_id, lock_params)
         if self.enable_storage:
@@ -1949,6 +2078,7 @@ class UnifiedRadixCache(BasePrefixCache):
         while finish_count > 0:
             ack = cc.ack_load_queue.pop(0)
             ack.finish_event.synchronize()
+            log_load_back_finish(cc.mem_pool_device, ack)
             for ack_id in ack.node_ids:
                 node, lock_params, host_lock_params = self.ongoing_load_back.pop(ack_id)
                 self.dec_lock_ref(node, lock_params)
