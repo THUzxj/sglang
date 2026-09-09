@@ -14,7 +14,7 @@ Covers:
 
 import asyncio
 import unittest
-from unittest.mock import AsyncMock, MagicMock, Mock
+from unittest.mock import AsyncMock, MagicMock, Mock, patch
 
 import msgspec
 
@@ -140,6 +140,7 @@ def _make_req_state(rid: str = "test_rid", *, dispatched: bool = False) -> ReqSt
     """Create a minimal ReqState for testing."""
     obj = Mock(spec=GenerateReqInput)
     obj.rid = rid
+    obj.is_single = True
     obj.stream = False
     obj.return_logprob = False
     obj.lora_path = None
@@ -419,6 +420,61 @@ class TestResubmitAfterCompletion(CustomTestCase):
         tm._init_req_state(obj)
 
         self.assertIn(rid, tm.rid_to_state)
+
+
+class TestDelayedAbortOwnership(CustomTestCase):
+    """A response cleanup task must only abort the lifecycle that created it."""
+
+    @patch(
+        "sglang.srt.managers.tokenizer_manager.asyncio.sleep",
+        new_callable=AsyncMock,
+    )
+    def test_task_does_not_require_normalized_request(self, _sleep):
+        tm = _make_tokenizer_manager()
+        tm.abort_request = Mock()
+        obj = Mock(spec=GenerateReqInput)
+        obj.rid = "not_normalized_yet"
+
+        background_tasks = tm.create_abort_task(obj)
+        asyncio.run(background_tasks())
+
+        tm.abort_request.assert_not_called()
+
+    @patch(
+        "sglang.srt.managers.tokenizer_manager.asyncio.sleep",
+        new_callable=AsyncMock,
+    )
+    def test_old_task_does_not_abort_reused_rid(self, _sleep):
+        tm = _make_tokenizer_manager()
+        tm.abort_request = Mock()
+        rid = "reused_rid"
+
+        old_state = _make_req_state(rid)
+        background_tasks = tm.create_abort_task(old_state.obj)
+
+        new_state = _make_req_state(rid)
+        tm.rid_to_state[rid] = new_state
+
+        asyncio.run(background_tasks())
+
+        tm.abort_request.assert_not_called()
+
+    @patch(
+        "sglang.srt.managers.tokenizer_manager.asyncio.sleep",
+        new_callable=AsyncMock,
+    )
+    def test_task_aborts_its_original_lifecycle(self, _sleep):
+        tm = _make_tokenizer_manager()
+        tm.abort_request = Mock()
+        rid = "active_rid"
+
+        state = _make_req_state(rid)
+        tm.rid_to_state[rid] = state
+        background_tasks = tm.create_abort_task(state.obj)
+
+        asyncio.run(background_tasks())
+
+        tm.abort_request.assert_called_once_with(rid)
 
 
 class _DummyAsyncCM:
