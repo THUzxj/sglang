@@ -70,7 +70,11 @@ from sglang.srt.managers.schedule_batch import (
 from sglang.srt.managers.schedule_policy import match_prefix_for_req
 from sglang.srt.managers.utils import GenerationBatchResult
 from sglang.srt.mem_cache.allocator import BaseTokenToKVPoolAllocator
-from sglang.srt.mem_cache.base_prefix_cache import BasePrefixCache, EvictParams
+from sglang.srt.mem_cache.base_prefix_cache import (
+    BasePrefixCache,
+    DecLockRefParams,
+    EvictParams,
+)
 from sglang.srt.mem_cache.common import (
     kv_to_page_indices,
     page_align_floor,
@@ -569,16 +573,61 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
         """
         if token_ids is None:
             token_ids = req.origin_input_ids
+        # A PD decode worker receives the post-prefill Mamba state for this
+        # request through the state transfer.  It therefore only needs radix
+        # matching to reuse Full-Attention KV.  Do not apply this optimization
+        # to Full+SWA+Mamba caches: their request-local SWA state has separate
+        # reuse constraints that are not covered by the Mamba handoff.
+        match_full_kv_only = (
+            self.tree_cache.supports_mamba()
+            and not self.tree_cache.supports_swa()
+            and StateType.MAMBA in self.kv_manager.kv_args.state_types
+        )
         result = match_prefix_for_req(
             self.tree_cache,
             req,
             token_ids,
-            cow_mamba=self.tree_cache.supports_mamba(),
+            cow_mamba=self.tree_cache.supports_mamba() and not match_full_kv_only,
             include_req=True,
+            match_full_kv_only=match_full_kv_only,
         )
         # Always lock to match aggregated scheduling behavior
-        self.tree_cache.inc_lock_ref(result.last_device_node)
-        return self._build_decode_prefix_match(req, result, token_ids)
+        lock_result = self.tree_cache.inc_lock_ref(result.last_device_node)
+        req.swa_uuid_for_lock = lock_result.swa_uuid_for_lock
+        req.skip_lock_node_ids = lock_result.skip_lock_node_ids
+        prefix_match = self._build_decode_prefix_match(req, result, token_ids)
+        if self.scheduler.metrics_reporter.is_stats_logging_rank:
+            logger.info(
+                "Decode prefix match: rid=%s kind=%s pair_key=%s mode=%s "
+                "input_len=%d l1_hit=%d l2_hit=%d l3_hit=%d "
+                "decode_prefix_len=%d full_kv_hit=%d "
+                "mamba_host_hit=%d mamba_branching_seqlen=%s "
+                "cache_protected_len=%s",
+                req.rid,
+                "compact" if req.is_context_engineering_compact() else "main",
+                req.context_engineering_pair_key,
+                "full_kv_only" if match_full_kv_only else "all_components",
+                len(token_ids),
+                prefix_match.l1_prefix_len,
+                prefix_match.l2_host_hit_length,
+                prefix_match.l3_storage_hit_length,
+                prefix_match.decode_prefix_len,
+                result.full_kv_hit_length,
+                result.mamba_host_hit_length,
+                result.mamba_branching_seqlen,
+                result.cache_protected_len,
+            )
+        return prefix_match
+
+    def _release_prefix_lock(self, req: Req) -> None:
+        """Release the decode-side prefix lock with its component skip mask."""
+        self.tree_cache.dec_lock_ref(
+            req.last_node,
+            DecLockRefParams(
+                swa_uuid_for_lock=req.swa_uuid_for_lock,
+                skip_lock_node_ids=req.skip_lock_node_ids,
+            ),
+        )
 
     def _resolve_prefill_dp_rank(self, req: Req) -> Optional[int]:
         prefill_info = self.kv_manager.prefill_info_table.get(_bootstrap_addr(req))
@@ -1101,11 +1150,11 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
                 > full_allocatable_tokens
             ):
                 if prefix_len > 0:
-                    self.tree_cache.dec_lock_ref(decode_req.req.last_node)
+                    self._release_prefix_lock(decode_req.req)
                 break
             if required_tokens_for_request > full_allocatable_tokens:
                 if prefix_len > 0:
-                    self.tree_cache.dec_lock_ref(decode_req.req.last_node)
+                    self._release_prefix_lock(decode_req.req)
                 break
 
             if uses_swa_tail_prealloc:
@@ -1123,14 +1172,14 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
                     > swa_allocatable_tokens
                 ):
                     if prefix_len > 0:
-                        self.tree_cache.dec_lock_ref(decode_req.req.last_node)
+                        self._release_prefix_lock(decode_req.req)
                     break
 
             if total_prefix_len != 0 and hasattr(
                 self.token_to_kv_pool_allocator, "c4_attn_allocator"
             ):
                 if prefix_len > 0:
-                    self.tree_cache.dec_lock_ref(decode_req.req.last_node)
+                    self._release_prefix_lock(decode_req.req)
                 raise RuntimeError(
                     "DSV4 NPU PD disaggregation does not support decode-side "
                     "prefix cache yet; disable disaggregation decode radix/HiCache "
@@ -1151,7 +1200,7 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
                 decode_req.req.kv = None
                 decode_req.req.kv_committed_len = 0
                 if prefix_len > 0:
-                    self.tree_cache.dec_lock_ref(decode_req.req.last_node)
+                    self._release_prefix_lock(decode_req.req)
                 break
             decode_req.prefix_match = prefix_match
             if self.scheduler.enable_decode_hicache:

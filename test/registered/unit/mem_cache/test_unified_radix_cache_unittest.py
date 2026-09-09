@@ -3764,6 +3764,36 @@ class UnifiedRadixCacheSuite:
         )
         self.assertIsNone(with_hicache.mamba_branching_seqlen)
 
+    def test_full_kv_only_match_is_not_capped_by_missing_mamba_state(self):
+        if not self.cfg.has_mamba or self.cfg.has_swa or self.cfg.page_size != 1:
+            self.skipTest("requires page_size=1 Full+Mamba")
+        cache, allocator, req_to_token_pool = build_fixture(self.cfg)
+        chunk_size = get_server_args().mamba_cache_chunk_size
+        tokens = self._make_seq(1, chunk_size + 1)
+        self._insert(cache, allocator, req_to_token_pool, tokens)
+
+        initial = cache.match_prefix(
+            MatchPrefixParams(key=RadixKey(array("q", tokens)))
+        )
+        leaf = cache.resolve_node_handle(initial.last_device_node)
+        leaf.component_data[ComponentType.MAMBA].value = None
+
+        all_components = cache.match_prefix(
+            MatchPrefixParams(key=RadixKey(array("q", tokens)))
+        )
+        full_only = cache.match_prefix(
+            MatchPrefixParams(
+                key=RadixKey(array("q", tokens)),
+                match_full_kv_only=True,
+            )
+        )
+
+        self.assertEqual(len(all_components.device_indices), 0)
+        self.assertEqual(len(full_only.device_indices), len(tokens))
+        self.assertEqual(full_only.full_kv_hit_length, len(tokens))
+        self.assertEqual(full_only.last_device_node, leaf.id)
+        self.assertIsNone(full_only.mamba_branching_seqlen)
+
     def test_mamba_branching_seqlen_uses_device_full_hit_under_hicache(self):
         if not self.cfg.has_mamba or self.cfg.has_swa or self.cfg.page_size != 1:
             self.skipTest("requires page_size=1 Full+Mamba")

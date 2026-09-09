@@ -32,6 +32,7 @@ from unittest.mock import MagicMock, patch
 
 import torch
 
+from sglang.srt.disaggregation.base.conn import StateType
 from sglang.srt.disaggregation.decode import DecodePreallocQueue
 from sglang.srt.disaggregation.decode_hicache_mixin import DecodePrefixMatch
 from sglang.srt.mem_cache.base_prefix_cache import (
@@ -301,6 +302,8 @@ class TestDecodeLockRefScenarios(unittest.TestCase):
         req.origin_input_ids = list(range(8))
         req.output_ids = [99]
         req.last_node = object()
+        req.swa_uuid_for_lock = None
+        req.skip_lock_node_ids = {"mamba": {17}}
         req.finished_reason = None
         req.cache_protected_len = 0
         req.sampling_params.max_new_tokens = 16
@@ -362,7 +365,11 @@ class TestDecodeLockRefScenarios(unittest.TestCase):
         self.assertEqual(preallocated, [])
         self.assertEqual(failed, [])
         queue._pre_alloc.assert_not_called()
-        queue.tree_cache.dec_lock_ref.assert_called_once_with(req.last_node)
+        queue.tree_cache.dec_lock_ref.assert_called_once()
+        release_node, release_params = queue.tree_cache.dec_lock_ref.call_args.args
+        self.assertIs(release_node, req.last_node)
+        self.assertIsNone(release_params.swa_uuid_for_lock)
+        self.assertEqual(release_params.skip_lock_node_ids, {"mamba": {17}})
         self.assertEqual(queue._allocatable_token_budgets.call_count, 2)
 
     def test_pop_preallocated_rolls_back_when_actual_alloc_fails(self):
@@ -374,6 +381,8 @@ class TestDecodeLockRefScenarios(unittest.TestCase):
         req.origin_input_ids = list(range(32))
         req.output_ids = []
         req.last_node = object()
+        req.swa_uuid_for_lock = None
+        req.skip_lock_node_ids = {"mamba": {23}}
         req.finished_reason = None
         req.cache_protected_len = 0
         req.kv_committed_len = 32
@@ -438,7 +447,11 @@ class TestDecodeLockRefScenarios(unittest.TestCase):
         queue.req_to_token_pool.free.assert_called_once_with(req)
         self.assertEqual(req.kv_committed_len, 0)
         self.assertIsNone(req.kv)
-        queue.tree_cache.dec_lock_ref.assert_called_once_with(req.last_node)
+        queue.tree_cache.dec_lock_ref.assert_called_once()
+        release_node, release_params = queue.tree_cache.dec_lock_ref.call_args.args
+        self.assertIs(release_node, req.last_node)
+        self.assertIsNone(release_params.swa_uuid_for_lock)
+        self.assertEqual(release_params.skip_lock_node_ids, {"mamba": {23}})
         decode_req.kv_receiver.send_metadata.assert_not_called()
 
     def test_cache_resume_matches_full_generated_history(self):
@@ -446,6 +459,8 @@ class TestDecodeLockRefScenarios(unittest.TestCase):
         queue.tree_cache = MagicMock()
         queue.tree_cache.supports_mamba.return_value = False
         queue.tree_cache.inc_lock_ref = MagicMock()
+        queue.scheduler = MagicMock()
+        queue.scheduler.metrics_reporter.is_stats_logging_rank = False
 
         req = MagicMock()
         req.origin_input_ids = [1, 2, 3]
@@ -468,6 +483,51 @@ class TestDecodeLockRefScenarios(unittest.TestCase):
         self.assertEqual(match_prefix.call_args.args[2], [1, 2, 3, 4, 5])
         queue.tree_cache.inc_lock_ref.assert_called_once_with(last_node)
         build_match.assert_called_once_with(req, match_result, [1, 2, 3, 4, 5])
+
+    def test_mamba_pd_decode_uses_full_kv_only_match(self):
+        queue = DecodePreallocQueue.__new__(DecodePreallocQueue)
+        queue.tree_cache = MagicMock()
+        queue.tree_cache.supports_mamba.return_value = True
+        queue.tree_cache.supports_swa.return_value = False
+        queue.tree_cache.inc_lock_ref.return_value = SimpleNamespace(
+            swa_uuid_for_lock=None,
+            skip_lock_node_ids={"mamba": {7}},
+        )
+        queue.kv_manager = MagicMock()
+        queue.kv_manager.kv_args.state_types = [StateType.MAMBA]
+        queue.scheduler = MagicMock()
+        queue.scheduler.metrics_reporter.is_stats_logging_rank = False
+
+        req = MagicMock()
+        req.origin_input_ids = [1, 2, 3]
+        last_node = object()
+        match_result = MagicMock()
+        match_result.last_device_node = last_node
+
+        with patch(
+            "sglang.srt.disaggregation.decode.match_prefix_for_req",
+            return_value=match_result,
+        ) as match_prefix, patch.object(
+            queue, "_build_decode_prefix_match", return_value="prefix-match"
+        ):
+            result = queue._match_prefix_and_lock(req)
+
+        self.assertEqual(result, "prefix-match")
+        self.assertFalse(match_prefix.call_args.kwargs["cow_mamba"])
+        self.assertTrue(match_prefix.call_args.kwargs["match_full_kv_only"])
+        self.assertEqual(req.skip_lock_node_ids, {"mamba": {7}})
+
+        queue.kv_manager.kv_args.state_types = []
+        with patch(
+            "sglang.srt.disaggregation.decode.match_prefix_for_req",
+            return_value=match_result,
+        ) as match_prefix, patch.object(
+            queue, "_build_decode_prefix_match", return_value="prefix-match"
+        ):
+            queue._match_prefix_and_lock(req)
+
+        self.assertTrue(match_prefix.call_args.kwargs["cow_mamba"])
+        self.assertFalse(match_prefix.call_args.kwargs["match_full_kv_only"])
 
     def test_repeated_incremental_no_leak(self):
         """Multiple incremental transfers shouldn't leak lock_refs."""

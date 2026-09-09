@@ -392,7 +392,11 @@ class UnifiedRadixCache(BasePrefixCache):
             self.host_pool_group.destroy()
 
     def match_prefix(self, params: MatchPrefixParams) -> MatchResult:
-        result = self.session.try_match_prefix(params)
+        # Streaming-session matching has multi-component semantics. PD
+        # Full-only lookup deliberately bypasses it and walks the shared tree.
+        result = (
+            None if params.match_full_kv_only else self.session.try_match_prefix(params)
+        )
         if result is not None:
             return result
         if self.disable:
@@ -401,7 +405,12 @@ class UnifiedRadixCache(BasePrefixCache):
         # Apply the walk's actions (e.g. a pending write-through relocation on
         # a split) before the finalizers, which can evict or raise.
         self._apply_cache_actions(result.cache_actions)
-        for component in self._components_tuple:
+        match_components = (
+            (self.components[BASE_COMPONENT_TYPE],)
+            if params.match_full_kv_only
+            else self._components_tuple
+        )
+        for component in match_components:
             result = component.finalize_match_result_in_cache(params, result)
         # Finalizers must not emit actions; the walk's were applied above.
         assert not result.cache_actions

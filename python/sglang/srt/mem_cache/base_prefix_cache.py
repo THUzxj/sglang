@@ -55,6 +55,11 @@ class MatchPrefixParams:
     cow_mamba: bool = False
     req: Optional[Req] = None
 
+    # PD decode can receive the request's post-prefill Mamba state directly.
+    # In that case the radix lookup is only used to reuse/skip transfer of
+    # Full-Attention KV, so auxiliary components must not cap the match.
+    match_full_kv_only: bool = False
+
 
 @dataclasses.dataclass
 class InsertParams:
