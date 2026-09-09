@@ -28,7 +28,7 @@ register_amd_ci(est_time=10, suite="stage-b-test-1-gpu-small-amd")
 import unittest
 from array import array
 from types import SimpleNamespace
-from unittest.mock import MagicMock
+from unittest.mock import MagicMock, patch
 
 import torch
 
@@ -364,6 +364,110 @@ class TestDecodeLockRefScenarios(unittest.TestCase):
         queue._pre_alloc.assert_not_called()
         queue.tree_cache.dec_lock_ref.assert_called_once_with(req.last_node)
         self.assertEqual(queue._allocatable_token_budgets.call_count, 2)
+
+    def test_pop_preallocated_rolls_back_when_actual_alloc_fails(self):
+        queue = DecodePreallocQueue.__new__(DecodePreallocQueue)
+        queue.pp_size = 1
+
+        req = MagicMock()
+        req.rid = "req-alloc-fail"
+        req.origin_input_ids = list(range(32))
+        req.output_ids = []
+        req.last_node = object()
+        req.finished_reason = None
+        req.cache_protected_len = 0
+        req.kv_committed_len = 32
+        req.kv = object()
+        req.req_pool_idx = 3
+        req.sampling_params.max_new_tokens = 8
+
+        decode_req = MagicMock()
+        decode_req.req = req
+        decode_req.waiting_for_input = True
+        decode_req.is_rebootstrap = False
+        decode_req.is_cache_resume = False
+
+        queue.queue = [decode_req]
+        queue.pending_reqs = []
+        queue.retracted_queue = []
+        queue.num_reserved_decode_tokens = 0
+        queue._resolve_pending_reqs = MagicMock()
+        queue._update_handshake_waiters = MagicMock()
+        queue._match_prefix_and_lock = MagicMock(
+            return_value=DecodePrefixMatch(
+                prefix_indices=torch.arange(4, dtype=torch.int64),
+                l2_host_hit_length=8,
+                l3_storage_hit_length=0,
+                last_device_node=req.last_node,
+            )
+        )
+        queue._pre_alloc = MagicMock(return_value=None)
+        queue.transfer_queue = MagicMock(queue=[], enable_staging=False)
+        queue.tree_cache = MagicMock()
+        queue.tree_cache.dec_lock_ref = MagicMock()
+        queue.req_to_token_pool = MagicMock()
+        queue.req_to_token_pool.available_size.return_value = 1
+        queue.req_to_token_pool.free = MagicMock()
+        queue.req_to_metadata_buffer_idx_allocator = MagicMock()
+        queue.req_to_metadata_buffer_idx_allocator.available_size.return_value = 1
+        queue.token_to_kv_pool = MagicMock()
+        queue.token_to_kv_pool_allocator = SimpleNamespace(page_size=1)
+
+        running_batch = MagicMock()
+        running_batch.reqs = []
+        server_args = MagicMock()
+        server_args.disaggregation_decode_enable_radix_cache = True
+        scheduler = MagicMock()
+        scheduler.running_batch = running_batch
+        scheduler.server_args = server_args
+        scheduler.enable_decode_hicache = True
+        scheduler.enable_hisparse = False
+        scheduler.enable_priority_scheduling = False
+        scheduler.waiting_queue = []
+        scheduler.last_batch = None
+        scheduler.output_streamer = MagicMock()
+        queue.scheduler = scheduler
+
+        queue._allocatable_token_budgets = MagicMock(return_value=64)
+
+        preallocated, failed = queue.pop_preallocated()
+
+        self.assertEqual(preallocated, [])
+        self.assertEqual(failed, [])
+        self.assertEqual(queue.queue, [decode_req])
+        queue.req_to_token_pool.free.assert_called_once_with(req)
+        self.assertEqual(req.kv_committed_len, 0)
+        self.assertIsNone(req.kv)
+        queue.tree_cache.dec_lock_ref.assert_called_once_with(req.last_node)
+        decode_req.kv_receiver.send_metadata.assert_not_called()
+
+    def test_cache_resume_matches_full_generated_history(self):
+        queue = DecodePreallocQueue.__new__(DecodePreallocQueue)
+        queue.tree_cache = MagicMock()
+        queue.tree_cache.supports_mamba.return_value = False
+        queue.tree_cache.inc_lock_ref = MagicMock()
+
+        req = MagicMock()
+        req.origin_input_ids = [1, 2, 3]
+        req.output_ids = [4, 5]
+        last_node = object()
+        match_result = MagicMock()
+        match_result.last_device_node = last_node
+
+        with patch(
+            "sglang.srt.disaggregation.decode.match_prefix_for_req",
+            return_value=match_result,
+        ) as match_prefix, patch.object(
+            queue, "_build_decode_prefix_match", return_value="prefix-match"
+        ) as build_match:
+            result = queue._match_prefix_and_lock(
+                req, req.origin_input_ids + req.output_ids
+            )
+
+        self.assertEqual(result, "prefix-match")
+        self.assertEqual(match_prefix.call_args.args[2], [1, 2, 3, 4, 5])
+        queue.tree_cache.inc_lock_ref.assert_called_once_with(last_node)
+        build_match.assert_called_once_with(req, match_result, [1, 2, 3, 4, 5])
 
     def test_repeated_incremental_no_leak(self):
         """Multiple incremental transfers shouldn't leak lock_refs."""

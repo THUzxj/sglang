@@ -994,6 +994,18 @@ class SchedulerReqTimeStats(ReqTimeStatsBase):
         self.observe_per_stage_req_latency(stage, ts - self.scheduler_recv_time)
         self.trace_slice(stage, self.scheduler_recv_time, ts)
 
+    def reset_for_decode_cache_resume(self):
+        """Start a new decode admission interval for a cache-paused request.
+
+        ``set_wait_queue_entry_time`` is called again after the local radix/L2
+        restore, so the first-forward timestamp must also be refreshed.  Keeping
+        the original value would make the exported queue time negative.  The
+        bootstrap marker is per admission attempt as well.
+        """
+
+        self.forward_entry_time = 0.0
+        self.bootstrap_done_time = 0.0
+
     def set_decode_transfer_queue_entry_time(self, ts=None):
         ts = ts or time.perf_counter()
         self.decode_transfer_queue_entry_time = ts
