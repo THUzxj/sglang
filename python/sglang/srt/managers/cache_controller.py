@@ -165,6 +165,58 @@ class HiCacheAck(NamedTuple):
     timing_enabled: bool = False
 
 
+def estimate_primary_kv_bytes(device_pool, num_tokens: int) -> Optional[int]:
+    """Estimate the primary KV bytes represented by ``num_tokens`` slots."""
+    try:
+        pool_size = int(device_pool.size)
+        if pool_size <= 0:
+            return None
+        pool_bytes = device_pool.get_kv_size_bytes()
+        if isinstance(pool_bytes, tuple):
+            pool_bytes = sum(pool_bytes)
+        return int(pool_bytes * num_tokens / pool_size)
+    except (AttributeError, TypeError, ValueError, ZeroDivisionError):
+        return None
+
+
+def log_load_back_start(device_pool, node_ids: List[int], num_tokens: int) -> None:
+    """Log submission of one merged L2→L1 transfer batch."""
+    if not logger.isEnabledFor(logging.DEBUG):
+        return
+    logger.debug(
+        "HiCache L2->L1 load-back start: node_ids=%s tokens=%d "
+        "primary_kv_estimated_bytes=%s",
+        node_ids,
+        num_tokens,
+        estimate_primary_kv_bytes(device_pool, num_tokens),
+    )
+
+
+def log_load_back_finish(device_pool, ack: HiCacheAck) -> None:
+    """Log completion and device-event timing for an L2→L1 transfer batch."""
+    if not logger.isEnabledFor(logging.DEBUG):
+        return
+    estimated_bytes = estimate_primary_kv_bytes(device_pool, ack.num_tokens)
+    duration_ms = (
+        ack.start_event.elapsed_time(ack.finish_event) if ack.timing_enabled else None
+    )
+    bandwidth = (
+        estimated_bytes / duration_ms / 1e6
+        if estimated_bytes is not None and duration_ms is not None and duration_ms > 0
+        else None
+    )
+    logger.debug(
+        "HiCache L2->L1 load-back finish: node_ids=%s tokens=%d "
+        "primary_kv_estimated_bytes=%s device_elapsed_ms=%s "
+        "primary_kv_effective_bandwidth_gb_s=%s",
+        ack.node_ids,
+        ack.num_tokens,
+        estimated_bytes,
+        f"{duration_ms:.3f}" if duration_ms is not None else "unknown",
+        f"{bandwidth:.3f}" if bandwidth is not None else "unknown",
+    )
+
+
 class StorageOperation:
     counter = 0
 
@@ -793,6 +845,9 @@ class HiCacheController:
         producer_event.start_event.record()
 
         ack_start_event, ack_finish_event, timing_enabled = make_timing_event_pair()
+        log_load_back_start(
+            self.mem_pool_device, op.node_ids, len(op.device_indices)
+        )
 
         with device_module.stream(self.load_stream):
             producer_event.start_event.wait(self.load_stream)

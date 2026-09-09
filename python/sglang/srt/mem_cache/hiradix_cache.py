@@ -14,7 +14,11 @@ import torch
 
 from sglang.srt.disaggregation.kv_events import StorageMedium
 from sglang.srt.distributed.communication_tags import P2PTag
-from sglang.srt.managers.cache_controller import HiCacheController, PrefetchOperation
+from sglang.srt.managers.cache_controller import (
+    HiCacheController,
+    PrefetchOperation,
+    log_load_back_finish,
+)
 from sglang.srt.mem_cache.base_prefix_cache import (
     DecLockRefParams,
     DecLockRefResult,
@@ -1075,6 +1079,7 @@ class HiRadixCache(RadixCache):
         while finish_count > 0:
             ack = self.cache_controller.ack_load_queue.pop(0)
             ack.finish_event.synchronize()
+            log_load_back_finish(self.cache_controller.mem_pool_device, ack)
             for ack_id in ack.node_ids:
                 end_node = self.ongoing_load_back.pop(ack_id)
                 self.dec_lock_ref(end_node)
@@ -1096,7 +1101,11 @@ class HiRadixCache(RadixCache):
         finish_event = self.cache_controller.layer_done_counter.events[
             consumer_index
         ].finish_event
-        if not finish_event.query():
+        event_done = torch.tensor(
+            int(finish_event.query()), dtype=torch.int, device="cpu"
+        )
+        self._all_reduce(event_done, torch.distributed.ReduceOp.MIN)
+        if not event_done.item():
             return False
 
         self.loading_check()

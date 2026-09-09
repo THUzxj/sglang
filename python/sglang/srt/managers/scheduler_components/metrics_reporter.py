@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import dataclasses
+import json
 import logging
 import math
 import tempfile
@@ -18,6 +19,10 @@ from typing import (
 
 from sglang.srt.disaggregation.utils import DisaggregationMode
 from sglang.srt.environ import envs
+from sglang.srt.managers.pair_scheduler import (
+    batch_context_engineering_observation,
+    batch_context_engineering_stats,
+)
 from sglang.srt.managers.schedule_batch import ScheduleBatch
 from sglang.srt.managers.utils import GenerationBatchResult
 from sglang.srt.observability.metrics_collector import (
@@ -113,6 +118,91 @@ class SchedulerMetricsReporter:
         )
         self._init_metrics(self.tp_rank, self.pp_rank, self.dp_rank)
         self._install_device_timer_on_runners()
+
+    def _log_context_engineering_batch(
+        self,
+        *,
+        stage: str,
+        batch: ScheduleBatch,
+        batch_iter: int,
+        extra: Optional[dict] = None,
+    ) -> None:
+        # Keep structured context-engineering logs on the same rank as the
+        # human-readable prefill/decode batch logs. Metrics may be collected on
+        # every scheduler, but that must not duplicate log lines across TP ranks.
+        if not self.is_stats_logging_rank:
+            return
+        # The structured batch event describes compact-aware (joint) scheduling
+        # decisions. Normal/background scheduler runs may still carry the same
+        # request metadata, but must not emit this event as if pair scheduling was
+        # active.
+        if not self.scheduler.server_args.enable_pair_scheduler:
+            return
+        observation = batch_context_engineering_observation(batch.reqs)
+        if not observation["main"] and not observation["compact"]:
+            return
+        payload = {
+            "event": "context_engineering_batch",
+            "stage": stage,
+            "forward_iter": batch_iter,
+            "pair_scheduler_enabled": bool(
+                self.scheduler.server_args.enable_pair_scheduler
+            ),
+            "tp_rank": self.tp_rank,
+            "pp_rank": self.pp_rank,
+            "dp_rank": self.dp_rank,
+            **observation,
+        }
+        if extra:
+            payload.update(extra)
+        logger.info("context_engineering_batch %s", json.dumps(payload, sort_keys=True))
+
+    def log_context_engineering_transition(
+        self,
+        *,
+        event: str,
+        reason: str,
+        stage: str,
+        reqs: list[Req],
+        batch: Optional[ScheduleBatch] = None,
+    ) -> None:
+        if not self.is_stats_logging_rank:
+            return
+        if not self.scheduler.server_args.enable_pair_scheduler:
+            return
+        if not reqs:
+            return
+        payload = {
+            "event": event,
+            "reason": reason,
+            "stage": stage,
+            "forward_iter": self.scheduler.forward_ct,
+            "pair_scheduler_enabled": True,
+            "tp_rank": self.tp_rank,
+            "pp_rank": self.pp_rank,
+            "dp_rank": self.dp_rank,
+            "requests": [
+                {
+                    "rid": str(getattr(req, "rid", "")),
+                    "kind": str(getattr(req, "context_engineering_kind", "") or ""),
+                    "pair_key": getattr(req, "context_engineering_pair_key", None),
+                    "seqlen": int(getattr(req, "seqlen", 0) or 0),
+                    "kv_committed_len": int(
+                        getattr(req, "kv_committed_len", 0) or 0
+                    ),
+                    "pause_committed_len": int(
+                        getattr(
+                            req, "context_engineering_pause_committed_len", 0
+                        )
+                        or 0
+                    ),
+                }
+                for req in reqs
+            ],
+        }
+        if batch is not None:
+            payload["batch"] = batch_context_engineering_observation(batch.reqs)
+        logger.info("%s %s", event, json.dumps(payload, sort_keys=True))
 
     def _init_metrics(
         self,
@@ -548,6 +638,13 @@ class SchedulerMetricsReporter:
         self.last_input_throughput = (
             prefill_stats.log_input_tokens / gap_latency if gap_latency > 0 else 0.0
         )
+        batch_start_end_latency = None
+        if (
+            batch is not None
+            and batch.launch_ts is not None
+            and batch.finish_ts is not None
+        ):
+            batch_start_end_latency = batch.finish_ts - batch.launch_ts
 
         pool_stats = self.scheduler.pool_stats_observer.get_pool_stats()
         token_usage_msg = ", ".join(pool_stats.get_prefill_usage_msg_parts()) + ", "
@@ -570,6 +667,24 @@ class SchedulerMetricsReporter:
             f"#queue-req: {len(self.scheduler.waiting_queue)}, "
             f"#pending-token: {prefill_stats.num_pending_tokens}, "
         )
+        if batch is not None:
+            context_stats = batch_context_engineering_stats(batch.reqs)
+            if context_stats["main"] or context_stats["compact"]:
+                msg += (
+                    f"#ce-main: {context_stats['main']}, "
+                    f"#ce-compact: {context_stats['compact']}, "
+                    f"#ce-paired-compact: {context_stats['paired_compact']}, "
+                )
+                self._log_context_engineering_batch(
+                    stage="prefill",
+                    batch=batch,
+                    batch_iter=batch_iter,
+                    extra={
+                        "num_new_seqs": prefill_stats.num_new_seqs,
+                        "log_input_tokens": prefill_stats.log_input_tokens,
+                        "log_hit_tokens": prefill_stats.log_hit_tokens,
+                    },
+                )
 
         if self.scheduler.disaggregation_mode == DisaggregationMode.PREFILL:
             msg += f"#bootstrap-req: {len(self.scheduler.disagg_prefill_bootstrap_queue.queue)}, "
@@ -589,6 +704,9 @@ class SchedulerMetricsReporter:
             )
 
         msg += f"{self._graph_backend_label}: {can_run_cuda_graph}, "
+        msg += f"input-throughput-window (s): {gap_latency:.6f}, "
+        if batch_start_end_latency is not None:
+            msg += f"batch-start-end (s): {batch_start_end_latency:.6f}, "
         msg += f"input throughput (token/s): {self.last_input_throughput:.2f}"
 
         if self.enable_mfu_metrics and gap_latency > 0:
@@ -657,6 +775,10 @@ class SchedulerMetricsReporter:
             )
             self.stats.num_grammar_queue_reqs = len(self.scheduler.grammar_manager)
             self.stats.cache_hit_rate = cache_hit_rate
+            self.stats.prefill_input_throughput_window_s = gap_latency
+            self.stats.prefill_batch_start_end_s = (
+                batch_start_end_latency if batch_start_end_latency is not None else 0.0
+            )
 
             # Memory pool usage ratios / Absolute token counts
             pool_stats.update_scheduler_stats(self.stats)
@@ -839,6 +961,24 @@ class SchedulerMetricsReporter:
             f"gen throughput (token/s): {self.last_gen_throughput:.2f}, "
             f"#queue-req: {len(self.scheduler.waiting_queue)}"
         )
+        context_stats = batch_context_engineering_stats(batch.reqs)
+        if context_stats["main"] or context_stats["compact"]:
+            msg += (
+                f", #ce-main: {context_stats['main']}, "
+                f"#ce-compact: {context_stats['compact']}, "
+                f"#ce-paired-compact: {context_stats['paired_compact']}"
+            )
+            self._log_context_engineering_batch(
+                stage="decode",
+                batch=batch,
+                batch_iter=batch.forward_iter
+                if batch.forward_iter is not None
+                else self.scheduler.forward_ct,
+                extra={
+                    "batch_size": batch.batch_size(),
+                    "num_retracted_reqs": self.num_retracted_reqs,
+                },
+            )
 
         if self.enable_mfu_metrics and gap_latency > 0:
             flops_per_s = self._mfu_log_flops / gap_latency
@@ -867,7 +1007,7 @@ class SchedulerMetricsReporter:
             server_time = datetime.now().isoformat(timespec="milliseconds")
             logger.info(
                 f"{msg}, server time: {server_time}, "
-                f"log interval (s): {log_time_delta:.3f}"
+                f"log interval (ms): {(log_time_delta * 1000):.3f}"
             )
         if self.current_scheduler_metrics_enabled:
             priority_enabled = self.scheduler.enable_priority_scheduling

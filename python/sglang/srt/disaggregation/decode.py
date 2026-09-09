@@ -25,7 +25,7 @@ import time
 from collections import deque
 from dataclasses import dataclass
 from http import HTTPStatus
-from typing import TYPE_CHECKING, Any, Dict, List, Optional, Tuple
+from typing import TYPE_CHECKING, Any, Callable, Dict, List, Optional, Sequence, Tuple
 
 import numpy as np
 import torch
@@ -273,6 +273,9 @@ class DecodeRequest:
     waiting_for_input: bool = False
     metadata_buffer_index: int = -1
     is_rebootstrap: bool = False
+    # A cache-resume is a rebootstrap only for the missing suffix/boundary
+    # handshake.  Unlike true retraction it may reuse decode-side radix L1/L2.
+    is_cache_resume: bool = False
 
     # HiCache Status
     prefix_match: Optional[DecodePrefixMatch] = None
@@ -515,7 +518,11 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
         return kv_manager
 
     def add(
-        self, req: Req, is_retracted: bool = False, is_rebootstrap: bool = False
+        self,
+        req: Req,
+        is_retracted: bool = False,
+        is_rebootstrap: bool = False,
+        is_cache_resume: bool = False,
     ) -> None:
         """Add a request to the pending queue.
 
@@ -534,7 +541,9 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
             self.retracted_queue.append(req)
         else:
             decode_req = self._create_receiver_and_enqueue(
-                req, is_rebootstrap=is_rebootstrap
+                req,
+                is_rebootstrap=is_rebootstrap,
+                is_cache_resume=is_cache_resume,
             )
 
             # NOTE: fake transfer does not need to resolve prefill dp rank in the pending queue
@@ -551,21 +560,25 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
 
             self.pending_reqs.append(decode_req)
 
-    def _match_prefix_and_lock(self, req: Req) -> DecodePrefixMatch:
+    def _match_prefix_and_lock(
+        self, req: Req, token_ids: Optional[Sequence[int]] = None
+    ) -> DecodePrefixMatch:
         """
         Match a request against the decode-side radix cache, lock the matched
         node to prevent eviction, and return the matched prefix information.
         """
+        if token_ids is None:
+            token_ids = req.origin_input_ids
         result = match_prefix_for_req(
             self.tree_cache,
             req,
-            req.origin_input_ids,
+            token_ids,
             cow_mamba=self.tree_cache.supports_mamba(),
             include_req=True,
         )
         # Always lock to match aggregated scheduling behavior
         self.tree_cache.inc_lock_ref(result.last_device_node)
-        return self._build_decode_prefix_match(req, result)
+        return self._build_decode_prefix_match(req, result, token_ids)
 
     def _resolve_prefill_dp_rank(self, req: Req) -> Optional[int]:
         prefill_info = self.kv_manager.prefill_info_table.get(_bootstrap_addr(req))
@@ -588,7 +601,10 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
         return None
 
     def _create_receiver_and_enqueue(
-        self, req: Req, is_rebootstrap: bool = False
+        self,
+        req: Req,
+        is_rebootstrap: bool = False,
+        is_cache_resume: bool = False,
     ) -> DecodeRequest:
         backend = (
             TransferBackend.FAKE
@@ -604,7 +620,10 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
         )
 
         decode_req = DecodeRequest(
-            req=req, kv_receiver=kv_receiver, is_rebootstrap=is_rebootstrap
+            req=req,
+            kv_receiver=kv_receiver,
+            is_rebootstrap=is_rebootstrap,
+            is_cache_resume=is_cache_resume,
         )
         self.queue.append(decode_req)
         return decode_req
@@ -629,6 +648,11 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
         self.held_rebootstrap_reqs = []
         for req in held:
             self.add(req, is_rebootstrap=True)
+
+    def add_cache_resume(self, req: Req) -> None:
+        """Re-admit a compact whose committed KV is owned by decode radix."""
+
+        self.add(req, is_rebootstrap=True, is_cache_resume=True)
 
     @staticmethod
     def _rebootstrap_prefill_len(req: Req) -> int:
@@ -690,7 +714,9 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
             self.kv_manager.register_buffer_to_engine()
 
     def resume_retracted_reqs(
-        self, rids_to_check: Optional[List[str]] = None
+        self,
+        rids_to_check: Optional[List[str]] = None,
+        can_resume: Optional[Callable[[Req], bool]] = None,
     ) -> List[Req]:
         # TODO refactor the scheduling part, reuse with the unified engine logic as much as possible
 
@@ -709,6 +735,8 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
 
         for i, req in enumerate(self.retracted_queue):
             if rids_to_check is not None and req.rid not in rids_to_check:
+                continue
+            if can_resume is not None and not can_resume(req):
                 continue
 
             if self.req_to_token_pool.available_size() <= 0:
@@ -1012,13 +1040,21 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
             # TODO: add new_token ratio
             origin_input_len = self._rebootstrap_prefill_len(decode_req.req)
             prefix_match: Optional[DecodePrefixMatch] = None
+            is_cache_resume = getattr(decode_req, "is_cache_resume", False) is True
             use_decode_radix_cache = (
                 self.scheduler.server_args.disaggregation_decode_enable_radix_cache
-                and not decode_req.is_rebootstrap
+                and (not decode_req.is_rebootstrap or is_cache_resume)
             )
             if use_decode_radix_cache:
                 # Match prefix against decode's radix cache.
-                prefix_match = self._match_prefix_and_lock(decode_req.req)
+                match_token_ids = (
+                    decode_req.req.origin_input_ids + decode_req.req.output_ids
+                    if is_cache_resume
+                    else decode_req.req.origin_input_ids
+                )
+                prefix_match = self._match_prefix_and_lock(
+                    decode_req.req, match_token_ids
+                )
                 prefix_indices = prefix_match.prefix_indices
                 # prefix_len: tokens already on device (L1 hit).
                 # total_prefix_len: full prefix promised to prefill
@@ -1107,6 +1143,16 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
                 prefix_len,
                 total_prefix_len,
             )
+            if dst_kv_indices is None:
+                # Admission estimates can become stale after prefix locking or
+                # concurrent allocator activity.  Keep the request queued and
+                # roll back the request slot/lock so a later pass can retry.
+                self.req_to_token_pool.free(decode_req.req)
+                decode_req.req.kv = None
+                decode_req.req.kv_committed_len = 0
+                if prefix_len > 0:
+                    self.tree_cache.dec_lock_ref(decode_req.req.last_node)
+                break
             decode_req.prefix_match = prefix_match
             if self.scheduler.enable_decode_hicache:
                 self._start_hicache_prefetch(decode_req.req, prefix_match)
@@ -1501,6 +1547,60 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
         )
         return num_new_pages * page_size
 
+    def _evict_for_mamba_request(self: Scheduler, req: Req) -> None:
+        """Evict radix-cached Mamba states before allocating a decode request.
+
+        ``HybridReqToTokenPool.alloc`` allocates the main state and the
+        extra-buffer slots together.  Decode preallocation must therefore
+        reclaim the complete request footprint before entering that method.
+        """
+        if not isinstance(self.req_to_token_pool, HybridReqToTokenPool):
+            return
+
+        mamba_allocator = self.req_to_token_pool.mamba_allocator
+        required_slots = 1  # running request main state
+        if self.req_to_token_pool.enable_mamba_extra_buffer:
+            required_slots += (
+                1
+                if self.req_to_token_pool.enable_mamba_extra_buffer_lazy
+                else self.req_to_token_pool.mamba_ping_pong_track_buffer_size
+            )
+
+        available_slots = mamba_allocator.available_size()
+        shortfall = required_slots - available_slots
+        if shortfall <= 0:
+            return
+
+        if self.tree_cache is None or not self.tree_cache.supports_mamba():
+            logger.warning(
+                "Decode Mamba preallocation is short by %d slot(s), but "
+                "the tree cache cannot evict Mamba states: req=%s "
+                "required=%d available=%d",
+                shortfall,
+                getattr(req, "rid", None),
+                required_slots,
+                available_slots,
+            )
+            return
+
+        evict_result = self.tree_cache.evict(
+            EvictParams(num_tokens=0, mamba_num=shortfall)
+        )
+        available_after = mamba_allocator.available_size()
+        if available_after < required_slots:
+            logger.warning(
+                "Decode Mamba eviction was insufficient: req=%s "
+                "required=%d available_before=%d requested_evict=%d "
+                "evicted=%d available_after=%d mamba_evictable=%d",
+                getattr(req, "rid", None),
+                required_slots,
+                available_slots,
+                shortfall,
+                evict_result.mamba_num_evicted,
+                available_after,
+                self.tree_cache.mamba_evictable_size(),
+            )
+
     def _pre_alloc(
         self,
         req: Req,
@@ -1521,6 +1621,7 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
         if total_prefix_len is None:
             total_prefix_len = prefix_len
 
+        self._evict_for_mamba_request(req)
         req_pool_indices = self.req_to_token_pool.alloc([req])
 
         assert (
@@ -2230,6 +2331,8 @@ class SchedulerDisaggregationDecodeMixin:
                 else:
                     running_batch.merge_batch(new_prebuilt_batch)
 
+        running_batch = self._resume_paused_compacts(running_batch)
+
         # Schedule decode batch
         if running_batch.is_empty():
             ret = None
@@ -2319,7 +2422,14 @@ class SchedulerDisaggregationDecodeMixin:
             self.decode_offload_manager.check_offload_progress()
 
         # try to resume retracted requests if there are enough space for another `num_reserved_decode_tokens` decode steps
-        resumed_reqs = self.disagg_decode_prealloc_queue.resume_retracted_reqs()
+        can_resume = (
+            self._can_resume_context_engineering_retracted_req
+            if self._pair_scheduler_active()
+            else None
+        )
+        resumed_reqs = self.disagg_decode_prealloc_queue.resume_retracted_reqs(
+            can_resume=can_resume
+        )
         self.waiting_queue.extend(resumed_reqs)
         if len(self.disagg_decode_prealloc_queue.retracted_queue) > 0:
             # if there are still retracted requests, we do not allocate new requests

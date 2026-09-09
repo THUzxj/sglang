@@ -263,6 +263,11 @@ class GenerateReqInput:
 
     # For DP routing — external router assigns a specific DP worker
     routed_dp_rank: Optional[int] = None
+    # Deprecated alias for `routed_dp_rank`, still accepted because
+    # sgl-model-gateway's dp-aware mode injects this spelling into every
+    # request it forwards (DPAwareWorker::prepare_request), and the OpenAI
+    # entrypoints and Engine.generate() accept it as well.
+    data_parallel_rank: Optional[int] = None
     # For PD disagg — hint telling decode which prefill DP worker has the KV cache
     disagg_prefill_dp_rank: Optional[int] = None
     # Routing key for routing-key schedule policy
@@ -290,6 +295,10 @@ class GenerateReqInput:
     no_logs: bool = False
     # For custom metric labels
     custom_labels: Optional[Dict[str, str]] = None
+    # Generic request metadata accepted for compatibility with trace-replay
+    # clients. TokenizerManager maps this to custom_labels when no explicit
+    # custom_labels are supplied.
+    metadata: Optional[Dict[str, Any]] = None
 
     # (Internal) Whether to return bytes for image generation
     return_bytes: bool = False
@@ -365,6 +374,18 @@ class GenerateReqInput:
             ValueError: If inputs are not properly specified (e.g., none or all of
                        text, input_ids, input_embeds are provided)
         """
+        if self.data_parallel_rank is not None:
+            import warnings
+
+            warnings.warn(
+                "'data_parallel_rank' is deprecated, use 'routed_dp_rank' instead.",
+                DeprecationWarning,
+                stacklevel=2,
+            )
+            if self.routed_dp_rank is None:
+                self.routed_dp_rank = self.data_parallel_rank
+            self.data_parallel_rank = None
+
         self._validate_inputs()
         self._determine_batch_size()
         if self.session_id is not None and self.session_params is not None:
@@ -829,6 +850,7 @@ class GenerateReqInput:
             extra_key=self.extra_key[i] if self.extra_key is not None else None,
             no_logs=self.no_logs,
             custom_labels=self.custom_labels,
+            metadata=self.metadata,
             return_bytes=self.return_bytes,
             return_entropy=self.return_entropy,
             return_prompt_token_ids=self.return_prompt_token_ids,
@@ -920,6 +942,9 @@ class TokenizedGenerateReqInput(BaseReq, kw_only=True):
 
     # Whether to disallow logging for this request (e.g. due to ZDR)
     no_logs: bool = False
+    # Custom request labels propagated to scheduler-side Req. Context-engineering
+    # experiments use these labels to distinguish main and compact requests.
+    custom_labels: Optional[Dict[str, str]] = None
 
     # (Internal) Whether to return bytes for image generation
     return_bytes: bool = False

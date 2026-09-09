@@ -24,6 +24,7 @@ from sglang.srt.managers.cache_controller import (
     StorageOperation as BaseStorageOperation,
 )
 from sglang.srt.managers.cache_controller import (
+    log_load_back_start,
     make_timing_event_pair,
 )
 from sglang.srt.mem_cache.hicache_storage import (
@@ -502,6 +503,9 @@ class HybridCacheController(BaseHiCacheController):
         producer_event.start_event.record()
 
         ack_start_event, ack_finish_event, timing_enabled = make_timing_event_pair()
+        log_load_back_start(
+            self.mem_pool_device, op.node_ids, len(op.device_indices)
+        )
 
         with device_module.stream(self.load_stream):
             producer_event.start_event.wait(self.load_stream)

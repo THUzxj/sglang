@@ -43,6 +43,7 @@ class SchedulerLoadInquirer:
     spec_algorithm: SpeculativeAlgorithm
     get_running_batch: Callable
     get_waiting_queue: Callable
+    get_paused_compact_queue: Callable
     get_stats: Callable
     get_chunked_req: Callable
     get_disagg_prefill_bootstrap_queue: Callable
@@ -93,7 +94,8 @@ class SchedulerLoadInquirer:
         stats = self.get_stats()
         num_running_reqs = len(self.get_running_batch().reqs)
 
-        waiting_queues = [self.get_waiting_queue()]
+        paused_compact_queue = self.get_paused_compact_queue()
+        waiting_queues = [self.get_waiting_queue(), paused_compact_queue]
         pending_token_queues = [self.get_waiting_queue()]
         awaiting_kv_tokens = 0
         if self.disaggregation_mode == DisaggregationMode.PREFILL:
@@ -197,7 +199,7 @@ class SchedulerLoadInquirer:
         queues = QueueMetrics(
             waiting=len(self.get_waiting_queue()),
             grammar=stats.num_grammar_queue_reqs,
-            paused=stats.num_paused_reqs,
+            paused=len(paused_compact_queue),
             retracted=stats.num_retracted_reqs,
             prealloc_ready=decode_prealloc_ready,
         )

@@ -5,7 +5,7 @@ from __future__ import annotations
 import logging
 from dataclasses import dataclass
 from enum import Enum
-from typing import TYPE_CHECKING, Any, List, Optional
+from typing import TYPE_CHECKING, Any, List, Optional, Sequence
 
 import torch
 
@@ -58,7 +58,9 @@ class HiCacheRestoreResult(Enum):
 class DecodeHiCachePreallocMixin:
     """HiCache hooks for ``DecodePreallocQueue``: issue prefetch + reserve tokens."""
 
-    def _build_decode_prefix_match(self, req: Req, result: Any) -> DecodePrefixMatch:
+    def _build_decode_prefix_match(
+        self, req: Req, result: Any, token_ids: Optional[Sequence[int]] = None
+    ) -> DecodePrefixMatch:
         """Convert a ``match_prefix_for_req`` result into ``DecodePrefixMatch``.
 
         Performs the optional L3 storage hit length query when decode-side
@@ -70,11 +72,14 @@ class DecodeHiCachePreallocMixin:
 
         l3_storage_hit_length = 0
         last_host_node = None
+        if token_ids is None:
+            token_ids = req.origin_input_ids
+
         if self.scheduler.enable_decode_hicache:
             last_host_node = self.tree_cache.resolve_node_handle(result.last_host_node)
             if last_host_node.backuped or last_host_node is self.tree_cache.root_node:
                 matched_len = l1_prefix_len + l2_host_hit_length
-                suffix_tokens = req.origin_input_ids[matched_len:]
+                suffix_tokens = token_ids[matched_len:]
                 last_hash = last_host_node.get_last_hash_value()
                 prefix_keys = (
                     last_host_node.get_prefix_hash_values(last_host_node.parent)
@@ -114,7 +119,12 @@ class DecodeHiCachePreallocMixin:
         try:
             node = self.tree_cache.resolve_node_handle(prefix_match.last_host_node)
             matched_len = prefix_match.l1_prefix_len + prefix_match.l2_host_hit_length
-            suffix = req.origin_input_ids[
+            token_ids = (
+                req.origin_input_ids + req.output_ids
+                if getattr(req, "is_context_engineering_cache_paused", False)
+                else req.origin_input_ids
+            )
+            suffix = token_ids[
                 matched_len : matched_len + prefix_match.l3_storage_hit_length
             ]
             last_hash = node.get_last_hash_value()
@@ -197,28 +207,49 @@ class DecodeHiCacheTransferMixin:
             self.tree_cache.pop_prefetch_loaded_tokens(dr.req.rid)
 
         # Re-match: req.last_node / prefix_indices updated to current device state.
+        token_ids = (
+            dr.req.origin_input_ids + dr.req.output_ids
+            if getattr(dr.req, "is_context_engineering_cache_paused", False)
+            else dr.req.origin_input_ids
+        )[:]
         rematch = match_prefix_for_req(
             self.tree_cache,
             dr.req,
-            dr.req.origin_input_ids,
+            token_ids,
             cow_mamba=False,
             include_req=True,
         )
-        new_indices, restored_node = self.tree_cache.init_load_back(
+        loaded_indices, _ = self.tree_cache.init_load_back(
             InitLoadBackParams(
                 best_match_node=rematch.best_match_node,
                 host_hit_length=rematch.host_hit_length,
                 req=dr.req,
             )
         )
-        # Failback: total coverage < required prefix means device alloc likely failed.
-        if len(rematch.device_indices) + len(new_indices) < pm.decode_prefix_len:
+
+        # init_load_back() returns the full radix path materialized by the load
+        # operation.  That path may overlap the device prefix (or otherwise be
+        # larger than this request's [L1, decode_prefix_len) hole), so it must
+        # not be written to req_to_token directly.  Re-match the frozen request
+        # key after load_back installed the device mappings and derive the exact
+        # request-local interval from that result.
+        restored_match = match_prefix_for_req(
+            self.tree_cache,
+            dr.req,
+            token_ids,
+            cow_mamba=False,
+            include_req=True,
+        )
+        expected_restore_tokens = pm.restore_token_count
+        restored_prefix_len = len(restored_match.device_indices)
+        if restored_prefix_len < pm.decode_prefix_len:
             logger.warning(
-                "HiCache load_back failed for rid=%s: device_indices=%d, "
-                "new_indices=%d, expected decode_prefix_len=%d (l1=%d, l2=%d, l3=%d)",
+                "HiCache load_back failed for rid=%s: rematched_device_indices=%d, "
+                "loaded_path_indices=%d, expected decode_prefix_len=%d "
+                "(l1=%d, l2=%d, l3=%d)",
                 dr.req.rid,
-                len(rematch.device_indices),
-                len(new_indices),
+                restored_prefix_len,
+                len(loaded_indices),
                 pm.decode_prefix_len,
                 pm.l1_prefix_len,
                 pm.l2_host_hit_length,
@@ -227,13 +258,27 @@ class DecodeHiCacheTransferMixin:
             dr.hicache_restore_status = HiCacheRestoreResult.FAILED
             return False
 
-        dr.hicache_restored_kv_indices = torch.cat(
-            [rematch.device_indices[pm.l1_prefix_len :], new_indices]
-        )
-        dr.hicache_restored_node = restored_node
-        self.tree_cache.inc_lock_ref(restored_node)
+        restored_kv_indices = restored_match.device_indices[
+            pm.l1_prefix_len : pm.decode_prefix_len
+        ].clone()
+        if len(restored_kv_indices) != expected_restore_tokens:
+            logger.warning(
+                "HiCache load_back produced an invalid restore interval for rid=%s: "
+                "restored=%d, expected=%d, l1=%d, decode_prefix_len=%d",
+                dr.req.rid,
+                len(restored_kv_indices),
+                expected_restore_tokens,
+                pm.l1_prefix_len,
+                pm.decode_prefix_len,
+            )
+            dr.hicache_restore_status = HiCacheRestoreResult.FAILED
+            return False
 
-        if len(new_indices) == 0:
+        dr.hicache_restored_kv_indices = restored_kv_indices
+        dr.hicache_restored_node = restored_match.last_device_node
+        self.tree_cache.inc_lock_ref(dr.hicache_restored_node)
+
+        if len(loaded_indices) == 0:
             # Whole prefix already on device; no DMA needed.
             dr.hicache_restore_status = HiCacheRestoreResult.READY
             return False
@@ -296,6 +341,20 @@ class DecodeHiCacheTransferMixin:
         if prefix_match is None or not prefix_match.needs_local_restore:
             return
 
+        restored_kv_indices = decode_req.hicache_restored_kv_indices
+        expected_restore_tokens = prefix_match.restore_token_count
+        if restored_kv_indices is None or len(restored_kv_indices) != expected_restore_tokens:
+            actual_restore_tokens = (
+                None if restored_kv_indices is None else len(restored_kv_indices)
+            )
+            raise RuntimeError(
+                "Cannot commit HiCache restore for "
+                f"rid={decode_req.req.rid}: restored={actual_restore_tokens}, "
+                f"expected={expected_restore_tokens}, "
+                f"l1={prefix_match.l1_prefix_len}, "
+                f"decode_prefix_len={prefix_match.decode_prefix_len}"
+            )
+
         self.tree_cache.dec_lock_ref(prefix_match.last_device_node)
 
         self.tree_cache.req_to_token_pool.write(
@@ -303,9 +362,9 @@ class DecodeHiCacheTransferMixin:
                 decode_req.req.req_pool_idx,
                 slice(prefix_match.l1_prefix_len, prefix_match.decode_prefix_len),
             ),
-            decode_req.hicache_restored_kv_indices,
+            restored_kv_indices,
         )
         decode_req.req.prefix_indices = torch.cat(
-            [prefix_match.prefix_indices, decode_req.hicache_restored_kv_indices]
+            [prefix_match.prefix_indices, restored_kv_indices]
         )
         decode_req.req.last_node = decode_req.hicache_restored_node

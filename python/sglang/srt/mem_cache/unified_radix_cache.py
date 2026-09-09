@@ -10,6 +10,10 @@ import torch
 
 from sglang.srt.distributed.communication_tags import P2PTag
 from sglang.srt.environ import envs
+from sglang.srt.managers.cache_controller import (
+    estimate_primary_kv_bytes,
+    log_load_back_finish,
+)
 from sglang.srt.mem_cache.base_prefix_cache import (
     BasePrefixCache,
     DecLockRefParams,
@@ -31,6 +35,7 @@ from sglang.srt.mem_cache.hicache_storage import (
 )
 from sglang.srt.mem_cache.hybrid_cache.hybrid_cache_controller import (
     HybridCacheController,
+    PrefetchOperation,
 )
 from sglang.srt.mem_cache.radix_cache import RadixKey
 from sglang.srt.mem_cache.unified_cache.cache_action import (
@@ -99,6 +104,10 @@ class _OngoingWriteThrough(NamedTuple):
     node_id: NodeId
     lock_params: Optional[DecLockRefParams]
     publish_node_ids: list[NodeId]
+    started_at: float = 0.0
+    num_tokens: int = 0
+    estimated_bytes: Optional[int] = None
+    write_back: bool = False
 
 
 class _OngoingLoadBack(NamedTuple):
@@ -288,6 +297,9 @@ class UnifiedRadixCache(BasePrefixCache):
         """Full reset: destroy entire tree and all state."""
         self.tree_core.reset()
         self.session_refs.reset()
+        # Compatibility bookkeeping for the legacy decode offload manager.
+        # UnifiedTreeCore owns the real component lock counters.
+        self._legacy_protected_size = 0
 
         # Reset Controller.
         self.session.slots.clear()
@@ -513,26 +525,79 @@ class UnifiedRadixCache(BasePrefixCache):
                     backup_kv = self._evict_device_leaf(node_id, tracker)
                     if backup_kv is not None:
                         # Deferred demote: run the D->H backup, demote only on success.
+                        debug_write_back = logger.isEnabledFor(logging.DEBUG)
+                        write_back_start = (
+                            time.perf_counter() if debug_write_back else 0.0
+                        )
+                        if debug_write_back:
+                            node = self.tree_core.node_by_id(node_id)
+                            device_value = node.component_data[
+                                BASE_COMPONENT_TYPE
+                            ].value
+                            num_tokens = (
+                                len(device_value) if device_value is not None else 0
+                            )
+                            logger.debug(
+                                "HiCache L1->L2 write-back start: "
+                                "node_id=%d component=%s tokens=%d",
+                                node_id,
+                                ct.name,
+                                num_tokens,
+                            )
                         written = self._execute_and_commit_kv_backup(
                             backup_kv, write_back=True
                         )
                         if written > 0:
                             self.writing_check(write_back=True)
+                            if debug_write_back:
+                                elapsed = time.perf_counter() - write_back_start
+                                copied_bytes = estimate_primary_kv_bytes(
+                                    self.cache_controller.mem_pool_device, written
+                                )
+                                bandwidth = (
+                                    copied_bytes / elapsed / 1e9
+                                    if copied_bytes is not None and elapsed > 0
+                                    else None
+                                )
+                                logger.debug(
+                                    "HiCache L1->L2 write-back finish: "
+                                    "node_id=%d component=%s tokens=%d "
+                                    "estimated_bytes=%s elapsed_ms=%.3f "
+                                    "effective_bandwidth_gb_s=%s",
+                                    node_id,
+                                    ct.name,
+                                    written,
+                                    copied_bytes,
+                                    elapsed * 1e3,
+                                    f"{bandwidth:.3f}"
+                                    if bandwidth is not None
+                                    else "unknown",
+                                )
                             self._demote(node_id, tracker)
-                        elif self._drop_subtree_no_host(node_id, tracker):
-                            logger.warning(
-                                "write_back: KV subtree dropped without backup "
-                                "due to host memory pressure, root node %d",
-                                node_id,
-                            )
                         else:
-                            logger.warning(
-                                "write_back: backup failed under host memory "
-                                "pressure but subtree drop declined (node "
-                                "locked); root node %d stays device-resident "
-                                "until host space frees",
-                                node_id,
-                            )
+                            if debug_write_back:
+                                logger.debug(
+                                    "HiCache L1->L2 write-back finish: "
+                                    "node_id=%d component=%s status=failed "
+                                    "elapsed_ms=%.3f",
+                                    node_id,
+                                    ct.name,
+                                    (time.perf_counter() - write_back_start) * 1e3,
+                                )
+                            if self._drop_subtree_no_host(node_id, tracker):
+                                logger.warning(
+                                    "write_back: KV subtree dropped without backup "
+                                    "due to host memory pressure, root node %d",
+                                    node_id,
+                                )
+                            else:
+                                logger.warning(
+                                    "write_back: backup failed under host memory "
+                                    "pressure but subtree drop declined (node "
+                                    "locked); root node %d stays device-resident "
+                                    "until host space frees",
+                                    node_id,
+                                )
             finally:
                 self.tree_core.evict_device_end(ct)
 
@@ -874,16 +939,52 @@ class UnifiedRadixCache(BasePrefixCache):
                 continue
             device_value, comp_xfers = self.tree_core.build_backup_spec(node_id)
             sidecar_xfers = self._build_backup_sidecar(device_value, comp_xfers)
+            debug_write_through = (
+                not write_back and logger.isEnabledFor(logging.DEBUG)
+            )
+            started_at = time.perf_counter() if debug_write_through else 0.0
+            num_tokens = len(device_value)
+            estimated_bytes = (
+                estimate_primary_kv_bytes(
+                    self.cache_controller.mem_pool_device, num_tokens
+                )
+                if debug_write_through
+                else None
+            )
+            if debug_write_through:
+                logger.debug(
+                    "HiCache L1->L2 write-through start: "
+                    "node_id=%d policy=%s tokens=%d estimated_bytes=%s",
+                    node_id,
+                    self.cache_controller.write_policy,
+                    num_tokens,
+                    estimated_bytes,
+                )
             host_indices = self._execute_kv_backup(
                 node_id, device_value, comp_xfers, sidecar_xfers
             )
             if host_indices is None:
+                if debug_write_through:
+                    logger.debug(
+                        "HiCache L1->L2 write-through finish: "
+                        "node_id=%d policy=%s status=failed elapsed_ms=%.3f",
+                        node_id,
+                        self.cache_controller.write_policy,
+                        (time.perf_counter() - started_at) * 1e3,
+                    )
                 return 0
             self.tree_core.commit_backup(node_id, host_indices, comp_xfers)
             lock_params = None
             if not write_back:
                 lock_params = self.inc_lock_ref(node_id).to_dec_params()
-            self._track_write_through_node(node_id, lock_params)
+            self._track_write_through_node(
+                node_id,
+                lock_params,
+                started_at=started_at,
+                num_tokens=num_tokens,
+                estimated_bytes=estimated_bytes,
+                write_back=write_back,
+            )
             written = len(host_indices)
         return written
 
@@ -912,10 +1013,21 @@ class UnifiedRadixCache(BasePrefixCache):
         self,
         node_id: NodeId,
         lock_params: Optional[DecLockRefParams],
+        *,
+        started_at: float = 0.0,
+        num_tokens: int = 0,
+        estimated_bytes: Optional[int] = None,
+        write_back: bool = False,
     ) -> None:
         self.tree_core.mark_write_through_pending(node_id)
         self.ongoing_write_through[node_id] = _OngoingWriteThrough(
-            node_id, lock_params, [node_id]
+            node_id,
+            lock_params,
+            [node_id],
+            started_at,
+            num_tokens,
+            estimated_bytes,
+            write_back,
         )
 
     def _replace_pending_write_through_node(
@@ -925,7 +1037,7 @@ class UnifiedRadixCache(BasePrefixCache):
         if pending is None:
             return
 
-        lock_node_id, lock_params, publish_node_ids = pending
+        publish_node_ids = pending.publish_node_ids
         updated_node_ids = []
         replaced = False
         for node_id in publish_node_ids:
@@ -938,17 +1050,38 @@ class UnifiedRadixCache(BasePrefixCache):
         if not replaced:
             return
 
-        self.ongoing_write_through[ack_id] = _OngoingWriteThrough(
-            lock_node_id,
-            lock_params,
-            updated_node_ids,
+        self.ongoing_write_through[ack_id] = pending._replace(
+            publish_node_ids=updated_node_ids
         )
 
     def _finish_write_through_ack(self, ack_id: int) -> None:
-        lock_node_id, lock_params, publish_node_ids = self.ongoing_write_through.pop(
-            ack_id
-        )
+        pending = self.ongoing_write_through.pop(ack_id)
+        lock_node_id = pending.node_id
+        lock_params = pending.lock_params
+        publish_node_ids = pending.publish_node_ids
         self.tree_core.finish_write_through(publish_node_ids, ack_id)
+        if (
+            not pending.write_back
+            and pending.started_at > 0
+            and logger.isEnabledFor(logging.DEBUG)
+        ):
+            elapsed = time.perf_counter() - pending.started_at
+            bandwidth = (
+                pending.estimated_bytes / elapsed / 1e9
+                if pending.estimated_bytes is not None and elapsed > 0
+                else None
+            )
+            logger.debug(
+                "HiCache L1->L2 write-through finish: "
+                "node_id=%d policy=%s tokens=%d estimated_bytes=%s "
+                "elapsed_ms=%.3f effective_bandwidth_gb_s=%s",
+                ack_id,
+                self.cache_controller.write_policy,
+                pending.num_tokens,
+                pending.estimated_bytes,
+                elapsed * 1e3,
+                f"{bandwidth:.3f}" if bandwidth is not None else "unknown",
+            )
         if lock_params is not None:
             self.dec_lock_ref(lock_node_id, lock_params)
         if self.enable_storage:
@@ -1156,6 +1289,78 @@ class UnifiedRadixCache(BasePrefixCache):
 
     def get_prefix_hash_values(self, node_id: NodeId) -> list[str]:
         return self.tree_core.get_prefix_hash_values(node_id)
+
+    def is_load_back_event_done(self, consumer_index: int) -> bool:
+        """Return True after the local load-back event is complete."""
+        if consumer_index < 0:
+            return True
+        if self.cache_controller is None:
+            return True
+
+        finish_event = self.cache_controller.layer_done_counter.events[
+            consumer_index
+        ].finish_event
+        event_done = torch.tensor(
+            int(finish_event.query()), dtype=torch.int, device="cpu"
+        )
+        self._all_reduce(event_done, torch.distributed.ReduceOp.MIN)
+        if not event_done.item():
+            return False
+
+        self.loading_check()
+        return True
+
+    def query_storage_hit_length(
+        self,
+        last_host_node_id: NodeId,
+        new_input_tokens: list[int],
+        last_hash: Optional[str] = None,
+        prefix_keys: Optional[list[str]] = None,
+    ) -> int:
+        if not self.enable_storage or self.cache_controller is None:
+            return 0
+        if self.cache_controller.prefetch_rate_limited():
+            return 0
+
+        extra_key = self.tree_core.prefetch_anchor_info(last_host_node_id)
+        prefetch_key = RadixKey(
+            new_input_tokens,
+            extra_key=extra_key,
+            is_bigram=self.tree_core.is_eagle,
+        ).page_aligned(self.page_size)
+        if len(prefetch_key) < self.prefetch_threshold:
+            return 0
+
+        # Hybrid SSM checkpoints are stored for the trailing page of every
+        # backed-up prefix.  Include that requirement in the synchronous hit
+        # query so decode never reports a restorable KV prefix whose matching
+        # Mamba state is absent.  The key value itself is replaced by the
+        # controller with the hash at the candidate prefix boundary; only its
+        # cardinality is significant here.
+        extra_pools = None
+        if ComponentType.MAMBA in self.tree_components:
+            extra_pools = [
+                PoolTransfer(
+                    name=PoolName.MAMBA,
+                    keys=["__trailing_page__"],
+                    hit_policy=PoolHitPolicy.TRAILING_PAGES,
+                )
+            ]
+
+        operation = PrefetchOperation(
+            "__storage_hit_query__",
+            prefetch_key,
+            last_hash,
+            prefix_keys,
+            pool_transfers=extra_pools,
+        )
+        _, storage_hit_count = self.cache_controller._storage_hit_query(operation)
+        storage_hit_count_tensor = torch.tensor(storage_hit_count, dtype=torch.int)
+        self._all_reduce_attn_groups(
+            storage_hit_count_tensor, torch.distributed.ReduceOp.MIN
+        )
+        storage_hit_count = storage_hit_count_tensor.item()
+        return storage_hit_count - (storage_hit_count % self.page_size)
 
     def prefetch_from_storage(
         self,
@@ -1853,6 +2058,10 @@ class UnifiedRadixCache(BasePrefixCache):
                 self._finish_write_through_ack(ack_id)
             finish_count -= 1
 
+    def flush_write_through_acks(self) -> None:
+        """Poll completed write-through acks without blocking the scheduler."""
+        self.writing_check(write_back=False)
+
     def loading_check(self, finish_count: Optional[int] = None) -> None:
         """Poll load-back completions."""
         cc = self.cache_controller
@@ -1873,6 +2082,7 @@ class UnifiedRadixCache(BasePrefixCache):
         while finish_count > 0:
             ack = cc.ack_load_queue.pop(0)
             ack.finish_event.synchronize()
+            log_load_back_finish(cc.mem_pool_device, ack)
             for ack_id in ack.node_ids:
                 node, lock_params, host_lock_params = self.ongoing_load_back.pop(ack_id)
                 self.dec_lock_ref(node, lock_params)
@@ -2045,13 +2255,30 @@ class UnifiedRadixCache(BasePrefixCache):
         return self.session.session_held_mamba_slots(active_pool_idxs)
 
     def evictable_size(self) -> int:
-        return self.tree_core.evictable_size()
+        raw_evictable_size = self.tree_core.evictable_size()
+        try:
+            available_size = self.token_to_kv_pool_allocator.available_size()
+            allocated_size = self.token_to_kv_pool_allocator.size - available_size
+            return max(0, min(raw_evictable_size, allocated_size))
+        except AttributeError:
+            return raw_evictable_size
 
     def protected_size(self) -> int:
         return self.tree_core.protected_size()
 
+    @property
+    def protected_size_(self) -> int:
+        return self._legacy_protected_size
+
+    @protected_size_.setter
+    def protected_size_(self, value: int) -> None:
+        if value < 0:
+            logger.debug("Clamp UnifiedRadixCache protected_size_ from %s to 0", value)
+            value = 0
+        self._legacy_protected_size = value
+
     def full_evictable_size(self) -> int:
-        return self.tree_core.full_evictable_size()
+        return self.evictable_size()
 
     def full_protected_size(self) -> int:
         return self.tree_core.full_protected_size()
@@ -2083,7 +2310,7 @@ class UnifiedRadixCache(BasePrefixCache):
             full_available_size = self.token_to_kv_pool_allocator.full_available_size()
         else:
             full_available_size = self.token_to_kv_pool_allocator.available_size()
-        full_evictable = self.tree_core.component_evictable_size(BASE_COMPONENT_TYPE)
+        full_evictable = self.evictable_size()
         lines = [
             f"Available full tokens: {full_available_size + full_evictable} "
             f"(full_available_size={full_available_size} + full_evictable_size_={full_evictable})"

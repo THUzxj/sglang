@@ -817,6 +817,73 @@ class ServerArgs:
         "The maximum number of requests in a prefill batch. If not specified, there is no limit.",
         NS("schedule"),
     ] = None
+    enable_pair_scheduler: A[
+        bool,
+        "Enable pair scheduling for context-engineering workloads. Main requests are scheduled before compact requests, and paired compact requests are admitted only with remaining budget.",
+        NS("schedule"),
+    ] = False
+    context_engineering_compact_pause_mode: A[
+        Literal["retract", "gpu_resident", "radix_evictable"],
+        Arg(
+            help=(
+                "How pair scheduling pauses compact decode requests. 'retract' "
+                "uses the normal KV release/offload path; 'gpu_resident' parks "
+                "the request outside the running batch while retaining GPU KV; "
+                "'radix_evictable' detaches the GPU request slot and transfers "
+                "committed KV ownership to radix cache, allowing an L1 hit or "
+                "HiCache L2 load-back when the compact resumes. "
+                "With unified HiCache, a real KV-pressure downgrade inserts the "
+                "committed compact prefix into radix cache; write_back then "
+                "backs evicted pages to L2 and reloads them on re-admission."
+            ),
+            choices=["retract", "gpu_resident", "radix_evictable"],
+        ),
+        NS("schedule"),
+    ] = "retract"
+    context_engineering_decode_attention_token_budget: A[
+        Optional[int],
+        Arg(
+            help=(
+                "Maximum sum of decode attention tokens for compact-aware decode batches. "
+                "If unset, only the batch-size budget is enforced."
+            ),
+            type_parser=human_readable_int,
+        ),
+        NS("schedule"),
+    ] = None
+    context_engineering_prefill_attention_token_budget: A[
+        Optional[int],
+        Arg(
+            help=(
+                "Maximum sum of prefill-batch attention tokens for compact-aware "
+                "prefill admission. Main/foreground requests are admitted by the "
+                "normal scheduler; compact requests can use only the remaining budget."
+            ),
+            type_parser=human_readable_int,
+        ),
+        NS("schedule"),
+    ] = None
+    context_engineering_decode_max_batch_size: A[
+        int,
+        "Maximum decode batch size for pair scheduling.",
+        NS("schedule"),
+    ] = 256
+    context_engineering_prefill_max_batch_size: A[
+        int,
+        "Maximum prefill batch size for compact-aware compact admission.",
+        NS("schedule"),
+    ] = 256
+    context_engineering_compact_attention_cost_ratio: A[
+        float,
+        Arg(
+            help=(
+                "Multiplier applied to compact requests when accounting "
+                "compact-aware prefill/decode attention-token budgets. "
+                "This changes scheduler admission only, not the actual model work."
+            ),
+        ),
+        NS("schedule"),
+    ] = 1.0
     schedule_policy: A[
         str,
         Arg(
@@ -8825,6 +8892,26 @@ class ServerArgs:
             raise ValueError(
                 "--retraction-policy priority requires --enable-priority-scheduling"
             )
+
+        if self.context_engineering_compact_pause_mode == "radix_evictable":
+            if not self.enable_pair_scheduler:
+                raise ValueError(
+                    "--context-engineering-compact-pause-mode radix_evictable "
+                    "requires --enable-pair-scheduler"
+                )
+            if not self.enable_hierarchical_cache:
+                raise ValueError(
+                    "--context-engineering-compact-pause-mode radix_evictable "
+                    "requires --enable-hierarchical-cache"
+                )
+            if (
+                self.disaggregation_mode == "decode"
+                and not self.disaggregation_decode_enable_radix_cache
+            ):
+                raise ValueError(
+                    "PD decode radix_evictable compact pause requires "
+                    "--disaggregation-decode-enable-radix-cache"
+                )
 
         # Check hisparse
         # Moved to the resolution pipeline (arg_groups/overrides.py:

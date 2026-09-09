@@ -808,6 +808,7 @@ class Req(ReqDllmMixin):
         metrics_collector: Optional[SchedulerMetricsCollector] = None,
         extra_key: Optional[str] = None,
         routing_key: Optional[str] = None,
+        custom_labels: Optional[Dict[str, str]] = None,
         dimensions: Optional[int] = None,
         http_worker_ipc: Optional[str] = None,
         time_stats: Optional[
@@ -894,6 +895,10 @@ class Req(ReqDllmMixin):
         self.extra_key = extra_key
         self.lora_id = lora_id
         self.routing_key = routing_key
+        self.custom_labels = custom_labels or {}
+        self.context_engineering_kind = self._derive_context_engineering_kind()
+        self.context_engineering_pair_key = self._derive_context_engineering_pair_key()
+        self.allow_compact_drain = self._derive_allow_compact_drain()
 
         # Memory pool info
         self.req_pool_idx: Optional[int] = None
@@ -986,6 +991,14 @@ class Req(ReqDllmMixin):
 
         # For retraction
         self.is_retracted = False
+        # GPU-resident pair-scheduler pause. Unlike retraction, this preserves
+        # req_pool_idx, KV mappings, and decode progress.
+        self.is_context_engineering_paused = False
+        # ``radix_evictable`` compact pause keeps the Python Req as control-plane
+        # state while releasing req_pool_idx/Req.kv.  The committed KV is owned
+        # by radix cache and is rediscovered through prefix match on resume.
+        self.is_context_engineering_cache_paused = False
+        self.context_engineering_pause_committed_len = 0
         # Indicates if the req has ever been retracted.
         self.retracted_stain = False
 
@@ -1153,6 +1166,52 @@ class Req(ReqDllmMixin):
 
         # For hisparse
         self.hisparse_staging = False
+
+    def _derive_context_engineering_kind(self) -> str:
+        labels = self.custom_labels if isinstance(self.custom_labels, dict) else {}
+        request_class = str(labels.get("request_class") or "").lower()
+        call_kind = str(labels.get("call_kind") or "").lower()
+        if request_class in {"compact", "compaction", "context_engineering"}:
+            return "compact"
+        if request_class in {"main", "agent", "agent_run"}:
+            return "main"
+        if call_kind == "context_engineering":
+            return "compact"
+        if call_kind == "agent_run":
+            return "main"
+        return ""
+
+    def _derive_context_engineering_pair_key(self) -> Optional[str]:
+        labels = self.custom_labels if isinstance(self.custom_labels, dict) else {}
+        for key in (
+            "pair_key",
+            "run_id",
+            "context_engineering_pair_key",
+            "compact_pair_key",
+            "session_id",
+        ):
+            value = labels.get(key)
+            if value is not None and str(value):
+                return str(value)
+        if self.session_id:
+            return str(self.session_id)
+        return None
+
+    def _derive_allow_compact_drain(self) -> bool:
+        labels = self.custom_labels if isinstance(self.custom_labels, dict) else {}
+        value = labels.get("allow_compact_drain")
+        if isinstance(value, str):
+            return value.lower() in {"1", "true", "yes"}
+        return bool(value)
+
+    def is_context_engineering_main(self) -> bool:
+        return self.context_engineering_kind == "main"
+
+    def is_context_engineering_compact(self) -> bool:
+        return self.context_engineering_kind == "compact"
+
+    def is_context_engineering_request(self) -> bool:
+        return self.context_engineering_kind in {"main", "compact"}
 
     @property
     def seqlen(self) -> int:
@@ -1645,6 +1704,45 @@ class Req(ReqDllmMixin):
         if self.input_embeds is not None:
             self.output_ids = array("q")
 
+    def detach_gpu_state_for_cache_pause(self, committed_len: int) -> None:
+        """Drop request-local GPU bindings while retaining decode metadata.
+
+        The caller must first transfer the committed KV to radix cache with
+        ``release_kv_cache(..., is_insert=True)``.  Unlike ``reset_for_retract``,
+        this does not increment retraction_count or discard output/logprob/
+        grammar state: a cache-paused compact is the same logical attempt.
+        """
+
+        assert self.req_pool_idx is None and self.kv is None
+        self.context_engineering_pause_committed_len = committed_len
+        self.prefix_indices = torch.empty((0,), dtype=torch.int64)
+        self.last_node = None
+        self.last_host_node = None
+        self.best_match_node = None
+        self.host_hit_length = 0
+        self.swa_host_hit_length = 0
+        self.mamba_host_hit_length = 0
+        self.cache_protected_len = 0
+        self.num_matched_prefix_tokens = 0
+        self.swa_uuid_for_lock = None
+        self.swa_prefix_lock_released = False
+        self.skip_lock_node_ids = {}
+        self.extend_range = None
+        self.dllm_initialized = False
+        self.is_retracted = True
+        self.retracted_stain = True
+        self.inflight_middle_chunks = 0
+        self.mamba_pool_idx = None
+        self.mamba_ping_pong_track_buffer = None
+        self.mamba_next_track_idx = None
+        self.mamba_last_track_seqlen = None
+        self.mamba_branching_seqlen = None
+        self.mamba_cow_src_index = None
+        self.mamba_needs_clear = False
+        self.kv_committed_len = 0
+        self.extend_batch_idx = 0
+        self.decode_batch_idx = 0
+
     def offload_kv_cache(self, req_to_token_pool, token_to_kv_pool_allocator):
         token_indices = req_to_token_pool.req_to_token[
             self.req_pool_idx, : self.seqlen - 1
@@ -1665,23 +1763,7 @@ class Req(ReqDllmMixin):
         del self.kv_cache_cpu
 
     def build_rebootstrap_payload(self) -> dict:
-        """Build the prefill ``/generate`` payload that asks the original prefill
-        worker to recompute this request's prefix KV under the current weights
-        (PD true-retraction rebootstrap).
-
-        ``input_ids`` are coerced to plain ``int`` so the payload is always
-        JSON-serializable even when ``origin_input_ids``/``output_ids`` hold
-        numpy scalars. The sampling-param allow-list forces ``max_new_tokens=1``
-        and drops stop/grammar/min_new_tokens so the recompute only re-derives
-        the prefix KV and samples a single handoff token. The already-emitted
-        boundary token is replayed on the *decode* side (the transfer commit
-        overrides the sampled handoff with it), so it is intentionally not sent
-        to the prefill here.
-        """
-        # TODO: multi-modal requests are not supported here. The payload only
-        # carries token ``input_ids`` and drops any image/audio/video inputs, so
-        # the rebootstrap recompute would not reproduce the original prefix KV
-        # for multi-modal requests. Add multi-modal support before enabling it.
+        """Build the prefill request used to resume a PD true retraction."""
         sp = self.sampling_params
         return {
             "input_ids": [int(x) for x in self.origin_input_ids]
@@ -1710,6 +1792,7 @@ class Req(ReqDllmMixin):
             "extra_key": self.extra_key,
             "routing_key": self.routing_key,
             "disagg_prefill_dp_rank": self.disagg_prefill_dp_rank,
+            "custom_labels": dict(getattr(self, "custom_labels", {})),
         }
 
     def log_time_stats(self):
@@ -1841,6 +1924,7 @@ def release_req(
     tree_cache: BasePrefixCache,
     hisparse_coordinator: Optional[HiSparseCoordinator],
     offload_kv: bool = True,
+    insert_into_radix_cache: bool = False,
 ) -> None:
     if hisparse_coordinator is not None and not req.finished():
         hisparse_coordinator.retract_req(req)
@@ -1851,8 +1935,12 @@ def release_req(
     # pass offload_kv=False to skip the wasteful device->host copy.
     if server_args.disaggregation_mode == "decode" and offload_kv:
         req.offload_kv_cache(req_to_token_pool, token_to_kv_pool_allocator)
-    # TODO (csy): for preempted requests, we may want to insert into the tree
-    release_kv_cache(req, tree_cache, is_insert=False)
+    # GPU-resident compact pauses use this only when real KV pressure forces a
+    # downgrade.  In unified mode, inserting the committed prefix transfers
+    # ownership to the radix cache without discarding the data.  With HiCache
+    # write-back, the following eviction backs an unlocked victim to L2 before
+    # freeing its L1 pages; re-admission reloads it through normal prefix match.
+    release_kv_cache(req, tree_cache, is_insert=insert_into_radix_cache)
     # NOTE(lsyin): we should use the newly evictable memory instantly.
     num_tokens = remaing_req_count * envs.SGLANG_RETRACT_DECODE_STEPS.get()
     evict_from_tree_cache(tree_cache, num_tokens)
@@ -1979,6 +2067,7 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
     prefill_stats: Optional[PrefillStats] = None
     forward_iter: Optional[int] = None
     launch_ts: Optional[float] = None
+    finish_ts: Optional[float] = None
 
     # === GPU tensors crossing to ForwardBatch (clone targets for stream isolation) ===
     # Batched arguments to model runner
@@ -2732,29 +2821,100 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
         return self.token_to_kv_pool_allocator.available_size() >= num_tokens
 
     def retract_decode(
-        self, server_args: ServerArgs
+        self,
+        server_args: ServerArgs,
+        preferred_pair_key: Optional[str] = None,
     ) -> Tuple[List[Req], float, List[Req]]:
         """Retract the decoding requests when there is not enough memory."""
         sorted_indices = self._get_decode_retraction_order(self.reqs, server_args)
 
         retracted_reqs = []
         first_iter = True
+        # If retracting the compact side of a pair did not free enough KV,
+        # retract the matching main before moving to another pair. This makes
+        # pair eviction gradual (width 1 or 2) instead of unconditionally
+        # evicting both physical requests.
+        continue_pair_key = preferred_pair_key
         while first_iter or (
             not self.check_decode_mem(selected_indices=sorted_indices)
         ):
-            if len(sorted_indices) == 1:
-                # Always keep at least one request
+            if not sorted_indices:
                 break
 
             first_iter = False
-            idx = sorted_indices.pop()
+            idx = None
+            if continue_pair_key is not None:
+                idx = next(
+                    (
+                        candidate
+                        for candidate in reversed(sorted_indices)
+                        if self.reqs[candidate].context_engineering_pair_key
+                        == continue_pair_key
+                    ),
+                    None,
+                )
+
+            if idx is None:
+                idx = sorted_indices[-1]
+                candidate_req = self.reqs[idx]
+                pair_key = (
+                    candidate_req.context_engineering_pair_key
+                    if server_args.enable_pair_scheduler
+                    and candidate_req.is_context_engineering_request()
+                    else None
+                )
+                # Compact is background work. When the selected victim belongs
+                # to a live pair, retract compact first and re-check memory
+                # before disturbing main.
+                if pair_key:
+                    idx = next(
+                        (
+                            candidate
+                            for candidate in reversed(sorted_indices)
+                            if self.reqs[candidate].context_engineering_pair_key
+                            == pair_key
+                            and self.reqs[candidate].is_context_engineering_compact()
+                        ),
+                        idx,
+                    )
+
+            req = self.reqs[idx]
+            pair_key = (
+                req.context_engineering_pair_key
+                if server_args.enable_pair_scheduler
+                and req.is_context_engineering_request()
+                else None
+            )
+            pair_members_remaining = [
+                candidate
+                for candidate in sorted_indices
+                if candidate != idx
+                and pair_key is not None
+                and self.reqs[candidate].context_engineering_pair_key == pair_key
+                and self.reqs[candidate].is_context_engineering_request()
+            ]
+
+            # Preserve the generic scheduler's last-request safeguard. Pair
+            # continuation and a lone compact may be retracted to an empty
+            # batch because both have a recoverable queue path.
+            if (
+                len(sorted_indices) == 1
+                and continue_pair_key is None
+                and not req.is_context_engineering_compact()
+            ):
+                break
+
+            sorted_indices.remove(idx)
             req = self.reqs[idx]
             retracted_reqs.append(req)
-            # release memory and don't insert into the tree because we need the space instantly
+            # Release memory and don't insert into the tree because we need the
+            # space instantly. In PD decode this remains the real CPU-offload
+            # retraction path; GPU-resident parking never calls this method.
             self.release_req(idx, len(sorted_indices), server_args)
+            continue_pair_key = pair_key if pair_members_remaining else None
 
         reqs_to_abort: List[Req] = []
-        if len(sorted_indices) <= 1 and not self.check_decode_mem(
+        if sorted_indices and len(sorted_indices) <= 1 and not self.check_decode_mem(
             selected_indices=sorted_indices
         ):
             # Even the last remaining request cannot fit in memory.
@@ -2785,20 +2945,16 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
     def _get_decode_retraction_order(
         reqs: List[Req], server_args: ServerArgs
     ) -> List[int]:
-        """Return indices ordered from most-preferred to least-preferred to keep.
-
-        The retraction loop pops from the end of this list, so the least-preferred
-        request is retracted first.
-        """
+        """Return indices from most-preferred to least-preferred to keep."""
         sorted_indices = list(range(len(reqs)))
-
-        # TODO(lsyin): improve retraction policy for radix cache
 
         def length_key(req: Req) -> Tuple[int, int]:
             return (len(req.output_ids), -len(req.origin_input_ids))
 
         if server_args.retraction_policy == "priority":
-            priority_sign = 1 if server_args.schedule_low_priority_values_first else -1
+            priority_sign = (
+                1 if server_args.schedule_low_priority_values_first else -1
+            )
 
             def retraction_key(req: Req) -> Tuple[int, int, int]:
                 priority = req.priority
@@ -2811,15 +2967,11 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
                 return (priority * (-priority_sign), *length_key(req))
 
             sorted_indices.sort(
-                key=lambda i: retraction_key(reqs[i]),
-                reverse=True,
+                key=lambda i: retraction_key(reqs[i]), reverse=True
             )
             return sorted_indices
 
-        sorted_indices.sort(
-            key=lambda i: length_key(reqs[i]),
-            reverse=True,
-        )
+        sorted_indices.sort(key=lambda i: length_key(reqs[i]), reverse=True)
         return sorted_indices
 
     def release_req(self, idx: int, remaing_req_count: int, server_args: ServerArgs):
@@ -3173,7 +3325,13 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
             extend_lens=self.extend_lens,
             prefix_lens=self.prefix_lens,
             req_to_token_pool=self.req_to_token_pool,
+            token_to_kv_pool_allocator=self.token_to_kv_pool_allocator,
+            tree_cache=self.tree_cache,
             req_pool_indices=self.req_pool_indices,
+            req_pool_indices_cpu=self.req_pool_indices_cpu,
+            seq_lens=self.seq_lens,
+            orig_seq_lens=self.orig_seq_lens,
+            input_ids=self.input_ids,
             model_config=self.model_config,
             forward_mode=self.forward_mode,
             out_cache_loc=self.out_cache_loc,
@@ -3201,6 +3359,7 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
             fpm_start_time=self.fpm_start_time,
             forward_iter=self.forward_iter,
             launch_ts=self.launch_ts,
+            finish_ts=self.finish_ts,
             extend_num_tokens=self.extend_num_tokens,
         )
 

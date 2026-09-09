@@ -74,6 +74,9 @@ class ScheduleBatchDisaggregationDecodeMixin:
             req.is_retracted = False
             if getattr(req, "pd_rebootstrap_in_progress", False):
                 req.pd_rebootstrap_in_progress = False
+            if getattr(req, "is_context_engineering_cache_paused", False):
+                req.is_context_engineering_cache_paused = False
+                req.context_engineering_pause_committed_len = 0
             pre_lens.append(pre_len)
 
         # Set fields
