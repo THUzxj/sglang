@@ -1300,7 +1300,11 @@ class UnifiedRadixCache(BasePrefixCache):
         finish_event = self.cache_controller.layer_done_counter.events[
             consumer_index
         ].finish_event
-        if not finish_event.query():
+        event_done = torch.tensor(
+            int(finish_event.query()), dtype=torch.int, device="cpu"
+        )
+        self._all_reduce(event_done, torch.distributed.ReduceOp.MIN)
+        if not event_done.item():
             return False
 
         self.loading_check()
