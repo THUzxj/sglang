@@ -1696,7 +1696,11 @@ class UnifiedTreeCore(UnifiedTreeCoreInterface):
         )
 
     def build_load_back_spec(
-        self, node_id: NodeId, req: Optional[Req] = None
+        self,
+        node_id: NodeId,
+        req: Optional[Req] = None,
+        *,
+        full_kv_only: bool = False,
     ) -> tuple[PoolTransfer, dict[ComponentType, list[PoolTransfer]]]:
         """Build the H->D load-back KV transfer plus per-component aux transfers."""
         # Component hooks take primitives, not Req: extract its fields here.
@@ -1706,6 +1710,8 @@ class UnifiedTreeCore(UnifiedTreeCoreInterface):
             node, CacheTransferPhase.LOAD_BACK
         )[0]
         comp_xfers: dict[ComponentType, list[PoolTransfer]] = {}
+        if full_kv_only:
+            return kv_xfer, comp_xfers
         for comp in self.components:
             if comp.component_type == BASE_COMPONENT_TYPE:
                 continue

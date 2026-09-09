@@ -27,6 +27,7 @@ class TestDecodeHiCacheRestore(unittest.TestCase):
             l2_host_hit_length=10,
             l3_storage_hit_length=0,
             last_device_node="old-device-node",
+            match_full_kv_only=True,
         )
         req = SimpleNamespace(
             rid="restore-superset",
@@ -76,6 +77,11 @@ class TestDecodeHiCacheRestore(unittest.TestCase):
         )
         self.assertEqual(len(decode_req.hicache_restored_kv_indices), 10)
         self.assertEqual(decode_req.hicache_restored_node, "restored-device-node")
+        self.assertEqual(mock_match_prefix.call_count, 2)
+        for call in mock_match_prefix.call_args_list:
+            self.assertTrue(call.kwargs["match_full_kv_only"])
+        init_params = queue.tree_cache.init_load_back.call_args.args[0]
+        self.assertTrue(init_params.full_kv_only)
         queue.tree_cache.inc_lock_ref.assert_called_once_with(
             "restored-device-node"
         )

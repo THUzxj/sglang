@@ -394,7 +394,11 @@ class UnifiedTreeCoreInterface(KVCacheEventMixin, ABC):
 
     @abstractmethod
     def build_load_back_spec(
-        self, node_id: NodeId, req: Optional[Req] = None
+        self,
+        node_id: NodeId,
+        req: Optional[Req] = None,
+        *,
+        full_kv_only: bool = False,
     ) -> tuple[PoolTransfer, dict[ComponentType, list[PoolTransfer]]]:
         """Build the H->D load-back KV transfer plus per-component aux transfers."""
         ...

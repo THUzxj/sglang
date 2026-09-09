@@ -28,6 +28,7 @@ class DecodePrefixMatch:
     last_device_node: Any
     last_host_node: Any = None
     prefetch_registered: bool = False
+    match_full_kv_only: bool = False
 
     @property
     def l1_prefix_len(self) -> int:
@@ -59,7 +60,12 @@ class DecodeHiCachePreallocMixin:
     """HiCache hooks for ``DecodePreallocQueue``: issue prefetch + reserve tokens."""
 
     def _build_decode_prefix_match(
-        self, req: Req, result: Any, token_ids: Optional[Sequence[int]] = None
+        self,
+        req: Req,
+        result: Any,
+        token_ids: Optional[Sequence[int]] = None,
+        *,
+        match_full_kv_only: bool = False,
     ) -> DecodePrefixMatch:
         """Convert a ``match_prefix_for_req`` result into ``DecodePrefixMatch``.
 
@@ -101,6 +107,7 @@ class DecodeHiCachePreallocMixin:
             last_host_node=(
                 result.last_host_node if l3_storage_hit_length > 0 else None
             ),
+            match_full_kv_only=match_full_kv_only,
         )
 
     def _start_hicache_prefetch(
@@ -218,12 +225,14 @@ class DecodeHiCacheTransferMixin:
             token_ids,
             cow_mamba=False,
             include_req=True,
+            match_full_kv_only=pm.match_full_kv_only,
         )
         loaded_indices, _ = self.tree_cache.init_load_back(
             InitLoadBackParams(
                 best_match_node=rematch.best_match_node,
                 host_hit_length=rematch.host_hit_length,
                 req=dr.req,
+                full_kv_only=pm.match_full_kv_only,
             )
         )
 
@@ -239,6 +248,7 @@ class DecodeHiCacheTransferMixin:
             token_ids,
             cow_mamba=False,
             include_req=True,
+            match_full_kv_only=pm.match_full_kv_only,
         )
         expected_restore_tokens = pm.restore_token_count
         restored_prefix_len = len(restored_match.device_indices)

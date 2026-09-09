@@ -3914,6 +3914,50 @@ class UnifiedRadixCacheSuite:
         self._finish_pending_loads(cache)
         self._release_ongoing_load_back_locks(cache)
 
+    def test_scheduler_hicache_full_kv_only_load_back_skips_mamba(self):
+        if not self.cfg.has_mamba or self.cfg.has_swa or self.cfg.page_size != 1:
+            self.skipTest("requires page_size=1 Full+Mamba")
+        cache, allocator, req_to_token_pool = self._build_hicache_fixture()
+        chain = self._build_chain_pages(cache, allocator, req_to_token_pool, 3)
+        if len(chain) < 3:
+            self.skipTest("chain too short")
+        leaf = chain[-1]
+        tokens = self._match_tokens_for_chain(chain)
+
+        self._backup_node(cache, leaf)
+        cache.evict(EvictParams(num_tokens=len(leaf.key)))
+        self.assertIsNone(leaf.component_data[ComponentType.FULL].value)
+        self.assertIsNone(leaf.component_data[ComponentType.MAMBA].value)
+        self.assertIsNotNone(leaf.component_data[ComponentType.MAMBA].host_value)
+
+        req = self._make_req(req_to_token_pool)
+        request_mamba_pool_idx = req.mamba_pool_idx.clone()
+        match = cache.match_prefix(
+            MatchPrefixParams(
+                key=RadixKey(array("q", tokens)),
+                req=req,
+                match_full_kv_only=True,
+            )
+        )
+        self._apply_match_to_req(req, match)
+
+        new_indices, new_node = cache.init_load_back(
+            InitLoadBackParams(
+                best_match_node=req.best_match_node,
+                host_hit_length=req.host_hit_length,
+                req=req,
+                full_kv_only=True,
+            )
+        )
+
+        self.assertIs(cache.resolve_node_handle(new_node), leaf)
+        self.assertEqual(len(torch.cat([req.prefix_indices, new_indices])), len(tokens))
+        self.assertIsNotNone(leaf.component_data[ComponentType.FULL].value)
+        self.assertIsNone(leaf.component_data[ComponentType.MAMBA].value)
+        torch.testing.assert_close(req.mamba_pool_idx, request_mamba_pool_idx)
+        self._finish_pending_loads(cache)
+        self._release_ongoing_load_back_locks(cache)
+
     def test_scheduler_hicache_aux_only_load_back_appends_full_device_indices(self):
         if self.cfg.page_size != 1:
             self.skipTest("page_size=1 keeps the expected suffix precise")

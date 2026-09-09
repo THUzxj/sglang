@@ -482,7 +482,12 @@ class TestDecodeLockRefScenarios(unittest.TestCase):
         self.assertEqual(result, "prefix-match")
         self.assertEqual(match_prefix.call_args.args[2], [1, 2, 3, 4, 5])
         queue.tree_cache.inc_lock_ref.assert_called_once_with(last_node)
-        build_match.assert_called_once_with(req, match_result, [1, 2, 3, 4, 5])
+        build_match.assert_called_once_with(
+            req,
+            match_result,
+            [1, 2, 3, 4, 5],
+            match_full_kv_only=False,
+        )
 
     def test_mamba_pd_decode_uses_full_kv_only_match(self):
         queue = DecodePreallocQueue.__new__(DecodePreallocQueue)
@@ -509,12 +514,13 @@ class TestDecodeLockRefScenarios(unittest.TestCase):
             return_value=match_result,
         ) as match_prefix, patch.object(
             queue, "_build_decode_prefix_match", return_value="prefix-match"
-        ):
+        ) as build_match:
             result = queue._match_prefix_and_lock(req)
 
         self.assertEqual(result, "prefix-match")
         self.assertFalse(match_prefix.call_args.kwargs["cow_mamba"])
         self.assertTrue(match_prefix.call_args.kwargs["match_full_kv_only"])
+        self.assertTrue(build_match.call_args.kwargs["match_full_kv_only"])
         self.assertEqual(req.skip_lock_node_ids, {"mamba": {7}})
 
         queue.kv_manager.kv_args.state_types = []
@@ -523,11 +529,12 @@ class TestDecodeLockRefScenarios(unittest.TestCase):
             return_value=match_result,
         ) as match_prefix, patch.object(
             queue, "_build_decode_prefix_match", return_value="prefix-match"
-        ):
+        ) as build_match:
             queue._match_prefix_and_lock(req)
 
         self.assertTrue(match_prefix.call_args.kwargs["cow_mamba"])
         self.assertFalse(match_prefix.call_args.kwargs["match_full_kv_only"])
+        self.assertFalse(build_match.call_args.kwargs["match_full_kv_only"])
 
     def test_repeated_incremental_no_leak(self):
         """Multiple incremental transfers shouldn't leak lock_refs."""

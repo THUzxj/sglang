@@ -595,7 +595,12 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
         lock_result = self.tree_cache.inc_lock_ref(result.last_device_node)
         req.swa_uuid_for_lock = lock_result.swa_uuid_for_lock
         req.skip_lock_node_ids = lock_result.skip_lock_node_ids
-        prefix_match = self._build_decode_prefix_match(req, result, token_ids)
+        prefix_match = self._build_decode_prefix_match(
+            req,
+            result,
+            token_ids,
+            match_full_kv_only=match_full_kv_only,
+        )
         if self.scheduler.metrics_reporter.is_stats_logging_rank:
             logger.info(
                 "Decode prefix match: rid=%s kind=%s pair_key=%s mode=%s "

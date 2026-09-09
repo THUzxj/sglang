@@ -166,6 +166,7 @@ class InitLoadBackParams:
     host_hit_length: int
     mem_quota: Optional[int] = None
     req: Optional[Req] = None
+    full_kv_only: bool = False
 
 
 class MatchResult(NamedTuple):
