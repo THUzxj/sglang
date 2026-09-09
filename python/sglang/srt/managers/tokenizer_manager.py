@@ -2133,13 +2133,29 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
 
     def create_abort_task(self, obj: GenerateReqInput):
         # Abort the request if the client is disconnected.
+        #
+        # A rid can be reused after its ReqState is removed (for example, when a
+        # paused disaggregated request is re-bootstrapped).  The background task
+        # belongs to this specific request object, so do not let a delayed task
+        # abort a newer lifecycle that happens to use the same rid.
         async def abort_request():
             await asyncio.sleep(2)
-            if obj.is_single:
-                self.abort_request(obj.rid)
-            else:
-                for rid in obj.rid:
-                    self.abort_request(rid)
+            # StreamingResponse is created before its generator starts, so the
+            # request may not have been normalized (and have ``is_single``)
+            # when create_abort_task is called.  Resolve the owners only after
+            # response processing has run.
+            if not hasattr(obj, "is_single"):
+                return
+            owners = (
+                ((obj.rid, obj),)
+                if obj.is_single
+                else tuple((obj.rid[i], obj[i]) for i in range(len(obj.rid)))
+            )
+            for rid, owner in owners:
+                state = self.rid_to_state.get(rid)
+                if state is None or state.obj is not owner:
+                    continue
+                self.abort_request(rid)
 
         background_tasks = BackgroundTasks()
         background_tasks.add_task(abort_request)
