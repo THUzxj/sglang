@@ -994,6 +994,11 @@ class Req(ReqDllmMixin):
         # GPU-resident pair-scheduler pause. Unlike retraction, this preserves
         # req_pool_idx, KV mappings, and decode progress.
         self.is_context_engineering_paused = False
+        # ``radix_evictable`` compact pause keeps the Python Req as control-plane
+        # state while releasing req_pool_idx/Req.kv.  The committed KV is owned
+        # by radix cache and is rediscovered through prefix match on resume.
+        self.is_context_engineering_cache_paused = False
+        self.context_engineering_pause_committed_len = 0
         # Indicates if the req has ever been retracted.
         self.retracted_stain = False
 
@@ -1699,6 +1704,45 @@ class Req(ReqDllmMixin):
         if self.input_embeds is not None:
             self.output_ids = array("q")
 
+    def detach_gpu_state_for_cache_pause(self, committed_len: int) -> None:
+        """Drop request-local GPU bindings while retaining decode metadata.
+
+        The caller must first transfer the committed KV to radix cache with
+        ``release_kv_cache(..., is_insert=True)``.  Unlike ``reset_for_retract``,
+        this does not increment retraction_count or discard output/logprob/
+        grammar state: a cache-paused compact is the same logical attempt.
+        """
+
+        assert self.req_pool_idx is None and self.kv is None
+        self.context_engineering_pause_committed_len = committed_len
+        self.prefix_indices = torch.empty((0,), dtype=torch.int64)
+        self.last_node = None
+        self.last_host_node = None
+        self.best_match_node = None
+        self.host_hit_length = 0
+        self.swa_host_hit_length = 0
+        self.mamba_host_hit_length = 0
+        self.cache_protected_len = 0
+        self.num_matched_prefix_tokens = 0
+        self.swa_uuid_for_lock = None
+        self.swa_prefix_lock_released = False
+        self.skip_lock_node_ids = {}
+        self.extend_range = None
+        self.dllm_initialized = False
+        self.is_retracted = True
+        self.retracted_stain = True
+        self.inflight_middle_chunks = 0
+        self.mamba_pool_idx = None
+        self.mamba_ping_pong_track_buffer = None
+        self.mamba_next_track_idx = None
+        self.mamba_last_track_seqlen = None
+        self.mamba_branching_seqlen = None
+        self.mamba_cow_src_index = None
+        self.mamba_needs_clear = False
+        self.kv_committed_len = 0
+        self.extend_batch_idx = 0
+        self.decode_batch_idx = 0
+
     def offload_kv_cache(self, req_to_token_pool, token_to_kv_pool_allocator):
         token_indices = req_to_token_pool.req_to_token[
             self.req_pool_idx, : self.seqlen - 1
@@ -1880,6 +1924,7 @@ def release_req(
     tree_cache: BasePrefixCache,
     hisparse_coordinator: Optional[HiSparseCoordinator],
     offload_kv: bool = True,
+    insert_into_radix_cache: bool = False,
 ) -> None:
     if hisparse_coordinator is not None and not req.finished():
         hisparse_coordinator.retract_req(req)
@@ -1890,8 +1935,12 @@ def release_req(
     # pass offload_kv=False to skip the wasteful device->host copy.
     if server_args.disaggregation_mode == "decode" and offload_kv:
         req.offload_kv_cache(req_to_token_pool, token_to_kv_pool_allocator)
-    # TODO (csy): for preempted requests, we may want to insert into the tree
-    release_kv_cache(req, tree_cache, is_insert=False)
+    # GPU-resident compact pauses use this only when real KV pressure forces a
+    # downgrade.  In unified mode, inserting the committed prefix transfers
+    # ownership to the radix cache without discarding the data.  With HiCache
+    # write-back, the following eviction backs an unlocked victim to L2 before
+    # freeing its L1 pages; re-admission reloads it through normal prefix match.
+    release_kv_cache(req, tree_cache, is_insert=insert_into_radix_cache)
     # NOTE(lsyin): we should use the newly evictable memory instantly.
     num_tokens = remaing_req_count * envs.SGLANG_RETRACT_DECODE_STEPS.get()
     evict_from_tree_cache(tree_cache, num_tokens)

@@ -190,6 +190,12 @@ class SchedulerMetricsReporter:
                     "kv_committed_len": int(
                         getattr(req, "kv_committed_len", 0) or 0
                     ),
+                    "pause_committed_len": int(
+                        getattr(
+                            req, "context_engineering_pause_committed_len", 0
+                        )
+                        or 0
+                    ),
                 }
                 for req in reqs
             ],

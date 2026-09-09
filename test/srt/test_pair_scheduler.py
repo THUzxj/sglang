@@ -26,6 +26,10 @@ order_prefill_waiting_queue = _scheduler.order_prefill_waiting_queue
 should_try_prefill_request = _scheduler.should_try_prefill_request
 select_decode_keep_indices = _scheduler.select_decode_keep_indices
 can_resume_retracted_decode_req = _scheduler.can_resume_retracted_decode_req
+can_resume_compact_req = _scheduler.can_resume_compact_req
+should_cache_paused_compact_for_kv_pressure = (
+    _scheduler.should_cache_paused_compact_for_kv_pressure
+)
 select_compact_indices_after_paired_main_finished = (
     _scheduler.select_compact_indices_after_paired_main_finished
 )
@@ -216,6 +220,28 @@ def test_should_try_prefill_request_allows_compact_only_prefill():
     )
 
     assert should_try
+
+
+def test_should_try_prefill_request_holds_pressure_retracted_compact_until_pair():
+    compact_a = FakeReq("compact-a", "compact", "a", is_retracted=True)
+    main_a = FakeReq("main-a", "main", "a")
+
+    assert not should_try_prefill_request(
+        compact_a,
+        can_run_reqs=[],
+        running_reqs=[],
+        waiting_queue=[compact_a],
+        max_batch_size=2,
+        attention_budget=None,
+    )
+    assert should_try_prefill_request(
+        compact_a,
+        can_run_reqs=[main_a],
+        running_reqs=[],
+        waiting_queue=[main_a, compact_a],
+        max_batch_size=2,
+        attention_budget=None,
+    )
 
 
 def test_should_try_prefill_request_does_not_reserve_waiting_main_attention():
@@ -416,6 +442,26 @@ def test_can_resume_retracted_decode_req_allows_non_compact():
     foreground = FakeReq("foreground")
 
     assert can_resume_retracted_decode_req(foreground, [])
+
+
+def test_can_resume_compact_req_is_shared_by_paused_and_retracted_paths():
+    compact_a = FakeReq("compact-a", "compact", "a")
+    main_a = FakeReq("main-a", "main", "a")
+
+    assert can_resume_compact_req(compact_a, [main_a])
+    assert not can_resume_compact_req(compact_a, [])
+
+
+def test_paused_compact_pressure_uses_hicache_only_in_unified_mode():
+    assert should_cache_paused_compact_for_kv_pressure(
+        enable_hierarchical_cache=True, disaggregation_mode="null"
+    )
+    assert not should_cache_paused_compact_for_kv_pressure(
+        enable_hierarchical_cache=False, disaggregation_mode="null"
+    )
+    assert not should_cache_paused_compact_for_kv_pressure(
+        enable_hierarchical_cache=True, disaggregation_mode="decode"
+    )
 
 
 def test_can_resume_retracted_decode_req_requires_running_pair_main_for_compact():

@@ -823,14 +823,20 @@ class ServerArgs:
         NS("schedule"),
     ] = False
     context_engineering_compact_pause_mode: A[
-        Literal["retract", "gpu_resident"],
+        Literal["retract", "gpu_resident", "radix_evictable"],
         Arg(
             help=(
                 "How pair scheduling pauses compact decode requests. 'retract' "
                 "uses the normal KV release/offload path; 'gpu_resident' parks "
-                "the request outside the running batch while retaining GPU KV."
+                "the request outside the running batch while retaining GPU KV; "
+                "'radix_evictable' detaches the GPU request slot and transfers "
+                "committed KV ownership to radix cache, allowing an L1 hit or "
+                "HiCache L2 load-back when the compact resumes. "
+                "With unified HiCache, a real KV-pressure downgrade inserts the "
+                "committed compact prefix into radix cache; write_back then "
+                "backs evicted pages to L2 and reloads them on re-admission."
             ),
-            choices=["retract", "gpu_resident"],
+            choices=["retract", "gpu_resident", "radix_evictable"],
         ),
         NS("schedule"),
     ] = "retract"
@@ -8886,6 +8892,26 @@ class ServerArgs:
             raise ValueError(
                 "--retraction-policy priority requires --enable-priority-scheduling"
             )
+
+        if self.context_engineering_compact_pause_mode == "radix_evictable":
+            if not self.enable_pair_scheduler:
+                raise ValueError(
+                    "--context-engineering-compact-pause-mode radix_evictable "
+                    "requires --enable-pair-scheduler"
+                )
+            if not self.enable_hierarchical_cache:
+                raise ValueError(
+                    "--context-engineering-compact-pause-mode radix_evictable "
+                    "requires --enable-hierarchical-cache"
+                )
+            if (
+                self.disaggregation_mode == "decode"
+                and not self.disaggregation_decode_enable_radix_cache
+            ):
+                raise ValueError(
+                    "PD decode radix_evictable compact pause requires "
+                    "--disaggregation-decode-enable-radix-cache"
+                )
 
         # Check hisparse
         # Moved to the resolution pipeline (arg_groups/overrides.py:

@@ -42,7 +42,8 @@ def allow_compact_drain(req: Any) -> bool:
     return bool(value)
 
 
-def can_resume_retracted_decode_req(req: Any, running_reqs: Iterable[Any]) -> bool:
+def can_resume_compact_req(req: Any, running_reqs: Iterable[Any]) -> bool:
+    """Return whether a compact may leave either paused/retracted state."""
     if not is_context_engineering_compact(req):
         return True
 
@@ -62,9 +63,28 @@ def can_resume_retracted_decode_req(req: Any, running_reqs: Iterable[Any]) -> bo
     return False
 
 
+# Compatibility for out-of-tree users of the prototype helper.
+can_resume_retracted_decode_req = can_resume_compact_req
+
+
+def should_cache_paused_compact_for_kv_pressure(
+    *, enable_hierarchical_cache: bool, disaggregation_mode: str
+) -> bool:
+    """Whether pressure retraction can hand the compact KV to HiCache.
+
+    Unified scheduling can re-admit the request through radix matching, which
+    transparently reloads an L2-only prefix.  PD decode's retracted queue has a
+    different contract: it expects ``Req.kv_cache_cpu`` and restores that copy
+    directly, so it must keep using its existing private host-copy path.
+    """
+
+    return enable_hierarchical_cache and disaggregation_mode == "null"
+
+
 def attention_tokens(req: Any) -> int:
     return max(
         int(getattr(req, "kv_committed_len", 0) or 0),
+        int(getattr(req, "context_engineering_pause_committed_len", 0) or 0),
         int(getattr(req, "seqlen", 0) or 0),
     )
 
@@ -113,15 +133,28 @@ def should_try_prefill_request(
     rather than the decode compact cost ratio.
     """
 
+    can_run_req_list = list(can_run_reqs)
+    running_req_list = list(running_reqs)
+
     if not is_context_engineering_compact(req):
         return True
 
-    active_reqs = list(running_reqs) + list(can_run_reqs)
+    # A compact that was genuinely retracted for KV pressure must wait for its
+    # paired main (or explicit compact drain).  Fresh compact requests may still
+    # perform compact-only prefill as required by the pair scheduler design.
+    if getattr(req, "is_retracted", False) and not can_resume_compact_req(
+        req, running_req_list + can_run_req_list
+    ):
+        return False
+
+    active_reqs = running_req_list + can_run_req_list
     if max_batch_size and len(active_reqs) >= max_batch_size:
         return False
 
     if attention_budget is not None:
-        used_attention_tokens = sum(attention_tokens(active_req) for active_req in active_reqs)
+        used_attention_tokens = sum(
+            attention_tokens(active_req) for active_req in active_reqs
+        )
         if used_attention_tokens + attention_tokens(req) > attention_budget:
             return False
 
