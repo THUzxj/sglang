@@ -50,6 +50,16 @@ class SchedulerStatusLogger:
             {
                 "rank": self.rank,
                 "running_rids": [r.rid for r in running_batch.reqs],
+                "running_reqs": {
+                    r.rid: {
+                        "seqlen": r.seqlen,
+                        "kv_committed_len": r.kv_committed_len,
+                        "kv_allocated_len": (
+                            r.kv.kv_allocated_len if r.kv is not None else 0
+                        ),
+                    }
+                    for r in running_batch.reqs
+                },
                 "queued_rids": [r.rid for r in waiting_queue],
             },
         )

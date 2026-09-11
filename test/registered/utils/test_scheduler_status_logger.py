@@ -55,9 +55,26 @@ class TestSchedulerStatusLogger(CustomTestCase):
         print(f"{events=}")
         self.assertGreater(len(events), 0, "scheduler.status event not found")
         data = events[0]
-        for field in ["timestamp", "rank", "running_rids", "queued_rids"]:
+        for field in [
+            "timestamp",
+            "rank",
+            "running_rids",
+            "running_reqs",
+            "queued_rids",
+        ]:
             self.assertIn(field, data)
         self.assertIsInstance(data["running_rids"], list)
+        self.assertIsInstance(data["running_reqs"], dict)
+        self.assertEqual(set(data["running_reqs"]), set(data["running_rids"]))
+        self.assertGreater(len(data["running_reqs"]), 0)
+        for req_stats in data["running_reqs"].values():
+            self.assertEqual(
+                set(req_stats),
+                {"seqlen", "kv_committed_len", "kv_allocated_len"},
+            )
+            self.assertTrue(
+                all(isinstance(value, int) for value in req_stats.values())
+            )
         self.assertIsInstance(data["queued_rids"], list)
 
 
