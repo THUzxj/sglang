@@ -3666,7 +3666,6 @@ class Scheduler(
             reason="kv_pressure_paused_compact",
             stage="decode",
             retracted_reqs=[victim],
-            batch=batch,
         )
         return [victim], preferred_pair_key
 
@@ -3844,7 +3843,6 @@ class Scheduler(
                 reason=f"{reason}_radix_evictable",
                 stage="decode",
                 reqs=retracted_reqs,
-                batch=batch,
             )
             return []
 
@@ -3869,7 +3867,6 @@ class Scheduler(
                 reason=reason,
                 stage="decode",
                 reqs=retracted_reqs,
-                batch=batch,
             )
             return []
 
@@ -3890,7 +3887,6 @@ class Scheduler(
             reason=reason,
             stage="decode",
             retracted_reqs=retracted_reqs,
-            batch=batch,
         )
         return retracted_reqs
 
@@ -3900,14 +3896,12 @@ class Scheduler(
         reason: str,
         stage: str,
         retracted_reqs: List[Req],
-        batch: Optional[ScheduleBatch] = None,
     ) -> None:
         self.metrics_reporter.log_context_engineering_transition(
             event="context_engineering_retract",
             reason=reason,
             stage=stage,
             reqs=retracted_reqs,
-            batch=batch,
         )
 
     def _log_context_engineering_resume(

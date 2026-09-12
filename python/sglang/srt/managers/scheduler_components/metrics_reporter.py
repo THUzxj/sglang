@@ -20,7 +20,6 @@ from typing import (
 from sglang.srt.disaggregation.utils import DisaggregationMode
 from sglang.srt.environ import envs
 from sglang.srt.managers.pair_scheduler import (
-    batch_context_engineering_observation,
     batch_context_engineering_stats,
 )
 from sglang.srt.managers.schedule_batch import ScheduleBatch
@@ -123,9 +122,8 @@ class SchedulerMetricsReporter:
         self,
         *,
         stage: str,
-        batch: ScheduleBatch,
         batch_iter: int,
-        extra: Optional[dict] = None,
+        context_stats: dict[str, int],
     ) -> None:
         # Keep structured context-engineering logs on the same rank as the
         # human-readable prefill/decode batch logs. Metrics may be collected on
@@ -138,24 +136,20 @@ class SchedulerMetricsReporter:
         # active.
         if not self.scheduler.server_args.enable_pair_scheduler:
             return
-        observation = batch_context_engineering_observation(batch.reqs)
-        if not observation["main"] and not observation["compact"]:
+        if not context_stats["main"] and not context_stats["compact"]:
             return
         payload = {
-            "event": "context_engineering_batch",
             "stage": stage,
             "forward_iter": batch_iter,
-            "pair_scheduler_enabled": bool(
-                self.scheduler.server_args.enable_pair_scheduler
-            ),
-            "tp_rank": self.tp_rank,
-            "pp_rank": self.pp_rank,
-            "dp_rank": self.dp_rank,
-            **observation,
+            "pair_scheduler_enabled": True,
+            "main": context_stats["main"],
+            "compact": context_stats["compact"],
+            "paired_compact": context_stats["paired_compact"],
         }
-        if extra:
-            payload.update(extra)
-        logger.info("context_engineering_batch %s", json.dumps(payload, sort_keys=True))
+        logger.info(
+            "context_engineering_batch %s",
+            json.dumps(payload, sort_keys=True, separators=(",", ":")),
+        )
 
     def log_context_engineering_transition(
         self,
@@ -164,7 +158,6 @@ class SchedulerMetricsReporter:
         reason: str,
         stage: str,
         reqs: list[Req],
-        batch: Optional[ScheduleBatch] = None,
     ) -> None:
         if not self.is_stats_logging_rank:
             return
@@ -173,36 +166,17 @@ class SchedulerMetricsReporter:
         if not reqs:
             return
         payload = {
-            "event": event,
             "reason": reason,
             "stage": stage,
             "forward_iter": self.scheduler.forward_ct,
             "pair_scheduler_enabled": True,
-            "tp_rank": self.tp_rank,
-            "pp_rank": self.pp_rank,
-            "dp_rank": self.dp_rank,
-            "requests": [
-                {
-                    "rid": str(getattr(req, "rid", "")),
-                    "kind": str(getattr(req, "context_engineering_kind", "") or ""),
-                    "pair_key": getattr(req, "context_engineering_pair_key", None),
-                    "seqlen": int(getattr(req, "seqlen", 0) or 0),
-                    "kv_committed_len": int(
-                        getattr(req, "kv_committed_len", 0) or 0
-                    ),
-                    "pause_committed_len": int(
-                        getattr(
-                            req, "context_engineering_pause_committed_len", 0
-                        )
-                        or 0
-                    ),
-                }
-                for req in reqs
-            ],
+            "count": len(reqs),
         }
-        if batch is not None:
-            payload["batch"] = batch_context_engineering_observation(batch.reqs)
-        logger.info("%s %s", event, json.dumps(payload, sort_keys=True))
+        logger.info(
+            "%s %s",
+            event,
+            json.dumps(payload, sort_keys=True, separators=(",", ":")),
+        )
 
     def _init_metrics(
         self,
@@ -677,13 +651,8 @@ class SchedulerMetricsReporter:
                 )
                 self._log_context_engineering_batch(
                     stage="prefill",
-                    batch=batch,
                     batch_iter=batch_iter,
-                    extra={
-                        "num_new_seqs": prefill_stats.num_new_seqs,
-                        "log_input_tokens": prefill_stats.log_input_tokens,
-                        "log_hit_tokens": prefill_stats.log_hit_tokens,
-                    },
+                    context_stats=context_stats,
                 )
 
         if self.scheduler.disaggregation_mode == DisaggregationMode.PREFILL:
@@ -970,14 +939,10 @@ class SchedulerMetricsReporter:
             )
             self._log_context_engineering_batch(
                 stage="decode",
-                batch=batch,
                 batch_iter=batch.forward_iter
                 if batch.forward_iter is not None
                 else self.scheduler.forward_ct,
-                extra={
-                    "batch_size": batch.batch_size(),
-                    "num_retracted_reqs": self.num_retracted_reqs,
-                },
+                context_stats=context_stats,
             )
 
         if self.enable_mfu_metrics and gap_latency > 0:
