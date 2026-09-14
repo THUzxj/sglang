@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import math
 from collections import deque
-from typing import Any, Deque, Iterable, List, Optional, Tuple
+from typing import Any, Deque, Iterable, List, NamedTuple, Optional, Tuple
 
 
 def is_context_engineering_request(req: Any) -> bool:
@@ -42,24 +42,48 @@ def allow_compact_drain(req: Any) -> bool:
     return bool(value)
 
 
-def can_resume_compact_req(req: Any, running_reqs: Iterable[Any]) -> bool:
+class CompactResumeContext(NamedTuple):
+    """Running-main state shared by compact resume checks in one scheduler tick."""
+
+    main_pair_keys: frozenset[str]
+    has_running_main: bool
+
+
+def build_compact_resume_context(
+    running_reqs: Iterable[Any],
+) -> CompactResumeContext:
+    """Index running main requests once for repeated compact resume checks."""
+
+    main_pair_keys = set()
+    has_running_main = False
+    for running_req in running_reqs:
+        if not is_context_engineering_main(running_req):
+            continue
+        has_running_main = True
+        pair_key = context_engineering_pair_key(running_req)
+        if pair_key:
+            main_pair_keys.add(pair_key)
+    return CompactResumeContext(frozenset(main_pair_keys), has_running_main)
+
+
+def can_resume_compact_req(
+    req: Any,
+    running_reqs: Iterable[Any] = (),
+    *,
+    resume_context: Optional[CompactResumeContext] = None,
+) -> bool:
     """Return whether a compact may leave either paused/retracted state."""
     if not is_context_engineering_compact(req):
         return True
 
-    running_req_list = list(running_reqs)
+    if resume_context is None:
+        resume_context = build_compact_resume_context(running_reqs)
+
     pair_key = context_engineering_pair_key(req)
-    if pair_key and any(
-        is_context_engineering_main(running_req)
-        and context_engineering_pair_key(running_req) == pair_key
-        for running_req in running_req_list
-    ):
+    if pair_key and pair_key in resume_context.main_pair_keys:
         return True
     if allow_compact_drain(req):
-        return not any(
-            is_context_engineering_main(running_req)
-            for running_req in running_req_list
-        )
+        return not resume_context.has_running_main
     return False
 
 

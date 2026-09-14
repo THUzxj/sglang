@@ -27,6 +27,7 @@ should_try_prefill_request = _scheduler.should_try_prefill_request
 select_decode_keep_indices = _scheduler.select_decode_keep_indices
 can_resume_retracted_decode_req = _scheduler.can_resume_retracted_decode_req
 can_resume_compact_req = _scheduler.can_resume_compact_req
+build_compact_resume_context = _scheduler.build_compact_resume_context
 should_cache_paused_compact_for_kv_pressure = (
     _scheduler.should_cache_paused_compact_for_kv_pressure
 )
@@ -450,6 +451,34 @@ def test_can_resume_compact_req_is_shared_by_paused_and_retracted_paths():
 
     assert can_resume_compact_req(compact_a, [main_a])
     assert not can_resume_compact_req(compact_a, [])
+
+
+def test_compact_resume_context_is_reused_across_paused_requests():
+    main_a = FakeReq("main-a", "main", "a")
+    main_without_pair = FakeReq("main-without-pair", "main")
+    context = build_compact_resume_context([main_a, main_without_pair])
+
+    assert can_resume_compact_req(
+        FakeReq("compact-a", "compact", "a"), resume_context=context
+    )
+    assert not can_resume_compact_req(
+        FakeReq("compact-b", "compact", "b"), resume_context=context
+    )
+    assert not can_resume_compact_req(
+        FakeReq("compact-drain", "compact", "b", allow_compact_drain=True),
+        resume_context=context,
+    )
+
+
+def test_compact_resume_context_tracks_unkeyed_main_for_drain():
+    context = build_compact_resume_context([FakeReq("main", "main")])
+
+    assert context.main_pair_keys == frozenset()
+    assert context.has_running_main
+    assert not can_resume_compact_req(
+        FakeReq("compact", "compact", allow_compact_drain=True),
+        resume_context=context,
+    )
 
 
 def test_paused_compact_pressure_uses_hicache_only_in_unified_mode():

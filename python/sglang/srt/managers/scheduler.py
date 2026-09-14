@@ -103,6 +103,7 @@ from sglang.srt.lora.lora_drainer import LoRADrainer
 from sglang.srt.lora.lora_overlap_loader import LoRAOverlapLoader
 from sglang.srt.managers.hisparse_coordinator import HiSparseCoordinator
 from sglang.srt.managers.pair_scheduler import (
+    build_compact_resume_context,
     can_resume_compact_req,
     order_prefill_waiting_queue,
     select_decode_keep_indices,
@@ -3000,21 +3001,25 @@ class Scheduler(
         if not self.paused_compact_queue:
             return running_batch
 
+        available_batch_slots = max(
+            0, self.max_running_requests - len(running_batch.reqs)
+        )
+        if not available_batch_slots:
+            return running_batch
+
+        resume_context = build_compact_resume_context(running_batch.reqs)
         runnable = [
             req
             for req in self.paused_compact_queue
-            if can_resume_compact_req(req, running_batch.reqs)
-            and (
+            if (
                 req.req_pool_idx is not None
                 or getattr(req, "is_context_engineering_cache_paused", False)
             )
+            and can_resume_compact_req(req, resume_context=resume_context)
         ]
         if not runnable:
             return running_batch
 
-        available_batch_slots = max(
-            0, self.max_running_requests - len(running_batch.reqs)
-        )
         runnable = runnable[:available_batch_slots]
         if not runnable:
             return running_batch
