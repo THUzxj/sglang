@@ -2423,12 +2423,30 @@ class SchedulerDisaggregationDecodeMixin:
         # pop req from waiting queue
         can_run_list: List[Req] = []
         waiting_queue: List[Req] = []
+        main_turn_limit = (
+            self.server_args.context_engineering_main_turn_decode_max_batch_size
+            if self._pair_scheduler_active()
+            else None
+        )
+        active_main_turns = sum(
+            1
+            for req in running_batch.reqs
+            if req.is_context_engineering_main()
+        )
 
-        for i in range(len(self.waiting_queue)):
-            req = self.waiting_queue[i]
+        for req in self.waiting_queue:
             # we can only add at least `num_not_used_batch` new batch to the running queue
-            if i < num_not_used_batch:
+            if len(can_run_list) < num_not_used_batch:
+                if (
+                    main_turn_limit is not None
+                    and req.is_context_engineering_main()
+                    and active_main_turns >= main_turn_limit
+                ):
+                    waiting_queue.append(req)
+                    continue
                 can_run_list.append(req)
+                if req.is_context_engineering_main():
+                    active_main_turns += 1
                 # Decode-radix path: new requests already matched in
                 # `pop_preallocated`. Retracted requests reset `last_node`,
                 # so re-match only when that state is missing.

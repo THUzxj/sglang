@@ -107,6 +107,7 @@ from sglang.srt.managers.pair_scheduler import (
     can_resume_compact_req,
     order_prefill_waiting_queue,
     select_decode_keep_indices,
+    select_main_turn_decode_keep_indices,
     should_cache_paused_compact_for_kv_pressure,
     should_try_prefill_request,
 )
@@ -3414,6 +3415,9 @@ class Scheduler(
                     compact_attention_cost_ratio=(
                         self.server_args.context_engineering_compact_attention_cost_ratio
                     ),
+                    main_turn_decode_max_batch_size=(
+                        self.server_args.context_engineering_main_turn_decode_max_batch_size
+                    ),
                 ):
                     continue
 
@@ -3688,7 +3692,8 @@ class Scheduler(
         if self.enable_hierarchical_cache:
             self.tree_cache.flush_write_through_acks()
 
-        retracted_reqs = self._retract_compact_decode_over_budget(batch)
+        retracted_reqs = self._retract_main_turn_decode_over_budget(batch)
+        retracted_reqs.extend(self._retract_compact_decode_over_budget(batch))
         if retracted_reqs:
             self.metrics_reporter.num_retracted_reqs = len(retracted_reqs)
             for req in retracted_reqs:
@@ -3795,6 +3800,43 @@ class Scheduler(
         # Update batch tensors
         batch.prepare_for_decode()
         return batch
+
+    def _retract_main_turn_decode_over_budget(
+        self, batch: ScheduleBatch
+    ) -> List[Req]:
+        if not self._pair_scheduler_active(batch.reqs):
+            return []
+
+        keep_indices = select_main_turn_decode_keep_indices(
+            batch.reqs,
+            max_batch_size=(
+                self.server_args.context_engineering_main_turn_decode_max_batch_size
+            ),
+        )
+        if len(keep_indices) == len(batch.reqs):
+            return []
+
+        keep_set = set(keep_indices)
+        retracted_reqs = [
+            req
+            for idx, req in enumerate(batch.reqs)
+            if idx not in keep_set and req.is_context_engineering_main()
+        ]
+        for idx in range(len(batch.reqs) - 1, -1, -1):
+            if idx not in keep_set:
+                batch.release_req(idx, len(keep_indices), self.server_args)
+
+        batch.filter_batch(keep_indices=keep_indices)
+        logger.debug(
+            "Context-engineering main-turn decode limit retracted %d requests.",
+            len(retracted_reqs),
+        )
+        self._log_context_engineering_retract(
+            reason="main_turn_decode_batch_size",
+            stage="decode",
+            retracted_reqs=retracted_reqs,
+        )
+        return retracted_reqs
 
     def _retract_compact_decode_over_budget(self, batch: ScheduleBatch) -> List[Req]:
         if not self._pair_scheduler_active(batch.reqs):

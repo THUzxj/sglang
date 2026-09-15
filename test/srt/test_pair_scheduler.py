@@ -25,6 +25,9 @@ _scheduler = _load_pair_scheduler()
 order_prefill_waiting_queue = _scheduler.order_prefill_waiting_queue
 should_try_prefill_request = _scheduler.should_try_prefill_request
 select_decode_keep_indices = _scheduler.select_decode_keep_indices
+select_main_turn_decode_keep_indices = (
+    _scheduler.select_main_turn_decode_keep_indices
+)
 can_resume_retracted_decode_req = _scheduler.can_resume_retracted_decode_req
 can_resume_compact_req = _scheduler.can_resume_compact_req
 build_compact_resume_context = _scheduler.build_compact_resume_context
@@ -110,6 +113,45 @@ def test_select_decode_keep_indices_uses_remaining_budget_for_paired_compact():
     )
 
     assert keep == [0, 1, 2]
+
+
+def test_select_main_turn_decode_keep_indices_caps_only_ce_main_turns():
+    foreground = FakeReq("foreground")
+    main_a = FakeReq("main-a", "main", "a")
+    compact_a = FakeReq("compact-a", "compact", "a")
+    main_b = FakeReq("main-b", "main", "b")
+
+    keep = select_main_turn_decode_keep_indices(
+        [foreground, main_a, compact_a, main_b], max_batch_size=1
+    )
+
+    assert keep == [0, 1, 2]
+
+
+def test_select_main_turn_decode_keep_indices_is_disabled_by_default():
+    main_a = FakeReq("main-a", "main", "a")
+    main_b = FakeReq("main-b", "main", "b")
+
+    keep = select_main_turn_decode_keep_indices(
+        [main_a, main_b], max_batch_size=None
+    )
+
+    assert keep == [0, 1]
+
+
+def test_should_try_prefill_request_holds_main_when_decode_limit_is_full():
+    running_main = FakeReq("main-a", "main", "a")
+    waiting_main = FakeReq("main-b", "main", "b")
+
+    assert not should_try_prefill_request(
+        waiting_main,
+        can_run_reqs=[],
+        running_reqs=[running_main],
+        waiting_queue=[waiting_main],
+        max_batch_size=256,
+        attention_budget=None,
+        main_turn_decode_max_batch_size=1,
+    )
 
 
 def test_select_decode_keep_indices_does_not_keep_unpaired_compact_with_main():

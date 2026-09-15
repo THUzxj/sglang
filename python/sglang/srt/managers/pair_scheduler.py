@@ -148,6 +148,7 @@ def should_try_prefill_request(
     max_batch_size: int,
     attention_budget: Optional[int],
     compact_attention_cost_ratio: float = 1.0,
+    main_turn_decode_max_batch_size: Optional[int] = None,
 ) -> bool:
     """Return whether the scheduler should attempt to prefill this request.
 
@@ -159,6 +160,16 @@ def should_try_prefill_request(
 
     can_run_req_list = list(can_run_reqs)
     running_req_list = list(running_reqs)
+
+    if is_context_engineering_main(req):
+        if main_turn_decode_max_batch_size is None:
+            return True
+        active_main_turns = sum(
+            1
+            for active_req in running_req_list + can_run_req_list
+            if is_context_engineering_main(active_req)
+        )
+        return active_main_turns < main_turn_decode_max_batch_size
 
     if not is_context_engineering_compact(req):
         return True
@@ -183,6 +194,30 @@ def should_try_prefill_request(
             return False
 
     return True
+
+
+def select_main_turn_decode_keep_indices(
+    batch_reqs: List[Any], *, max_batch_size: Optional[int]
+) -> List[int]:
+    """Keep at most ``max_batch_size`` CE main turns, preserving batch order.
+
+    Foreground and compact requests are left untouched here. Compact pairing and
+    its separate budgets are applied by ``select_decode_keep_indices`` after
+    excess main turns have been retracted.
+    """
+
+    if max_batch_size is None:
+        return list(range(len(batch_reqs)))
+
+    keep_indices: List[int] = []
+    kept_main_turns = 0
+    for idx, req in enumerate(batch_reqs):
+        if is_context_engineering_main(req):
+            if kept_main_turns >= max_batch_size:
+                continue
+            kept_main_turns += 1
+        keep_indices.append(idx)
+    return keep_indices
 
 
 def select_decode_keep_indices(
