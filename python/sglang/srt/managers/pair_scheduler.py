@@ -145,7 +145,6 @@ def should_try_prefill_request(
     can_run_reqs: Iterable[Any],
     running_reqs: Iterable[Any],
     waiting_queue: Iterable[Any],
-    max_batch_size: int,
     attention_budget: Optional[int],
     compact_attention_cost_ratio: float = 1.0,
     main_turn_decode_max_batch_size: Optional[int] = None,
@@ -183,9 +182,6 @@ def should_try_prefill_request(
         return False
 
     active_reqs = running_req_list + can_run_req_list
-    if max_batch_size and len(active_reqs) >= max_batch_size:
-        return False
-
     if attention_budget is not None:
         used_attention_tokens = sum(
             attention_tokens(active_req) for active_req in active_reqs
@@ -224,17 +220,16 @@ def select_decode_keep_indices(
     batch_reqs: List[Any],
     waiting_queue: Iterable[Any],
     *,
-    max_batch_size: int,
+    max_compact_batch_size: int,
     attention_budget: Optional[int],
     compact_attention_cost_ratio: float = 1.0,
 ) -> List[int]:
     """Select decode requests under compact-aware budget constraints.
 
-    All main/foreground requests are kept even if they exceed the compact-aware
-    budget. Paired compact requests are admitted only if the remaining batch-size
-    and attention-token budgets can cover them. A decode batch containing only
-    compact requests keeps none of them, regardless of remaining budget, so the
-    caller retracts/requeues them until a main request is active again.
+    All main/foreground requests are kept. Paired compact requests are admitted
+    only if the compact-count and attention-token budgets can cover them. A
+    decode batch containing only compact requests keeps none of them unless
+    explicit compact drain is enabled.
     """
 
     if not batch_reqs:
@@ -248,7 +243,10 @@ def select_decode_keep_indices(
         for idx, req in enumerate(batch_reqs):
             if not allow_compact_drain(req):
                 continue
-            if max_batch_size and len(keep_indices) >= max_batch_size:
+            if (
+                max_compact_batch_size
+                and len(keep_indices) >= max_compact_batch_size
+            ):
                 break
             tokens = budget_attention_tokens(
                 req,
@@ -265,10 +263,11 @@ def select_decode_keep_indices(
 
     keep_indices: List[int] = []
     keep_ids: set[int] = set()
+    kept_compact_reqs = 0
     used_attention_tokens = 0
 
     def can_fit(req: Any) -> bool:
-        if max_batch_size and len(keep_indices) >= max_batch_size:
+        if max_compact_batch_size and kept_compact_reqs >= max_compact_batch_size:
             return False
         if attention_budget is not None:
             return (
@@ -282,7 +281,7 @@ def select_decode_keep_indices(
         return True
 
     def add_req(idx: int, *, force: bool = False) -> bool:
-        nonlocal used_attention_tokens
+        nonlocal kept_compact_reqs, used_attention_tokens
         req = batch_reqs[idx]
         if id(req) in keep_ids:
             return True
@@ -290,6 +289,8 @@ def select_decode_keep_indices(
             return False
         keep_indices.append(idx)
         keep_ids.add(id(req))
+        if is_context_engineering_compact(req):
+            kept_compact_reqs += 1
         used_attention_tokens += budget_attention_tokens(
             req,
             compact_attention_cost_ratio=compact_attention_cost_ratio,

@@ -863,9 +863,9 @@ class ServerArgs:
         ),
         NS("schedule"),
     ] = None
-    context_engineering_decode_max_batch_size: A[
+    context_engineering_compact_decode_max_batch_size: A[
         int,
-        "Maximum decode batch size for pair scheduling.",
+        "Maximum number of context-engineering compact requests in a decode batch.",
         NS("schedule"),
     ] = 256
     context_engineering_main_turn_decode_max_batch_size: A[
@@ -873,11 +873,6 @@ class ServerArgs:
         "Maximum number of context-engineering main-turn requests in a decode batch. If not specified, there is no separate main-turn limit.",
         NS("schedule"),
     ] = None
-    context_engineering_prefill_max_batch_size: A[
-        int,
-        "Maximum prefill batch size for compact-aware compact admission.",
-        NS("schedule"),
-    ] = 256
     context_engineering_compact_attention_cost_ratio: A[
         float,
         Arg(
