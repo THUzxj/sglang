@@ -95,7 +95,7 @@ def test_order_prefill_waiting_queue_prioritizes_main_without_pairing():
     ]
 
 
-def test_select_decode_keep_indices_uses_remaining_budget_for_paired_compact():
+def test_select_decode_keep_indices_caps_paired_compact_count():
     main_a = FakeReq("main-a", "main", "a", seqlen=100)
     compact_a = FakeReq("compact-a", "compact", "a", seqlen=50)
     main_b = FakeReq("main-b", "main", "b", seqlen=100)
@@ -104,8 +104,8 @@ def test_select_decode_keep_indices_uses_remaining_budget_for_paired_compact():
     keep = select_decode_keep_indices(
         [main_a, compact_a, main_b, compact_b],
         [],
-        max_batch_size=3,
-        attention_budget=300,
+        max_compact_batch_size=1,
+        attention_budget=None,
     )
 
     assert keep == [0, 1, 2]
@@ -118,7 +118,7 @@ def test_select_decode_keep_indices_does_not_keep_unpaired_compact_with_main():
     keep = select_decode_keep_indices(
         [main_a, compact_b],
         [],
-        max_batch_size=2,
+        max_compact_batch_size=2,
         attention_budget=200,
     )
 
@@ -132,14 +132,14 @@ def test_select_decode_keep_indices_keeps_paired_compact_with_main_without_budge
     keep = select_decode_keep_indices(
         [main_a, compact_a],
         [],
-        max_batch_size=256,
+        max_compact_batch_size=256,
         attention_budget=None,
     )
 
     assert keep == [0, 1]
 
 
-def test_select_decode_keep_indices_does_not_let_compact_displace_later_main():
+def test_select_decode_keep_indices_does_not_count_main_toward_compact_limit():
     main_a = FakeReq("main-a", "main", "a", seqlen=100)
     compact_a = FakeReq("compact-a", "compact", "a", seqlen=50)
     main_b = FakeReq("main-b", "main", "b", seqlen=100)
@@ -147,11 +147,11 @@ def test_select_decode_keep_indices_does_not_let_compact_displace_later_main():
     keep = select_decode_keep_indices(
         [main_a, compact_a, main_b],
         [],
-        max_batch_size=2,
+        max_compact_batch_size=1,
         attention_budget=300,
     )
 
-    assert keep == [0, 2]
+    assert keep == [0, 1, 2]
 
 
 def test_should_try_prefill_request_allows_paired_compact_with_remaining_budget():
@@ -163,25 +163,22 @@ def test_should_try_prefill_request_allows_paired_compact_with_remaining_budget(
         can_run_reqs=[main_a],
         running_reqs=[],
         waiting_queue=[main_a, compact_a],
-        max_batch_size=2,
         attention_budget=200,
     )
 
     assert should_try
 
 
-def test_should_try_prefill_request_uses_normal_slot_admission():
-    main_a = FakeReq("main-a", "main", "a", seqlen=100)
+def test_should_try_prefill_request_has_no_ce_batch_size_limit():
+    active_foreground = [FakeReq(f"foreground-{idx}") for idx in range(300)]
     compact_a = FakeReq("compact-a", "compact", "a", seqlen=50)
-    main_b = FakeReq("main-b", "main", "b", seqlen=100)
 
     should_try = should_try_prefill_request(
         compact_a,
-        can_run_reqs=[main_a],
+        can_run_reqs=active_foreground,
         running_reqs=[],
-        waiting_queue=[main_a, compact_a, main_b],
-        max_batch_size=2,
-        attention_budget=300,
+        waiting_queue=[compact_a],
+        attention_budget=None,
     )
 
     assert should_try
@@ -197,7 +194,6 @@ def test_should_try_prefill_request_admits_paired_compact_after_reserving_main_b
         can_run_reqs=[main_a],
         running_reqs=[],
         waiting_queue=[main_a, compact_a, main_b],
-        max_batch_size=3,
         attention_budget=260,
     )
 
@@ -215,7 +211,6 @@ def test_should_try_prefill_request_allows_compact_only_prefill():
         can_run_reqs=[main_a],
         running_reqs=[],
         waiting_queue=[main_a, compact_a, main_b, main_c],
-        max_batch_size=3,
         attention_budget=1_000,
     )
 
@@ -231,7 +226,6 @@ def test_should_try_prefill_request_holds_pressure_retracted_compact_until_pair(
         can_run_reqs=[],
         running_reqs=[],
         waiting_queue=[compact_a],
-        max_batch_size=2,
         attention_budget=None,
     )
     assert should_try_prefill_request(
@@ -239,7 +233,6 @@ def test_should_try_prefill_request_holds_pressure_retracted_compact_until_pair(
         can_run_reqs=[main_a],
         running_reqs=[],
         waiting_queue=[main_a, compact_a],
-        max_batch_size=2,
         attention_budget=None,
     )
 
@@ -254,7 +247,6 @@ def test_should_try_prefill_request_does_not_reserve_waiting_main_attention():
         can_run_reqs=[main_a],
         running_reqs=[],
         waiting_queue=[main_a, compact_a, main_b],
-        max_batch_size=3,
         attention_budget=220,
     )
 
@@ -270,7 +262,6 @@ def test_should_try_prefill_request_rejects_paired_compact_over_budget():
         can_run_reqs=[main_a],
         running_reqs=[],
         waiting_queue=[main_a, compact_a],
-        max_batch_size=2,
         attention_budget=200,
     )
 
@@ -286,7 +277,6 @@ def test_should_try_prefill_request_ignores_compact_attention_cost_ratio():
         can_run_reqs=[main_a],
         running_reqs=[],
         waiting_queue=[main_a, compact_a],
-        max_batch_size=2,
         attention_budget=250,
         compact_attention_cost_ratio=0.5,
     )
@@ -303,7 +293,6 @@ def test_should_try_prefill_request_allows_compact_only_when_main_waits():
         can_run_reqs=[],
         running_reqs=[],
         waiting_queue=[compact_b, waiting_main],
-        max_batch_size=2,
         attention_budget=200,
     )
 
@@ -318,7 +307,6 @@ def test_should_try_prefill_request_allows_compact_only_without_main():
         can_run_reqs=[],
         running_reqs=[],
         waiting_queue=[compact_a],
-        max_batch_size=256,
         attention_budget=None,
     )
 
@@ -333,7 +321,7 @@ def test_select_decode_keep_indices_retracts_compact_only_batch_for_waiting_main
     keep = select_decode_keep_indices(
         [compact_a, compact_b],
         [waiting_main],
-        max_batch_size=256,
+        max_compact_batch_size=256,
         attention_budget=None,
     )
 
@@ -377,7 +365,7 @@ def test_select_decode_keep_indices_uses_compact_attention_cost_ratio():
     keep = select_decode_keep_indices(
         [main_a, compact_a],
         [],
-        max_batch_size=2,
+        max_compact_batch_size=2,
         attention_budget=250,
         compact_attention_cost_ratio=0.5,
     )
@@ -392,7 +380,7 @@ def test_select_decode_keep_indices_retracts_compact_only_without_main():
     keep = select_decode_keep_indices(
         [compact_a, compact_b],
         [],
-        max_batch_size=0,
+        max_compact_batch_size=0,
         attention_budget=1,
     )
 
@@ -412,7 +400,7 @@ def test_select_decode_keep_indices_allows_explicit_compact_drain():
     keep = select_decode_keep_indices(
         [compact_a, compact_b],
         [],
-        max_batch_size=256,
+        max_compact_batch_size=256,
         attention_budget=None,
     )
 
@@ -431,7 +419,7 @@ def test_select_decode_keep_indices_applies_budget_to_compact_drain():
     keep = select_decode_keep_indices(
         [compact_a],
         [],
-        max_batch_size=256,
+        max_compact_batch_size=256,
         attention_budget=50,
     )
 

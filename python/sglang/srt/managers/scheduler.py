@@ -3023,8 +3023,8 @@ class Scheduler(
         keep_indices = select_decode_keep_indices(
             combined_reqs,
             self.waiting_queue,
-            max_batch_size=(
-                self.server_args.context_engineering_decode_max_batch_size
+            max_compact_batch_size=(
+                self.server_args.context_engineering_compact_decode_max_batch_size
             ),
             attention_budget=(
                 self.server_args.context_engineering_decode_attention_token_budget
@@ -3400,9 +3400,6 @@ class Scheduler(
                     can_run_reqs=adder.can_run_list,
                     running_reqs=running_batch.reqs,
                     waiting_queue=self.waiting_queue,
-                    max_batch_size=(
-                        self.server_args.context_engineering_prefill_max_batch_size
-                    ),
                     attention_budget=(
                         self.server_args.context_engineering_prefill_attention_token_budget
                     ),
@@ -3802,7 +3799,9 @@ class Scheduler(
         keep_indices = select_decode_keep_indices(
             batch.reqs,
             self.waiting_queue,
-            max_batch_size=self.server_args.context_engineering_decode_max_batch_size,
+            max_compact_batch_size=(
+                self.server_args.context_engineering_compact_decode_max_batch_size
+            ),
             attention_budget=(
                 self.server_args.context_engineering_decode_attention_token_budget
             ),
