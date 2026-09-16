@@ -937,13 +937,6 @@ class SchedulerMetricsReporter:
                 f"#ce-compact: {context_stats['compact']}, "
                 f"#ce-paired-compact: {context_stats['paired_compact']}"
             )
-            self._log_context_engineering_batch(
-                stage="decode",
-                batch_iter=batch.forward_iter
-                if batch.forward_iter is not None
-                else self.scheduler.forward_ct,
-                context_stats=context_stats,
-            )
 
         if self.enable_mfu_metrics and gap_latency > 0:
             flops_per_s = self._mfu_log_flops / gap_latency
