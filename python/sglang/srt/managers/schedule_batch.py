@@ -899,6 +899,10 @@ class Req(ReqDllmMixin):
         self.context_engineering_kind = self._derive_context_engineering_kind()
         self.context_engineering_pair_key = self._derive_context_engineering_pair_key()
         self.allow_compact_drain = self._derive_allow_compact_drain()
+        labels = self.custom_labels if isinstance(self.custom_labels, dict) else {}
+        self.reprocess_reason = str(
+            labels.get("_sglang_reprocess_reason") or ""
+        )
 
         # Memory pool info
         self.req_pool_idx: Optional[int] = None
@@ -961,6 +965,11 @@ class Req(ReqDllmMixin):
         self.prefix_indices: torch.Tensor = torch.empty((0,), dtype=torch.int64)
         # TODO(ispobock): rename to last_device_node
         self.last_node: Any = None
+        # Node on which this request actually acquired its radix lock.  Keep
+        # this separate from last_node: prefix rematches may update last_node
+        # while the outstanding lock still belongs to the original node.
+        self.radix_lock_node: Any = None
+        self.radix_lock_prefix_len: Optional[int] = None
         self.last_host_node: Any = None
         self.best_match_node: Any = None
         # Per-component host hit lengths split off from host_hit_length:
@@ -1667,11 +1676,15 @@ class Req(ReqDllmMixin):
         # Increment retraction count before resetting other state. We should not reset this
         # since we are tracking the total number of retractions for each request.
         self.retraction_count += 1
+        if not self.reprocess_reason:
+            self.reprocess_reason = "retracted"
 
         self.prefix_indices = torch.empty((0,), dtype=torch.int64)
         self.routed_experts = None
         self.indexer_topk = None
         self.last_node = None
+        self.radix_lock_node = None
+        self.radix_lock_prefix_len = None
         self.cache_protected_len = 0
         self.num_matched_prefix_tokens = 0
         self.swa_uuid_for_lock = None
@@ -1721,6 +1734,8 @@ class Req(ReqDllmMixin):
         self.context_engineering_pause_committed_len = committed_len
         self.prefix_indices = torch.empty((0,), dtype=torch.int64)
         self.last_node = None
+        self.radix_lock_node = None
+        self.radix_lock_prefix_len = None
         self.last_host_node = None
         self.best_match_node = None
         self.host_hit_length = 0

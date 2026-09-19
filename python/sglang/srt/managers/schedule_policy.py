@@ -826,11 +826,15 @@ class PrefillAdder:
 
     def _req_inc_lock_ref(self, req: Req):
         result = self.tree_cache.inc_lock_ref(req.last_node)
-        if self.is_hybrid_swa:
-            req.swa_uuid_for_lock = result.swa_uuid_for_lock
-        # match locks this node's components, so clear any stale skip set
-        # carried from a previous scheduling of this req.
-        req.skip_lock_node_ids = {}
+        req.radix_lock_node = req.last_node
+        req.radix_lock_prefix_len = getattr(
+            req, "cache_protected_len", len(req.prefix_indices)
+        )
+        req.swa_uuid_for_lock = result.swa_uuid_for_lock
+        # A HiCache prefix can contain device tombstones when admission takes
+        # the lock. Keep the exact skip set so a later load-back does not make
+        # release_kv_cache decrement component locks this request never took.
+        req.skip_lock_node_ids = result.skip_lock_node_ids
 
     def add_dllm_staging_req(self, req: Req):
         assert self.dllm_config is not None

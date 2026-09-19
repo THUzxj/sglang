@@ -595,6 +595,8 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
         )
         # Always lock to match aggregated scheduling behavior
         lock_result = self.tree_cache.inc_lock_ref(result.last_device_node)
+        req.radix_lock_node = result.last_device_node
+        req.radix_lock_prefix_len = len(result.device_indices)
         req.swa_uuid_for_lock = lock_result.swa_uuid_for_lock
         req.skip_lock_node_ids = lock_result.skip_lock_node_ids
         prefix_match = self._build_decode_prefix_match(
@@ -628,13 +630,18 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
 
     def _release_prefix_lock(self, req: Req) -> None:
         """Release the decode-side prefix lock with its component skip mask."""
+        lock_node = getattr(req, "radix_lock_node", None)
+        if lock_node is None:
+            lock_node = req.last_node
         self.tree_cache.dec_lock_ref(
-            req.last_node,
+            lock_node,
             DecLockRefParams(
                 swa_uuid_for_lock=req.swa_uuid_for_lock,
                 skip_lock_node_ids=req.skip_lock_node_ids,
             ),
         )
+        req.radix_lock_node = None
+        req.radix_lock_prefix_len = None
 
     def _resolve_prefill_dp_rank(self, req: Req) -> Optional[int]:
         prefill_info = self.kv_manager.prefill_info_table.get(_bootstrap_addr(req))
@@ -801,6 +808,8 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
             mamba_host_hit_length=int(mamba_on_host),
         )
         lock = self.tree_cache.inc_lock_ref(full_match.last_device_node)
+        req.radix_lock_node = full_match.last_device_node
+        req.radix_lock_prefix_len = prefix_len
         req.swa_uuid_for_lock = lock.swa_uuid_for_lock
         req.skip_lock_node_ids = lock.skip_lock_node_ids
         allocated = False
@@ -819,6 +828,7 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
             # decode-side prefix reuse, so request completion/rollback cannot
             # free the shared KV pages as request-private allocations.
             req.cache_protected_len = length
+            req.radix_lock_prefix_len = length
 
             # _pre_alloc may evict the checkpoint to make room for the active
             # state. Re-evaluate Mamba residency after that eviction.
@@ -885,7 +895,7 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
             raise
         finally:
             if not allocated:
-                self.tree_cache.dec_lock_ref(full_match.last_device_node, lock.to_dec_params())
+                self.tree_cache._dec_req_lock(req)
 
     @staticmethod
     def _rebootstrap_prefill_len(req: Req) -> int:
@@ -991,6 +1001,13 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
 
             # load from cpu, release the cpu copy
             req.load_kv_cache(self.req_to_token_pool, self.token_to_kv_pool_allocator)
+            req.prefix_indices = self.req_to_token_pool.req_to_token[
+                req.req_pool_idx, : req.kv_committed_len
+            ]
+            req.cache_protected_len = 0
+            req.last_node = None
+            req.radix_lock_node = None
+            req.radix_lock_prefix_len = None
 
         self.retracted_queue = [
             entry
@@ -2647,13 +2664,15 @@ class SchedulerDisaggregationDecodeMixin:
                 can_run_list.append(req)
                 if req.is_context_engineering_main():
                     active_main_turns += 1
-                # Decode-radix path: new requests already matched in
-                # `pop_preallocated`. Retracted requests reset `last_node`,
-                # so re-match only when that state is missing.
-                if get_disagg().disaggregation_decode_enable_radix_cache:
-                    tree_cache = self.tree_cache if req.last_node is None else None
-                else:
-                    tree_cache = self.tree_cache
+                # Fresh decode-radix requests were matched and locked in
+                # pop_preallocated. A CPU-restored retraction owns private KV;
+                # rematching here would label those pages cache-owned without
+                # acquiring a lock or transferring the req_to_token row.
+                tree_cache = (
+                    self.tree_cache
+                    if not get_disagg().disaggregation_decode_enable_radix_cache
+                    else None
+                )
                 req.init_next_round_input(tree_cache)
                 # Truncate fill_len to kv_committed_len so cache_unfinished_req
                 # only sees committed KV (full array includes one uncommitted

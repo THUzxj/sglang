@@ -916,6 +916,141 @@ class UnifiedRadixCacheSuite:
         self.assertEqual(len(m.device_indices), aligned_len)
         cache.sanity_check()
 
+    def test_cache_finished_req_extends_locked_prefix(self):
+        cache, allocator, req_to_token_pool = build_fixture(self.cfg)
+        ps = self.cfg.page_size
+
+        prefix = self._make_seq(1, 3)
+        self._insert(cache, allocator, req_to_token_pool, prefix)
+        match = cache.match_prefix(
+            MatchPrefixParams(
+                key=RadixKey(array("q", prefix)), match_full_kv_only=True
+            )
+        )
+        lock = cache.inc_lock_ref(match.last_device_node)
+
+        req = self._make_req(req_to_token_pool)
+        suffix = self._make_seq(2000, 2)
+        tokens = prefix + suffix
+        req.origin_input_ids = array("q", tokens[:-1])
+        req.output_ids = array("q", tokens[-1:])
+        req.full_untruncated_fill_ids = array("q", tokens)
+        req.set_extend_range(len(prefix), len(tokens))
+        suffix_indices = self._alloc(allocator, len(suffix))
+        req_to_token_pool.write(
+            (req.req_pool_idx, slice(0, len(prefix))), match.device_indices
+        )
+        req_to_token_pool.write(
+            (req.req_pool_idx, slice(len(prefix), len(tokens))), suffix_indices
+        )
+        req.kv_committed_len = len(tokens)
+        req.kv = ReqKvInfo(kv_allocated_len=len(tokens), swa_evicted_seqlen=0)
+        req.prefix_indices = match.device_indices
+        req.last_node = match.last_device_node
+        req.radix_lock_node = match.last_device_node
+        req.radix_lock_prefix_len = len(prefix)
+        req.cache_protected_len = len(prefix)
+        req.swa_uuid_for_lock = lock.swa_uuid_for_lock
+        req.skip_lock_node_ids = lock.skip_lock_node_ids
+        req.extra_key = None
+        if self.cfg.has_mamba:
+            req.mamba_last_track_seqlen = len(tokens)
+
+        # Prefix rematching may update this mutable scheduling field without
+        # changing the lock ownership. Release must use the frozen lock prefix.
+        req.cache_protected_len = len(tokens)
+
+        cache.cache_finished_req(req, is_insert=True, kv_len_to_handle=len(tokens))
+
+        self.assertEqual(
+            cache.tree_core.node_by_id(match.last_device_node)
+            .component_data[ComponentType.FULL]
+            .lock_ref,
+            0,
+        )
+        self.assertEqual(
+            allocator.available_size() + cache.full_evictable_size(),
+            allocator.size,
+        )
+        self.assertIsNone(req.radix_lock_prefix_len)
+        cache.sanity_check()
+
+    def test_cache_finished_req_frees_private_kv_after_unowned_rematch(self):
+        cache, allocator, req_to_token_pool = build_fixture(self.cfg)
+
+        req = self._make_req(req_to_token_pool)
+        tokens = self._make_seq(1, 4)
+        kv_indices = self._alloc(allocator, len(tokens))
+        req_to_token_pool.write(
+            (req.req_pool_idx, slice(0, len(tokens))), kv_indices
+        )
+        req.origin_input_ids = array("q", tokens[:-1])
+        req.output_ids = array("q", tokens[-1:])
+        req.full_untruncated_fill_ids = array("q", tokens)
+        req.set_extend_range(0, len(tokens))
+        req.kv_committed_len = len(tokens)
+        req.kv = ReqKvInfo(kv_allocated_len=len(tokens), swa_evicted_seqlen=0)
+        req.prefix_indices = kv_indices
+        req.last_node = cache.root_node.id
+        req.radix_lock_node = None
+        req.radix_lock_prefix_len = None
+        # Simulate a stale rematch-derived value. Without explicit ownership,
+        # none of these request-private pages may be treated as cache-owned.
+        req.cache_protected_len = len(tokens)
+        req.extra_key = None
+        if self.cfg.has_mamba:
+            req.mamba_last_track_seqlen = len(tokens)
+
+        cache.cache_finished_req(
+            req, is_insert=False, kv_len_to_handle=len(tokens)
+        )
+
+        self.assertEqual(
+            allocator.available_size() + cache.full_evictable_size(),
+            allocator.size,
+        )
+        cache.sanity_check()
+
+    def test_req_lock_release_uses_acquired_node_after_last_node_changes(self):
+        cache, allocator, req_to_token_pool = build_fixture(self.cfg)
+        seq_a = self._make_seq(1, 2)
+        seq_b = self._make_seq(2000, 2)
+        self._insert(cache, allocator, req_to_token_pool, seq_a)
+        self._insert(cache, allocator, req_to_token_pool, seq_b)
+        match_a = cache.match_prefix(
+            MatchPrefixParams(key=RadixKey(array("q", seq_a)))
+        )
+        match_b = cache.match_prefix(
+            MatchPrefixParams(key=RadixKey(array("q", seq_b)))
+        )
+        lock_a = cache.inc_lock_ref(match_a.last_device_node)
+        lock_b = cache.inc_lock_ref(match_b.last_device_node)
+
+        req = self._make_req(req_to_token_pool)
+        req.last_node = match_b.last_device_node
+        req.radix_lock_node = match_a.last_device_node
+        req.radix_lock_prefix_len = len(seq_a)
+        req.swa_uuid_for_lock = lock_a.swa_uuid_for_lock
+        req.skip_lock_node_ids = lock_a.skip_lock_node_ids
+        cache._dec_req_lock(req)
+        self.assertIsNone(req.radix_lock_prefix_len)
+
+        full = ComponentType.FULL
+        self.assertEqual(
+            cache.tree_core.node_by_id(match_a.last_device_node)
+            .component_data[full]
+            .lock_ref,
+            0,
+        )
+        self.assertEqual(
+            cache.tree_core.node_by_id(match_b.last_device_node)
+            .component_data[full]
+            .lock_ref,
+            1,
+        )
+        cache.dec_lock_ref(match_b.last_device_node, lock_b.to_dec_params())
+        cache.sanity_check()
+
     def test_cache_finished_req_strips_thinking(self):
         cache, allocator, req_to_token_pool = build_fixture(self.cfg)
         ps = self.cfg.page_size

@@ -636,14 +636,63 @@ class UnifiedRadixCache(BasePrefixCache):
     def _dec_req_lock(self, req: Req, *, skip_swa: bool = False) -> None:
         """Release the tree lock a request holds on its last_node, honoring the
         components it skipped locking so it never drops a lock it never took."""
-        self.dec_lock_ref(
-            req.last_node,
-            DecLockRefParams(
-                swa_uuid_for_lock=req.swa_uuid_for_lock,
-                skip_lock_node_ids=req.skip_lock_node_ids,
-            ),
-            skip_swa=skip_swa,
+        params = DecLockRefParams(
+            swa_uuid_for_lock=req.swa_uuid_for_lock,
+            skip_lock_node_ids=req.skip_lock_node_ids,
         )
+        if hasattr(req, "radix_lock_node"):
+            lock_node = req.radix_lock_node
+            if lock_node is None:
+                req.radix_lock_prefix_len = None
+                return
+        else:
+            # Compatibility for request-like test objects and callers that
+            # predate explicit lock ownership.
+            lock_node = req.last_node
+        try:
+            self.dec_lock_ref(lock_node, params, skip_swa=skip_swa)
+        except AssertionError as exc:
+            node = self.tree_core.node_by_id(lock_node)
+            root = self.tree_core.root_node
+            full_skip = params.skip_lock_node_ids.get(ComponentType.FULL, ())
+            full_path = []
+            while node is not root:
+                cd = node.component_data[ComponentType.FULL]
+                full_path.append(
+                    {
+                        "node_id": node.id,
+                        "lock_ref": cd.lock_ref,
+                        "has_value": cd.value is not None,
+                        "skipped": node.id in full_skip,
+                    }
+                )
+                node = node.parent
+            raise AssertionError(
+                "Request radix lock release mismatch: "
+                f"rid={req.rid} lock_node={lock_node} last_node={req.last_node} "
+                f"swa_uuid_for_lock={req.swa_uuid_for_lock} "
+                f"skip_lock_node_ids={req.skip_lock_node_ids} "
+                f"full_path={full_path}"
+            ) from exc
+        req.radix_lock_node = None
+        req.radix_lock_prefix_len = None
+
+    @staticmethod
+    def _req_protected_len(req: Req) -> int:
+        """Return the prefix owned by the request's currently held radix lock."""
+        if not hasattr(req, "radix_lock_node"):
+            return req.cache_protected_len
+        if req.radix_lock_node is None:
+            assert req.radix_lock_prefix_len is None, (
+                f"radix lock prefix without lock ownership: rid={req.rid} "
+                f"radix_lock_prefix_len={req.radix_lock_prefix_len}"
+            )
+            return 0
+        assert req.radix_lock_prefix_len is not None, (
+            f"radix lock ownership without prefix length: rid={req.rid} "
+            f"radix_lock_node={req.radix_lock_node}"
+        )
+        return req.radix_lock_prefix_len
 
     def dec_swa_lock_only(
         self,
@@ -693,9 +742,11 @@ class UnifiedRadixCache(BasePrefixCache):
         result = None
         insert_params = None
 
+        protected_len = self._req_protected_len(req)
+
         if is_insert:
             insert_params = InsertParams(
-                prev_prefix_len=req.cache_protected_len,
+                prev_prefix_len=protected_len,
                 priority=getattr(req, "priority", 0) or 0,
             )
 
@@ -716,7 +767,7 @@ class UnifiedRadixCache(BasePrefixCache):
             kv_indices_full = kv_indices
             tail_free_start = None
             if effective_cache_len < len(token_ids):
-                tail_free_start = max(effective_cache_len, req.cache_protected_len)
+                tail_free_start = max(effective_cache_len, protected_len)
                 token_ids = token_ids[:effective_cache_len]
                 kv_indices = kv_indices[:effective_cache_len]
 
@@ -737,8 +788,8 @@ class UnifiedRadixCache(BasePrefixCache):
             self.token_to_kv_pool_allocator.free_segments(segments)
         else:
             self.token_to_kv_pool_allocator.free_segment(
-                kv_indices[req.cache_protected_len :],
-                start_pos=req.cache_protected_len,
+                kv_indices[protected_len:],
+                start_pos=protected_len,
             )
 
         self._dec_req_lock(req, skip_swa=req.swa_prefix_lock_released)
@@ -778,8 +829,9 @@ class UnifiedRadixCache(BasePrefixCache):
         ]
 
         # components prepare insert data + return effective cache_len
+        protected_len = self._req_protected_len(req)
         insert_params = InsertParams(
-            prev_prefix_len=req.cache_protected_len,
+            prev_prefix_len=protected_len,
             chunked=chunked,
             priority=getattr(req, "priority", 0) or 0,
         )
@@ -828,14 +880,14 @@ class UnifiedRadixCache(BasePrefixCache):
         new_last_node = match_result.last_device_node
         new_prefix_len = result.prefix_len
         assert (
-            req.cache_protected_len <= len(new_indices) + self.page_size - 1
-        ), f"{req.cache_protected_len=}, {len(new_indices)=}, {page_aligned_len=}"
+            protected_len <= len(new_indices) + self.page_size - 1
+        ), f"{protected_len=}, {len(new_indices)=}, {page_aligned_len=}"
         assert new_prefix_len <= len(
             new_indices
         ), f"{new_prefix_len=}, {len(new_indices)=}"
         self.req_to_token_pool.write(
-            (req.req_pool_idx, slice(req.cache_protected_len, len(new_indices))),
-            new_indices[req.cache_protected_len :],
+            (req.req_pool_idx, slice(protected_len, len(new_indices))),
+            new_indices[protected_len:],
         )
 
         self._dec_req_lock(req)
@@ -863,6 +915,8 @@ class UnifiedRadixCache(BasePrefixCache):
             req.prefix_indices = new_indices
         req.cache_protected_len = len(new_indices)
         req.last_node = new_last_node
+        req.radix_lock_node = new_last_node
+        req.radix_lock_prefix_len = len(new_indices)
         req.swa_uuid_for_lock = lock_result.swa_uuid_for_lock
         # carry the skip set so this node's dec releases only what we locked
         req.skip_lock_node_ids = lock_result.skip_lock_node_ids

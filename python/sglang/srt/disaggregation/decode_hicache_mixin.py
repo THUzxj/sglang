@@ -395,7 +395,9 @@ class DecodeHiCacheTransferMixin:
                 f"rid={decode_req.req.rid}"
             )
 
-        original_node = decode_req.req.last_node
+        original_node = getattr(decode_req.req, "radix_lock_node", None)
+        if original_node is None:
+            original_node = decode_req.req.last_node
         original_lock_params = DecLockRefParams(
             swa_uuid_for_lock=decode_req.req.swa_uuid_for_lock,
             skip_lock_node_ids={
@@ -417,6 +419,8 @@ class DecodeHiCacheTransferMixin:
             [prefix_match.prefix_indices, restored_kv_indices]
         )
         decode_req.req.last_node = restored_node
+        decode_req.req.radix_lock_node = restored_node
+        decode_req.req.radix_lock_prefix_len = prefix_match.decode_prefix_len
         decode_req.req.swa_uuid_for_lock = restored_lock_params.swa_uuid_for_lock
         decode_req.req.skip_lock_node_ids = {
             component_type: set(node_ids)

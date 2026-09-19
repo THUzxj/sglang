@@ -133,6 +133,7 @@ class TestDecodeHiCacheRestore(unittest.TestCase):
 
         self.assertTrue(prefix_match.needs_local_restore)
         self.assertEqual(prefix_match.restore_token_count, 0)
+
     def test_cleanup_releases_only_the_temporary_restored_lock(self):
         queue = self._make_queue()
         decode_req = self._make_decode_req()

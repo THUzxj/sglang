@@ -306,6 +306,8 @@ class TestDecodeLockRefScenarios(unittest.TestCase):
         req.skip_lock_node_ids = {"mamba": {17}}
         req.finished_reason = None
         req.cache_protected_len = 0
+        req.radix_lock_node = req.last_node
+        req.radix_lock_prefix_len = 4
         req.sampling_params.max_new_tokens = 16
 
         decode_req = MagicMock()
@@ -372,6 +374,47 @@ class TestDecodeLockRefScenarios(unittest.TestCase):
         self.assertEqual(release_params.skip_lock_node_ids, {"mamba": {17}})
         self.assertEqual(queue._allocatable_token_budgets.call_count, 2)
 
+    def test_resume_retracted_req_restores_private_kv_ownership(self):
+        queue = DecodePreallocQueue.__new__(DecodePreallocQueue)
+        req = SimpleNamespace(
+            rid="restored",
+            req_pool_idx=1,
+            kv_committed_len=4,
+            is_retracted=True,
+            prefix_indices=torch.tensor([99], dtype=torch.int64),
+            cache_protected_len=4,
+            last_node=17,
+            radix_lock_node=17,
+            radix_lock_prefix_len=4,
+            load_kv_cache=MagicMock(),
+        )
+        queue.retracted_queue = [req]
+        queue.req_to_token_pool = SimpleNamespace(
+            available_size=lambda: 1,
+            req_to_token=torch.arange(16, dtype=torch.int64).reshape(2, 8),
+        )
+        queue.token_to_kv_pool_allocator = MagicMock()
+        queue._uses_swa_tail_prealloc = MagicMock(return_value=False)
+        queue._allocatable_token_budgets = MagicMock(return_value=8)
+        queue._prealloc_required_tokens = MagicMock(return_value=(4, 0))
+        queue._pre_alloc = MagicMock()
+
+        resumed = queue.resume_retracted_reqs()
+
+        self.assertEqual(resumed, [req])
+        req.load_kv_cache.assert_called_once_with(
+            queue.req_to_token_pool, queue.token_to_kv_pool_allocator
+        )
+        torch.testing.assert_close(
+            req.prefix_indices,
+            queue.req_to_token_pool.req_to_token[req.req_pool_idx, :4],
+        )
+        self.assertEqual(req.cache_protected_len, 0)
+        self.assertIsNone(req.last_node)
+        self.assertIsNone(req.radix_lock_node)
+        self.assertIsNone(req.radix_lock_prefix_len)
+        self.assertEqual(queue.retracted_queue, [])
+
     def test_pop_preallocated_rolls_back_when_actual_alloc_fails(self):
         queue = DecodePreallocQueue.__new__(DecodePreallocQueue)
         queue.pp_size = 1
@@ -385,6 +428,8 @@ class TestDecodeLockRefScenarios(unittest.TestCase):
         req.skip_lock_node_ids = {"mamba": {23}}
         req.finished_reason = None
         req.cache_protected_len = 0
+        req.radix_lock_node = req.last_node
+        req.radix_lock_prefix_len = 4
         req.kv_committed_len = 32
         req.kv = object()
         req.req_pool_idx = 3
