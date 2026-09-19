@@ -69,6 +69,15 @@ class PrefillStats:
     num_new_seqs: int  # len(can_run_list)
     reprocessed_log_input_tokens: int = 0
     reprocessed_log_hit_tokens: int = 0
+    fresh_log_input_tokens_by_kind: dict[str, int] = dataclasses.field(
+        default_factory=dict
+    )
+    reprocessed_log_input_tokens_by_kind: dict[str, int] = dataclasses.field(
+        default_factory=dict
+    )
+    reprocessed_log_input_tokens_by_reason: dict[str, int] = dataclasses.field(
+        default_factory=dict
+    )
     num_pending_tokens: int = 0
 
     @classmethod
@@ -84,6 +93,15 @@ class PrefillStats:
             log_hit_tokens=adder.log_hit_tokens,
             reprocessed_log_input_tokens=adder.reprocessed_log_input_tokens,
             reprocessed_log_hit_tokens=adder.reprocessed_log_hit_tokens,
+            fresh_log_input_tokens_by_kind=dict(
+                adder.fresh_log_input_tokens_by_kind
+            ),
+            reprocessed_log_input_tokens_by_kind=dict(
+                adder.reprocessed_log_input_tokens_by_kind
+            ),
+            reprocessed_log_input_tokens_by_reason=dict(
+                adder.reprocessed_log_input_tokens_by_reason
+            ),
             new_token_ratio=adder.new_token_ratio,
             num_running_reqs=QueueCount.from_reqs(
                 running_reqs, enable_priority_scheduling
@@ -630,12 +648,39 @@ class SchedulerMetricsReporter:
             else self.scheduler.forward_ct
         )
         iter_msg = f" [{batch_iter}]" if LOG_FORWARD_ITERS else ""
+        reprocess_reason_token_json = json.dumps(
+            prefill_stats.reprocessed_log_input_tokens_by_reason,
+            sort_keys=True,
+            separators=(",", ":"),
+        )
+        fresh_input_tokens = (
+            prefill_stats.log_input_tokens
+            - prefill_stats.reprocessed_log_input_tokens
+        )
 
         msg = (
             f"Prefill batch{iter_msg}, "
             f"#new-seq: {prefill_stats.num_new_seqs}, "
             f"#new-token: {prefill_stats.log_input_tokens}, "
             f"#cached-token: {prefill_stats.log_hit_tokens}, "
+            f"#fresh-new-token: {fresh_input_tokens}, "
+            f"#fresh-main-token: "
+            f"{prefill_stats.fresh_log_input_tokens_by_kind.get('main', 0)}, "
+            f"#fresh-compact-token: "
+            f"{prefill_stats.fresh_log_input_tokens_by_kind.get('compact', 0)}, "
+            f"#fresh-other-token: "
+            f"{prefill_stats.fresh_log_input_tokens_by_kind.get('other', 0)}, "
+            f"#reprocessed-new-token: "
+            f"{prefill_stats.reprocessed_log_input_tokens}, "
+            f"#reprocessed-cached-token: "
+            f"{prefill_stats.reprocessed_log_hit_tokens}, "
+            f"#reprocessed-main-token: "
+            f"{prefill_stats.reprocessed_log_input_tokens_by_kind.get('main', 0)}, "
+            f"#reprocessed-compact-token: "
+            f"{prefill_stats.reprocessed_log_input_tokens_by_kind.get('compact', 0)}, "
+            f"#reprocessed-other-token: "
+            f"{prefill_stats.reprocessed_log_input_tokens_by_kind.get('other', 0)}, "
+            f"reprocess-reason-token: {reprocess_reason_token_json}, "
             f"{token_usage_msg}"
             f"#running-req: {prefill_stats.num_running_reqs.total}, "
             f"#queue-req: {len(self.scheduler.waiting_queue)}, "

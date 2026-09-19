@@ -1784,6 +1784,10 @@ class Req(ReqDllmMixin):
     def build_rebootstrap_payload(self) -> dict:
         """Build the prefill request used to resume a PD true retraction."""
         sp = self.sampling_params
+        custom_labels = dict(getattr(self, "custom_labels", {}))
+        custom_labels["_sglang_reprocess_reason"] = (
+            self.reprocess_reason or "pd_rebootstrap"
+        )
         return {
             "input_ids": [int(x) for x in self.origin_input_ids]
             + [int(x) for x in self.output_ids],
@@ -1811,7 +1815,7 @@ class Req(ReqDllmMixin):
             "extra_key": self.extra_key,
             "routing_key": self.routing_key,
             "disagg_prefill_dp_rank": self.disagg_prefill_dp_rank,
-            "custom_labels": dict(getattr(self, "custom_labels", {})),
+            "custom_labels": custom_labels,
         }
 
     def log_time_stats(self):
@@ -2926,6 +2930,7 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
             sorted_indices.remove(idx)
             req = self.reqs[idx]
             retracted_reqs.append(req)
+            req.reprocess_reason = "kv_pressure"
             # Release memory and don't insert into the tree because we need the
             # space instantly. In PD decode this remains the real CPU-offload
             # retraction path; GPU-resident parking never calls this method.
@@ -2945,6 +2950,7 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
                 "in the decode batch. Aborting the last request.",
                 status_code=HTTPStatus.INTERNAL_SERVER_ERROR,
             )
+            last_req.reprocess_reason = "kv_pressure_abort"
             reqs_to_abort.append(last_req)
             self.release_req(last_idx, 0, server_args)
             logger.warning(

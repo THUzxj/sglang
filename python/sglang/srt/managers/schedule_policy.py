@@ -492,6 +492,9 @@ class PrefillAdder:
         # TODO(lsyin): report the real input tokens excluding page alignment
         self.log_input_tokens = 0
         self.reprocessed_log_input_tokens = 0
+        self.fresh_log_input_tokens_by_kind = defaultdict(int)
+        self.reprocessed_log_input_tokens_by_kind = defaultdict(int)
+        self.reprocessed_log_input_tokens_by_reason = defaultdict(int)
 
         if running_batch is not None:
             # Estimate the offset in the remaining token space
@@ -749,7 +752,7 @@ class PrefillAdder:
         prefix_len: int,
         extend_input_len: int,
         max_new_tokens: int,
-        retracted_stain: bool,
+        req: Req,
         mamba_gap_reserve: int = 0,
     ):
         # TODO(lsyin): check this workaround logic, which only ensures the prefill will not out of memory, and may be too conservative
@@ -787,9 +790,22 @@ class PrefillAdder:
         # when computing the first-attempt prefix cache hit rate.
         self.log_hit_tokens += prefix_len
         self.log_input_tokens += extend_input_len
-        if retracted_stain:
+        kind = req.context_engineering_kind
+        if kind not in {"main", "compact"}:
+            kind = "other"
+        reason = getattr(req, "reprocess_reason", "")
+        if not isinstance(reason, str):
+            reason = ""
+        is_reprocessed = req.retracted_stain or bool(reason)
+        if is_reprocessed:
             self.reprocessed_log_hit_tokens += prefix_len
             self.reprocessed_log_input_tokens += extend_input_len
+            self.reprocessed_log_input_tokens_by_kind[kind] += extend_input_len
+            self.reprocessed_log_input_tokens_by_reason[
+                reason or "retracted"
+            ] += extend_input_len
+        else:
+            self.fresh_log_input_tokens_by_kind[kind] += extend_input_len
 
     def _get_dllm_remain_tokens(self) -> int:
         _rem_tokens = min(
@@ -820,7 +836,7 @@ class PrefillAdder:
             prefix_len,
             trunc_len,
             0,
-            req.retracted_stain,
+            req,
             mamba_gap_reserve=self._mamba_gap_budget_for_req(req),
         )
 
@@ -864,7 +880,7 @@ class PrefillAdder:
             0,
             req.extend_range.length,
             max_new_tokens,
-            req.retracted_stain,
+            req,
             mamba_gap_reserve=self._mamba_gap_budget_for_req(req),
         )
 
@@ -919,7 +935,7 @@ class PrefillAdder:
                 if not truncated
                 else 0
             ),
-            req.retracted_stain,
+            req,
             mamba_gap_reserve=self._mamba_gap_budget_for_req(req),
         )
 
@@ -1040,7 +1056,7 @@ class PrefillAdder:
                 0,
                 req.extend_range.length,
                 min(req.sampling_params.max_new_tokens, CLIP_MAX_NEW_TOKENS),
-                req.retracted_stain,
+                req,
                 mamba_gap_reserve=self._mamba_gap_budget_for_req(req),
             )
         else:
@@ -1060,7 +1076,7 @@ class PrefillAdder:
                 0,
                 trunc_len,
                 0,
-                req.retracted_stain,
+                req,
                 mamba_gap_reserve=self._mamba_gap_budget_for_req(req),
             )
 
@@ -1217,7 +1233,7 @@ class PrefillAdder:
                         req.sampling_params.max_new_tokens,
                         CLIP_MAX_NEW_TOKENS,
                     ),
-                    req.retracted_stain,
+                    req,
                     mamba_gap_reserve=self._mamba_gap_budget_for_req(req),
                 )
             else:
@@ -1258,7 +1274,7 @@ class PrefillAdder:
                     prefix_len,
                     trunc_len,
                     0,
-                    req.retracted_stain,
+                    req,
                     mamba_gap_reserve=self._mamba_gap_budget_for_req(req),
                 )
 
@@ -1323,6 +1339,7 @@ class PrefillAdder:
         release_counter = 0
         for i, running_req in enumerate(self.running_batch.reqs):
             if running_req in preemptible_reqs:
+                running_req.reprocess_reason = "priority_preemption"
                 self.rem_total_token_offset -= (
                     self._get_running_request_total_token_offset(running_req)
                 )

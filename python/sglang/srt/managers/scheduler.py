@@ -3083,6 +3083,7 @@ class Scheduler(
 
         if pd_rebootstrap_reqs:
             for req in pd_rebootstrap_reqs:
+                req.reprocess_reason = "radix_evictable_rebootstrap"
                 if self.disaggregation_mode == DisaggregationMode.DECODE:
                     req.time_stats.reset_for_decode_cache_resume()
                     self.disagg_decode_prealloc_queue.add_cache_resume(req)
@@ -3743,6 +3744,7 @@ class Scheduler(
 
         self.paused_compact_queue.remove(victim)
         victim.is_context_engineering_paused = False
+        victim.reprocess_reason = "kv_pressure_paused_compact"
         insert_into_radix_cache = should_cache_paused_compact_for_kv_pressure(
             enable_hierarchical_cache=self.enable_hierarchical_cache,
             disaggregation_mode=self.server_args.disaggregation_mode,
@@ -3913,6 +3915,8 @@ class Scheduler(
             for idx, req in enumerate(batch.reqs)
             if idx not in keep_set and req.is_context_engineering_main()
         ]
+        for req in retracted_reqs:
+            req.reprocess_reason = "main_turn_decode_batch_size"
         for idx in range(len(batch.reqs) - 1, -1, -1):
             if idx not in keep_set:
                 batch.release_req(idx, len(keep_indices), self.server_args)
@@ -4020,6 +4024,7 @@ class Scheduler(
                 continue
             req = batch.reqs[idx]
             if req.is_context_engineering_compact():
+                req.reprocess_reason = reason
                 batch.release_req(idx, len(keep_indices), self.server_args)
 
         batch.filter_batch(keep_indices=keep_indices)
@@ -5328,6 +5333,8 @@ class Scheduler(
         self.last_batch = None
         self.cur_batch_for_debug = None
 
+        for req in retract_reqs + cache_paused_reqs:
+            req.reprocess_reason = "engine_pause_rebootstrap"
         if retract_reqs:
             # Decode-side retract always rebootstraps (recomputes the KV from
             # the prefill), so skip the device->host KV offload that release_req
