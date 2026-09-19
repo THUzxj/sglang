@@ -78,6 +78,24 @@ class TestZeroMatchResult(unittest.TestCase):
 
 
 class TestMatchPrefixForReqForceMiss(unittest.TestCase):
+    def test_read_only_match_does_not_mutate_req(self):
+        tree = RadixCache.create_simulated()
+        tree.insert(
+            InsertParams(key=RadixKey(token_ids=array("q", [10, 11, 12, 13])))
+        )
+        req = _StubReq([10, 11, 12, 99])
+        original_node = object()
+        req.last_node = original_node
+        req.prefix_indices = "original-prefix"
+        req.cache_protected_len = 7
+
+        result = match_prefix_for_req(tree, req, update_req=False)
+
+        self.assertGreater(int(result.device_indices.numel()), 0)
+        self.assertIs(req.last_node, original_node)
+        self.assertEqual(req.prefix_indices, "original-prefix")
+        self.assertEqual(req.cache_protected_len, 7)
+
     def test_force_miss_zeros_req_prefix(self):
         tree = RadixCache.create_simulated()
         tree.insert(

@@ -286,6 +286,7 @@ class DecodeRequest:
     prefix_match: Optional[DecodePrefixMatch] = None
     hicache_restored_kv_indices: Optional[torch.Tensor] = None
     hicache_restored_node: Any = None
+    hicache_restored_lock_params: Optional[DecLockRefParams] = None
     hicache_load_consumer_index: int = -1
     hicache_restore_status: HiCacheRestoreResult = HiCacheRestoreResult.PENDING
 

@@ -97,6 +97,7 @@ def match_prefix_for_req(
     cow_mamba: bool = False,
     include_req: bool = False,
     match_full_kv_only: bool = False,
+    update_req: bool = True,
 ):
     if token_ids is None:
         token_ids = req.origin_input_ids + req.output_ids
@@ -120,6 +121,9 @@ def match_prefix_for_req(
         match_result = zero_match_result(
             tree_cache, match_result, extra_key=req.extra_key
         )
+    if not update_req:
+        return match_result
+
     (
         req.prefix_indices,
         req.last_node,

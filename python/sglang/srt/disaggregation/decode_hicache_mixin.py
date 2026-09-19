@@ -11,7 +11,7 @@ import torch
 
 from sglang.srt.disaggregation.base import KVPoll
 from sglang.srt.managers.schedule_policy import match_prefix_for_req
-from sglang.srt.mem_cache.base_prefix_cache import InitLoadBackParams
+from sglang.srt.mem_cache.base_prefix_cache import DecLockRefParams, InitLoadBackParams
 
 if TYPE_CHECKING:
     from sglang.srt.disaggregation.decode import DecodeRequest
@@ -198,9 +198,19 @@ class DecodeHiCacheTransferMixin:
             and decode_req.prefix_match.prefetch_registered
         ):
             self.tree_cache.release_aborted_request(decode_req.req.rid)
+            decode_req.prefix_match.prefetch_registered = False
         if decode_req.hicache_restored_node is not None:
-            self.tree_cache.dec_lock_ref(decode_req.hicache_restored_node)
+            if decode_req.hicache_restored_lock_params is None:
+                raise RuntimeError(
+                    "HiCache restored node is missing its lock parameters for "
+                    f"rid={decode_req.req.rid}"
+                )
+            self.tree_cache.dec_lock_ref(
+                decode_req.hicache_restored_node,
+                decode_req.hicache_restored_lock_params,
+            )
             decode_req.hicache_restored_node = None
+            decode_req.hicache_restored_lock_params = None
 
     def _try_hicache_queue_load_back(self, dr: DecodeRequest) -> bool:
         """Queue one L2->L1 load_back op for ``dr``; True iff a DMA was queued.
@@ -218,7 +228,8 @@ class DecodeHiCacheTransferMixin:
                 return False
             self.tree_cache.pop_prefetch_loaded_tokens(dr.req.rid)
 
-        # Re-match: req.last_node / prefix_indices updated to current device state.
+        # Re-match without changing req's ownership of the original prefix lock.
+        # The restored lock is held separately until commit or abort.
         token_ids = (
             dr.req.origin_input_ids + dr.req.output_ids
             if getattr(dr.req, "is_context_engineering_cache_paused", False)
@@ -231,6 +242,7 @@ class DecodeHiCacheTransferMixin:
             cow_mamba=False,
             include_req=True,
             match_full_kv_only=pm.match_full_kv_only,
+            update_req=False,
         )
         loaded_indices, _ = self.tree_cache.init_load_back(
             InitLoadBackParams(
@@ -254,6 +266,7 @@ class DecodeHiCacheTransferMixin:
             cow_mamba=False,
             include_req=True,
             match_full_kv_only=pm.match_full_kv_only,
+            update_req=False,
         )
         expected_restore_tokens = pm.restore_token_count
         restored_prefix_len = len(restored_match.device_indices)
@@ -291,7 +304,8 @@ class DecodeHiCacheTransferMixin:
 
         dr.hicache_restored_kv_indices = restored_kv_indices
         dr.hicache_restored_node = restored_match.last_device_node
-        self.tree_cache.inc_lock_ref(dr.hicache_restored_node)
+        lock_result = self.tree_cache.inc_lock_ref(dr.hicache_restored_node)
+        dr.hicache_restored_lock_params = lock_result.to_dec_params()
 
         if len(loaded_indices) == 0:
             # Whole prefix already on device; no DMA needed.
@@ -358,7 +372,10 @@ class DecodeHiCacheTransferMixin:
 
         restored_kv_indices = decode_req.hicache_restored_kv_indices
         expected_restore_tokens = prefix_match.restore_token_count
-        if restored_kv_indices is None or len(restored_kv_indices) != expected_restore_tokens:
+        if (
+            restored_kv_indices is None
+            or len(restored_kv_indices) != expected_restore_tokens
+        ):
             actual_restore_tokens = (
                 None if restored_kv_indices is None else len(restored_kv_indices)
             )
@@ -370,7 +387,24 @@ class DecodeHiCacheTransferMixin:
                 f"decode_prefix_len={prefix_match.decode_prefix_len}"
             )
 
-        self.tree_cache.dec_lock_ref(prefix_match.last_device_node)
+        restored_node = decode_req.hicache_restored_node
+        restored_lock_params = decode_req.hicache_restored_lock_params
+        if restored_node is None or restored_lock_params is None:
+            raise RuntimeError(
+                "Cannot commit HiCache restore without a restored prefix lock for "
+                f"rid={decode_req.req.rid}"
+            )
+
+        original_node = decode_req.req.last_node
+        original_lock_params = DecLockRefParams(
+            swa_uuid_for_lock=decode_req.req.swa_uuid_for_lock,
+            skip_lock_node_ids={
+                component_type: set(node_ids)
+                for component_type, node_ids in (
+                    decode_req.req.skip_lock_node_ids.items()
+                )
+            },
+        )
 
         self.tree_cache.req_to_token_pool.write(
             (
@@ -382,4 +416,18 @@ class DecodeHiCacheTransferMixin:
         decode_req.req.prefix_indices = torch.cat(
             [prefix_match.prefix_indices, restored_kv_indices]
         )
-        decode_req.req.last_node = decode_req.hicache_restored_node
+        decode_req.req.last_node = restored_node
+        decode_req.req.swa_uuid_for_lock = restored_lock_params.swa_uuid_for_lock
+        decode_req.req.skip_lock_node_ids = {
+            component_type: set(node_ids)
+            for component_type, node_ids in (
+                restored_lock_params.skip_lock_node_ids.items()
+            )
+        }
+        decode_req.req.swa_prefix_lock_released = False
+
+        # Ownership of the restored lock now belongs to req.  Abort cleanup
+        # must not release it separately before release_kv_cache handles req.
+        decode_req.hicache_restored_node = None
+        decode_req.hicache_restored_lock_params = None
+        self.tree_cache.dec_lock_ref(original_node, original_lock_params)
