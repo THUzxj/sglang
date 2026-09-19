@@ -86,6 +86,7 @@ from sglang.srt.mem_cache.memory_pool import (
     KVCache,
     ReqToTokenPool,
 )
+from sglang.srt.mem_cache.unified_cache.component_type import ComponentType
 from sglang.srt.mem_cache.swa_memory_pool import SWAKVPool
 from sglang.srt.observability.req_time_stats import (
     set_schedule_time_batch,
@@ -707,6 +708,183 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
         """Re-admit a compact whose committed KV is owned by decode radix."""
 
         self.add(req, is_rebootstrap=True, is_cache_resume=True)
+
+    def restore_cache_paused_req(self, req: Req) -> bool:
+        """Restore a paused compact locally, without a PD prefill handshake.
+
+        This path is deliberately separate from add_cache_resume: that method
+        sets is_rebootstrap and always submits a prefill recomputation.
+        """
+        length = req.context_engineering_pause_committed_len
+        node_id = req.context_engineering_pause_node
+        if length <= 0 or node_id is None or self.req_to_token_pool.available_size() < 1:
+            logger.debug("Compact local cache resume deferred rid=%s reason=req_slot", req.rid)
+            return False
+
+        all_token_ids = req.origin_input_ids + req.output_ids
+        pending_token_id = req.context_engineering_pause_pending_token_id
+        if len(all_token_ids) == length:
+            if pending_token_id is None or length < len(req.origin_input_ids):
+                raise RuntimeError(
+                    f"Compact local cache resume lost its pending token: rid={req.rid} "
+                    f"committed_len={length} visible_tokens={len(all_token_ids)}"
+                )
+            req.output_ids.append(pending_token_id)
+            all_token_ids = req.origin_input_ids + req.output_ids
+        if (
+            len(all_token_ids) != length + 1
+            or pending_token_id is None
+            or all_token_ids[length] != pending_token_id
+        ):
+            raise RuntimeError(
+                f"Compact local cache resume boundary mismatch: rid={req.rid} "
+                f"committed_len={length} visible_tokens={len(all_token_ids)}"
+            )
+
+        token_ids = all_token_ids[:length]
+        mamba_match = match_prefix_for_req(
+            self.tree_cache, req, token_ids, include_req=True
+        )
+        if mamba_match.best_match_node != node_id:
+            logger.debug("Compact local cache resume deferred rid=%s reason=mamba_match expected=%s actual=%s", req.rid, node_id, mamba_match.best_match_node)
+            return False
+        mamba_component = self.tree_cache.tree_core.get_component_device_value(
+            node_id, ComponentType.MAMBA
+        )
+        mamba_on_host = self.tree_cache.tree_core.component_has_host_value_only(
+            node_id, ComponentType.MAMBA
+        )
+        if mamba_component is None and not mamba_on_host:
+            logger.debug("Compact local cache resume deferred rid=%s reason=mamba_missing", req.rid)
+            return False
+
+        full_match = match_prefix_for_req(
+            self.tree_cache,
+            req,
+            token_ids,
+            include_req=True,
+            match_full_kv_only=True,
+        )
+        prefix_len = len(full_match.device_indices)
+        total_prefix_len = prefix_len + full_match.host_hit_length
+        fill_len = self._pre_alloc_fill_len(req)
+        if total_prefix_len != length or fill_len != length:
+            logger.debug("Compact local cache resume deferred rid=%s reason=kv_match expected=%d actual=%d fill=%d", req.rid, length, total_prefix_len, fill_len)
+            return False
+
+        pool = self.req_to_token_pool
+        required_mamba_slots = 1
+        if pool.enable_mamba_extra_buffer:
+            required_mamba_slots += (
+                1
+                if pool.enable_mamba_extra_buffer_lazy
+                else pool.mamba_ping_pong_track_buffer_size
+            )
+        if (
+            pool.mamba_allocator.available_size()
+            + self.tree_cache.mamba_evictable_size()
+            < required_mamba_slots
+        ):
+            logger.debug(
+                "Compact local cache resume deferred rid=%s reason=mamba_capacity",
+                req.rid,
+            )
+            return False
+
+        pm = DecodePrefixMatch(
+            prefix_indices=full_match.device_indices,
+            l2_host_hit_length=full_match.host_hit_length,
+            l3_storage_hit_length=0,
+            last_device_node=full_match.last_device_node,
+            match_full_kv_only=False,
+            mamba_host_hit_length=int(mamba_on_host),
+        )
+        lock = self.tree_cache.inc_lock_ref(full_match.last_device_node)
+        req.swa_uuid_for_lock = lock.swa_uuid_for_lock
+        req.skip_lock_node_ids = lock.skip_lock_node_ids
+        allocated = False
+        try:
+            needed = self._required_alloc_tokens(
+                fill_len=length, prefix_len=prefix_len
+            )
+            available = self.token_to_kv_pool_allocator.available_size()
+            if available + self.tree_cache.full_evictable_size() < needed:
+                logger.debug("Compact local cache resume deferred rid=%s reason=kv_capacity needed=%d available=%d evictable=%d", req.rid, needed, available, self.tree_cache.full_evictable_size())
+                return False
+            self._pre_alloc(req, full_match.device_indices, prefix_len, length)
+            allocated = True
+            # [0, length) is still owned by the locked radix node. Mark it as
+            # protected exactly as pop_preallocated does for ordinary
+            # decode-side prefix reuse, so request completion/rollback cannot
+            # free the shared KV pages as request-private allocations.
+            req.cache_protected_len = length
+
+            # _pre_alloc may evict the checkpoint to make room for the active
+            # state. Re-evaluate Mamba residency after that eviction.
+            mamba_on_host = self.tree_cache.tree_core.component_has_host_value_only(
+                node_id, ComponentType.MAMBA
+            )
+            pm.mamba_host_hit_length = int(mamba_on_host)
+
+            if pm.needs_local_restore:
+                dr = DecodeRequest(req=req, kv_receiver=None, prefix_match=pm)
+                queued = self.transfer_queue._try_hicache_queue_load_back(dr)
+                if dr.hicache_restore_status == HiCacheRestoreResult.FAILED:
+                    raise RuntimeError(f"Local cache restore failed for {req.rid}")
+                if queued:
+                    consumer_index = self.tree_cache.ready_to_load_host_cache()
+                    deadline = time.monotonic() + 30
+                    while consumer_index >= 0 and not self.tree_cache.is_load_back_event_done(
+                        consumer_index
+                    ):
+                        if time.monotonic() >= deadline:
+                            raise TimeoutError(f"Local cache restore timed out for {req.rid}")
+                        time.sleep(0.001)
+                self.transfer_queue._commit_hicache_local_restore_to_req(dr)
+
+            # The checkpoint belongs to radix; decoding must use its own slot.
+            source = self.tree_cache.tree_core.get_component_device_value(
+                node_id, ComponentType.MAMBA
+            )
+            if source is None:
+                raise RuntimeError(f"Mamba checkpoint missing after restore for {req.rid}")
+            if pool.mamba_ckpt_pool is not None:
+                pool.mamba_ckpt_pool.load_to_active(
+                    pool.mamba_pool, source, req.mamba_pool_idx.view(-1)
+                )
+            else:
+                translate = pool.translate_mamba_indices
+                pool.mamba_pool.copy_from(
+                    translate(source), translate(req.mamba_pool_idx.view(-1))
+                )
+            req.mamba_needs_clear = False
+            req.kv_committed_len = length
+            req.is_retracted = False
+            req.is_context_engineering_cache_paused = False
+            req.context_engineering_pause_committed_len = 0
+            req.context_engineering_pause_pending_token_id = None
+            self.tree_cache.dec_host_lock_ref(
+                node_id, req.context_engineering_pause_host_lock
+            )
+            req.context_engineering_pause_host_lock = None
+            req.context_engineering_pause_node = None
+            logger.info(
+                "Compact local cache resume rid=%s committed_len=%d "
+                "kv_host_tokens=%d mamba_host=%d prefill_recompute=0",
+                req.rid,
+                length,
+                full_match.host_hit_length,
+                int(mamba_on_host),
+            )
+            return True
+        except Exception:
+            if allocated:
+                release_kv_cache(req, self.tree_cache, is_insert=False)
+                req.detach_gpu_state_for_cache_pause(length)
+            raise
+        finally:
+            if not allocated:
+                self.tree_cache.dec_lock_ref(full_match.last_device_node, lock.to_dec_params())
 
     @staticmethod
     def _rebootstrap_prefill_len(req: Req) -> int:
@@ -1394,6 +1572,13 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
                 **metadata_kwargs,
             )
             if decode_req.is_rebootstrap:
+                if decode_req.is_cache_resume:
+                    logger.warning(
+                        "Compact cache resume submitted prefill recompute "
+                        "rid=%s committed_len=%d",
+                        decode_req.req.rid,
+                        decode_req.req.context_engineering_pause_committed_len,
+                    )
                 self.kv_manager.submit_prefill_recompute(
                     decode_req.kv_receiver,
                     decode_req.req.build_rebootstrap_payload(),
@@ -2313,6 +2498,20 @@ class SchedulerDisaggregationDecodeMixin:
                 continue
             self.process_decode_queue()
 
+            # A compact may be parked while selecting the next batch. Drain
+            # its previous output first so output_ids and committed KV/Mamba
+            # describe the same decode position.
+            previous_result_processed = bool(
+                self.last_batch
+                and self._radix_evictable_compact_pause_enabled()
+                and any(
+                    req.is_context_engineering_compact()
+                    for req in self.last_batch.reqs
+                )
+            )
+            if previous_result_processed:
+                pop_and_process()
+
             # Get the next batch to run
             plan = self.get_next_disagg_decode_batch_to_run(
                 running_batch=self.running_batch
@@ -2328,7 +2527,7 @@ class SchedulerDisaggregationDecodeMixin:
                 batch, last_batch=self.last_batch
             )
 
-            if disable_overlap_for_batch and self.last_batch:
+            if disable_overlap_for_batch and self.last_batch and not previous_result_processed:
                 pop_and_process()
 
             # Launch the current batch
@@ -2341,7 +2540,7 @@ class SchedulerDisaggregationDecodeMixin:
 
             # Process the last batch
             if self.last_batch:
-                if not disable_overlap_for_batch:
+                if not disable_overlap_for_batch and not previous_result_processed:
                     pop_and_process()
             elif batch is None:
                 self.on_idle()

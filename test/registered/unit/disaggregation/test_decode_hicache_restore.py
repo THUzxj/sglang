@@ -100,6 +100,18 @@ class TestDecodeHiCacheRestore(unittest.TestCase):
         queue.tree_cache.dec_lock_ref.assert_not_called()
         queue.tree_cache.req_to_token_pool.write.assert_not_called()
 
+    def test_mamba_host_only_hit_requires_local_restore(self):
+        prefix_match = DecodePrefixMatch(
+            prefix_indices=torch.arange(16, dtype=torch.int64),
+            l2_host_hit_length=0,
+            l3_storage_hit_length=0,
+            last_device_node="device-node",
+            mamba_host_hit_length=1,
+        )
+
+        self.assertTrue(prefix_match.needs_local_restore)
+        self.assertEqual(prefix_match.restore_token_count, 0)
+
 
 if __name__ == "__main__":
     unittest.main()

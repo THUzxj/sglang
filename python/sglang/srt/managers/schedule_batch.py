@@ -999,6 +999,10 @@ class Req(ReqDllmMixin):
         # by radix cache and is rediscovered through prefix match on resume.
         self.is_context_engineering_cache_paused = False
         self.context_engineering_pause_committed_len = 0
+        self.context_engineering_pause_pending_token_id = None
+        self.is_context_engineering_cache_parking = False
+        self.context_engineering_pause_node = None
+        self.context_engineering_pause_host_lock = None
         # Indicates if the req has ever been retracted.
         self.retracted_stain = False
 

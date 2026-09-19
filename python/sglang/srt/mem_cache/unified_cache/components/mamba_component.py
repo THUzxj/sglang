@@ -513,6 +513,21 @@ class MambaComponent(TreeComponent):
         token_ids_len: int,
         is_finished: bool,
     ) -> Optional[int]:
+        if getattr(req, "is_context_engineering_cache_parking", False):
+            # A paused decode request must resume at its committed KV boundary.
+            # The ordinary tracked checkpoint can lag behind that boundary in
+            # extra-buffer mode, so copy the live recurrent state instead.
+            active = req.mamba_pool_idx.view(-1)
+            if self.int8_ckpt_pool is not None:
+                insert_params.mamba_value = self._commit_int8_checkpoint(active)
+            else:
+                checkpoint = self._alloc_mamba_slot()
+                pool = self.cache.req_to_token_pool
+                translate = pool.translate_mamba_indices
+                pool.mamba_pool.copy_from(translate(active), translate(checkpoint))
+                insert_params.mamba_value = checkpoint
+            return token_ids_len
+
         if self.cache.enable_mamba_extra_buffer:
             cache_len = req.mamba_last_track_seqlen
         else:
@@ -592,6 +607,16 @@ class MambaComponent(TreeComponent):
         insert_result: Optional[InsertResult] = None,
         insert_params: Optional[InsertParams] = None,
     ) -> None:
+        if getattr(req, "is_context_engineering_cache_parking", False):
+            inserted = insert_result is not None and not insert_result.mamba_exist
+            if not inserted and insert_params is not None:
+                self._free_mamba_value(insert_params.mamba_value)
+            if is_finished:
+                self.cache.req_to_token_pool.free_mamba_cache(req)
+            else:
+                req.mamba_last_track_seqlen = None
+            return
+
         if is_finished:
             mamba_value_inserted = (
                 insert_result is not None and not insert_result.mamba_exist

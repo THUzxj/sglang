@@ -29,6 +29,7 @@ class DecodePrefixMatch:
     last_host_node: Any = None
     prefetch_registered: bool = False
     match_full_kv_only: bool = False
+    mamba_host_hit_length: int = 0
 
     @property
     def l1_prefix_len(self) -> int:
@@ -40,7 +41,10 @@ class DecodePrefixMatch:
 
     @property
     def needs_local_restore(self) -> bool:
-        return self.decode_prefix_len > self.l1_prefix_len
+        return (
+            self.decode_prefix_len > self.l1_prefix_len
+            or self.mamba_host_hit_length > 0
+        )
 
     @property
     def restore_token_count(self) -> int:
@@ -108,6 +112,7 @@ class DecodeHiCachePreallocMixin:
                 result.last_host_node if l3_storage_hit_length > 0 else None
             ),
             match_full_kv_only=match_full_kv_only,
+            mamba_host_hit_length=result.mamba_host_hit_length,
         )
 
     def _start_hicache_prefetch(

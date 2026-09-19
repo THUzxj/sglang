@@ -935,6 +935,26 @@ class UnifiedRadixCache(BasePrefixCache):
         self._free_values(result.device_frees, result.host_frees)
         return result.tracker.get(component_type, 0)
 
+    def protect_cache_paused_node(self, node_id: NodeId) -> Optional[DecLockRefParams]:
+        """Back up and pin a paused decode prefix in L2 without pinning its L1 slots.
+
+        The host lock prevents a later host-LRU eviction from forcing a PD
+        re-prefill.  It is intentionally separate from inc_lock_ref: the GPU KV
+        and Mamba checkpoint remain evictable while the compact is parked.
+        """
+        if self.cache_controller is None:
+            return None
+        node = self.tree_core.node_by_id(node_id)
+        if not node.backuped:
+            action = self.tree_core._build_backup_kv_action(node, write_back=True)
+            self._execute_and_commit_kv_backup(action, write_back=True)
+            self.writing_check(write_back=True)
+        if not node.backuped:
+            return None
+        if self.supports_mamba() and node.component_data[ComponentType.MAMBA].host_value is None:
+            return None
+        return self.inc_host_lock_ref(node_id).to_dec_params()
+
     # ---- HiCache: Backup / LoadBack ----
 
     def _execute_and_commit_kv_backup(
