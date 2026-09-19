@@ -1,6 +1,7 @@
 import importlib.util
 from dataclasses import dataclass
 from pathlib import Path
+from types import SimpleNamespace
 
 
 def _load_pair_scheduler():
@@ -53,6 +54,8 @@ class FakeReq:
     finished_reason: object | None = None
     is_retracted: bool = False
     allow_compact_drain: bool = False
+    priority: int | None = None
+    time_stats: object | None = None
 
     @property
     def rid(self):
@@ -97,6 +100,52 @@ def test_order_prefill_waiting_queue_prioritizes_main_without_pairing():
         "compact-a",
         "compact-b",
     ]
+
+
+def test_order_prefill_waiting_queue_promotes_older_higher_priority_compact():
+    compact = FakeReq(
+        "compact", "compact", priority=20,
+        time_stats=SimpleNamespace(scheduler_recv_time=100.0),
+    )
+    main = FakeReq(
+        "main", "main", priority=10,
+        time_stats=SimpleNamespace(scheduler_recv_time=100.0),
+    )
+
+    before_threshold = order_prefill_waiting_queue(
+        [compact, main],
+        enable_priority_scheduling=True,
+        now=159.9,
+    )
+    at_threshold = order_prefill_waiting_queue(
+        [compact, main],
+        enable_priority_scheduling=True,
+        now=160.0,
+    )
+    assert [req.name for req in before_threshold] == ["main", "compact"]
+    assert [req.name for req in at_threshold] == ["compact", "main"]
+
+
+def test_order_prefill_waiting_queue_respects_priority_and_custom_threshold():
+    compact = FakeReq(
+        "compact", "compact", priority=20,
+        time_stats=SimpleNamespace(scheduler_recv_time=100.0),
+    )
+    main = FakeReq(
+        "main", "main", priority=10,
+        time_stats=SimpleNamespace(scheduler_recv_time=200.0),
+    )
+
+    assert [req.name for req in order_prefill_waiting_queue(
+        [compact, main], enable_priority_scheduling=True,
+        compact_starvation_threshold_seconds=120.0,
+        now=200.0,
+    )] == ["main", "compact"]
+    assert [req.name for req in order_prefill_waiting_queue(
+        [compact, main], enable_priority_scheduling=True,
+        schedule_low_priority_values_first=True,
+        now=200.0,
+    )] == ["main", "compact"]
 
 
 def test_select_decode_keep_indices_caps_paired_compact_count():

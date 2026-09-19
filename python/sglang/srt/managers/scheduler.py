@@ -3586,9 +3586,17 @@ class Scheduler(
         req.is_context_engineering_paused = True
         req.is_context_engineering_cache_paused = True
 
-    @staticmethod
-    def _order_context_engineering_waiting_queue(waiting_queue: List[Req]) -> None:
-        waiting_queue[:] = order_prefill_waiting_queue(waiting_queue)
+    def _order_context_engineering_waiting_queue(
+        self, waiting_queue: List[Req]
+    ) -> None:
+        waiting_queue[:] = order_prefill_waiting_queue(
+            waiting_queue,
+            compact_starvation_threshold_seconds=(
+                self.server_args.context_engineering_compact_starvation_threshold_seconds
+            ),
+            enable_priority_scheduling=self.enable_priority_scheduling,
+            schedule_low_priority_values_first=self.schedule_low_priority_values_first,
+        )
 
     def _can_resume_context_engineering_retracted_req(self, req: Req) -> bool:
         running_reqs = []

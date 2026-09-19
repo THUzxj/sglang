@@ -819,9 +819,14 @@ class ServerArgs:
     ] = None
     enable_pair_scheduler: A[
         bool,
-        "Enable pair scheduling for context-engineering workloads. Main requests are scheduled before compact requests, and paired compact requests are admitted only with remaining budget.",
+        "Enable pair scheduling for context-engineering workloads. Main requests normally precede compact requests in prefill; compact admission uses the remaining budget.",
         NS("schedule"),
     ] = False
+    context_engineering_compact_starvation_threshold_seconds: A[
+        float,
+        "With pair scheduling and priority scheduling enabled, let a compact prefill request precede a lower-priority main request after the compact has waited this many seconds at the scheduler.",
+        NS("schedule"),
+    ] = 60.0
     context_engineering_compact_pause_mode: A[
         Literal["retract", "gpu_resident", "radix_evictable"],
         Arg(
@@ -8891,6 +8896,12 @@ class ServerArgs:
         if self.retraction_policy == "priority" and not self.enable_priority_scheduling:
             raise ValueError(
                 "--retraction-policy priority requires --enable-priority-scheduling"
+            )
+
+        if self.context_engineering_compact_starvation_threshold_seconds < 0:
+            raise ValueError(
+                "--context-engineering-compact-starvation-threshold-seconds "
+                "must be non-negative"
             )
 
         if self.context_engineering_compact_pause_mode == "radix_evictable":

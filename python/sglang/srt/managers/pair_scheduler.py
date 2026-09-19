@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import math
+import time
 from collections import deque
 from typing import Any, Deque, Iterable, List, NamedTuple, Optional, Tuple
 
@@ -125,18 +126,55 @@ def budget_attention_tokens(
     return max(1, int(math.ceil(tokens * ratio)))
 
 
-def order_prefill_waiting_queue(waiting_queue: Iterable[Any]) -> List[Any]:
-    """Return a stable queue order with foreground/main requests first.
+def order_prefill_waiting_queue(
+    waiting_queue: Iterable[Any],
+    *,
+    compact_starvation_threshold_seconds: float = 60.0,
+    enable_priority_scheduling: bool = False,
+    schedule_low_priority_values_first: bool = False,
+    now: Optional[float] = None,
+) -> List[Any]:
+    """Order prefill requests, allowing sufficiently older compacts ahead of mains.
 
     The input is assumed to have already been sorted by the normal SGLang policy
-    such as priority + FCFS. Prefill does not form main/compact pairs: all
-    foreground/main requests are tried before compact requests.
+    such as priority + FCFS. Each class keeps that order. A compact may pass a
+    main only when its priority is higher and it has waited at this scheduler
+    for at least the configured number of seconds. Other non-compact requests
+    keep their place in the original order.
     """
 
     queue = list(waiting_queue)
-    return [req for req in queue if not is_context_engineering_compact(req)] + [
-        req for req in queue if is_context_engineering_compact(req)
-    ]
+    non_compacts = [req for req in queue if not is_context_engineering_compact(req)]
+    compacts = [req for req in queue if is_context_engineering_compact(req)]
+    if not enable_priority_scheduling:
+        return non_compacts + compacts
+
+    if now is None:
+        now = time.perf_counter()
+    ordered = []
+    compact_index = 0
+    for req in non_compacts:
+        if is_context_engineering_main(req):
+            while compact_index < len(compacts):
+                compact = compacts[compact_index]
+                compact_time = getattr(compact.time_stats, "scheduler_recv_time", 0.0)
+                if (
+                    compact_time <= 0
+                    or now - compact_time < compact_starvation_threshold_seconds
+                    or compact.priority is None
+                    or req.priority is None
+                    or (
+                        compact.priority >= req.priority
+                        if schedule_low_priority_values_first
+                        else compact.priority <= req.priority
+                    )
+                ):
+                    break
+                ordered.append(compact)
+                compact_index += 1
+        ordered.append(req)
+    ordered.extend(compacts[compact_index:])
+    return ordered
 
 
 def should_try_prefill_request(
