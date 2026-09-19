@@ -66,6 +66,8 @@ from sglang.srt.managers.io_struct import (
     SlowDownReqOutput,
     UnloadLoRAAdapterReqInput,
     UnloadLoRAAdapterReqOutput,
+    UpdateRequestReqInput,
+    UpdateRequestReqOutput,
     UpdateWeightsFromDistributedReqInput,
     UpdateWeightsFromDistributedReqOutput,
     UpdateWeightsFromIPCReqInput,
@@ -120,6 +122,7 @@ _COMMUNICATOR_SPECS = [
     ("update_lora_adapter", LoRAUpdateOutput),
     ("dumper_control", DumperControlReqOutput),
     ("scale_elastic_ep", ScaleElasticEPReqOutput),
+    ("update_request", UpdateRequestReqOutput),
 ]
 
 
@@ -300,6 +303,46 @@ class TokenizerControlMixin:
         return (
             await self.flush_cache_communicator(FlushCacheReqInput(timeout_s=timeout_s))
         )[0]
+
+    async def update_request(
+        self: TokenizerManager, obj: UpdateRequestReqInput
+    ) -> UpdateRequestReqOutput:
+        self.auto_create_handle_loop()
+        results = await self.update_request_communicator(obj)
+        matched_results = [r for r in results if r.matched]
+        if matched_results:
+            updated = [r for r in matched_results if r.success]
+            if updated:
+                messages = " | ".join(r.message for r in matched_results)
+                fields = sorted(
+                    {field for result in updated for field in result.updated_fields}
+                )
+                locations = ", ".join(
+                    sorted({str(result.location) for result in updated})
+                )
+                return UpdateRequestReqOutput(
+                    rid=obj.rid,
+                    success=True,
+                    matched=True,
+                    location=locations,
+                    updated_fields=fields,
+                    message=messages,
+                )
+            messages = " | ".join(r.message for r in matched_results)
+            return UpdateRequestReqOutput(
+                rid=obj.rid,
+                success=False,
+                matched=True,
+                message=messages,
+            )
+
+        messages = " | ".join(r.message for r in results)
+        return UpdateRequestReqOutput(
+            rid=obj.rid,
+            success=False,
+            matched=False,
+            message=messages or f"Request {obj.rid!r} was not found.",
+        )
 
     async def clear_hicache_storage(self: TokenizerManager) -> ClearHiCacheReqOutput:
         """Clear the hierarchical cache storage."""

@@ -171,6 +171,8 @@ from sglang.srt.managers.io_struct import (
     TokenizedGenerateReqInput,
     UnloadLoRAAdapterReqInput,
     UnloadLoRAAdapterReqOutput,
+    UpdateRequestReqInput,
+    UpdateRequestReqOutput,
     UpdateWeightFromDiskReqInput,
     UpdateWeightsFromDistributedReqInput,
     UpdateWeightsFromIPCReqInput,
@@ -1593,6 +1595,7 @@ class Scheduler(
                 (ContinueGenerationReqInput, self.continue_generation),
                 (ConfigureLoggingReq, self.configure_logging),
                 (ScaleElasticEPReqInput, self.handle_scale_elastic_ep),
+                (UpdateRequestReqInput, self.update_request),
                 (DumperControlReqInput, self.handle_dumper_control),
                 (AddExternalCorpusReqInput, self.add_external_corpus),
                 (
@@ -4822,6 +4825,197 @@ class Scheduler(
 
         barrier(group=self.tp_group.cpu_group)
         return RpcReqOutput(success=success, message="" if not exec else str(exec))
+
+    def update_request(self, recv_req: UpdateRequestReqInput):
+        if not recv_req.rid:
+            return UpdateRequestReqOutput(
+                rid=recv_req.rid,
+                success=False,
+                matched=False,
+                message="rid is required.",
+            )
+
+        candidates: List[Tuple[str, Req, bool]] = []
+
+        def add_req(location: str, req: Optional[Req], *, running: bool = False):
+            if req is not None and req.rid.startswith(recv_req.rid):
+                candidates.append((location, req, running))
+
+        add_req("chunked_req", self.chunked_req, running=True)
+        for req in self.paused_compact_queue:
+            add_req("paused_compact_queue", req)
+        for req in self.waiting_queue:
+            add_req("waiting_queue", req)
+
+        if self.disaggregation_mode == DisaggregationMode.PREFILL:
+            for req in self.disagg_prefill_bootstrap_queue.queue:
+                add_req("disagg_prefill_bootstrap_queue", req)
+            for req in self.disagg_prefill_inflight_queue:
+                add_req("disagg_prefill_inflight_queue", req, running=True)
+        elif self.disaggregation_mode == DisaggregationMode.DECODE:
+            for decode_req in self.disagg_decode_prealloc_queue.queue:
+                add_req("disagg_decode_prealloc_queue", decode_req.req)
+            for decode_req in self.disagg_decode_transfer_queue.queue:
+                add_req("disagg_decode_transfer_queue", decode_req.req)
+            for req in self.disagg_decode_prealloc_queue.retracted_queue:
+                add_req("disagg_decode_retracted_queue", req)
+            for req in self.disagg_decode_prealloc_queue.held_rebootstrap_reqs:
+                add_req("disagg_decode_held_rebootstrap_queue", req)
+
+        if self.ps.pp_size == 1:
+            inflight_batches = [self.running_batch, self.last_batch]
+        else:
+            inflight_batches = [*self.running_mbs, *self.mbs]
+        seen_running_req_ids = set()
+        for batch in inflight_batches:
+            if batch is None:
+                continue
+            for req in batch.reqs:
+                if id(req) in seen_running_req_ids:
+                    continue
+                seen_running_req_ids.add(id(req))
+                add_req("running_batch", req, running=True)
+
+        if not candidates:
+            return UpdateRequestReqOutput(
+                rid=recv_req.rid,
+                success=False,
+                matched=False,
+                message=f"Request {recv_req.rid!r} was not found on this scheduler.",
+            )
+
+        all_updated_fields: List[str] = []
+        all_skipped_fields: List[str] = []
+        updated_locations: List[str] = []
+        waiting_queue_updated = False
+        seen_req_ids = set()
+        for location, req, running in candidates:
+            if id(req) in seen_req_ids:
+                continue
+            seen_req_ids.add(id(req))
+            updated_fields, skipped_fields = self._apply_request_update(
+                req, recv_req, running=running
+            )
+            if updated_fields:
+                all_updated_fields.extend(updated_fields)
+                updated_locations.append(location)
+                waiting_queue_updated |= location == "waiting_queue"
+            all_skipped_fields.extend(skipped_fields)
+
+        all_updated_fields = list(dict.fromkeys(all_updated_fields))
+        all_skipped_fields = list(dict.fromkeys(all_skipped_fields))
+        updated_locations = list(dict.fromkeys(updated_locations))
+
+        if waiting_queue_updated:
+            self.policy.calc_priority(self.waiting_queue, self.running_batch)
+            if self._pair_scheduler_active(self.waiting_queue):
+                self._order_context_engineering_waiting_queue(self.waiting_queue)
+
+        success = bool(all_updated_fields)
+        message_parts = []
+        if all_updated_fields:
+            message_parts.append(
+                f"Updated {len(updated_locations)} request location(s): "
+                f"{', '.join(updated_locations)}; fields: "
+                f"{', '.join(all_updated_fields)}."
+            )
+        if all_skipped_fields:
+            message_parts.append(f"Skipped: {', '.join(all_skipped_fields)}.")
+        if not message_parts:
+            message_parts.append(
+                f"Request prefix {recv_req.rid!r} matched but no fields changed."
+            )
+
+        return UpdateRequestReqOutput(
+            rid=recv_req.rid,
+            success=success,
+            matched=True,
+            location=", ".join(updated_locations) if updated_locations else None,
+            updated_fields=all_updated_fields,
+            message=" ".join(message_parts),
+        )
+
+    def _apply_request_update(
+        self, req: Req, recv_req: UpdateRequestReqInput, *, running: bool
+    ) -> Tuple[List[str], List[str]]:
+        updated_fields: List[str] = []
+        skipped_fields: List[str] = []
+
+        if recv_req.priority is not None:
+            req.priority = recv_req.priority
+            updated_fields.append("priority")
+
+        label_patch: Dict[str, str] = {}
+        if recv_req.metadata:
+            label_patch.update(
+                {str(key): str(value) for key, value in recv_req.metadata.items()}
+            )
+        if recv_req.custom_labels:
+            label_patch.update(
+                {str(key): str(value) for key, value in recv_req.custom_labels.items()}
+            )
+
+        wants_ce_update = (
+            recv_req.context_engineering_kind is not None
+            or recv_req.context_engineering_pair_key is not None
+            or bool(label_patch)
+            or recv_req.replace_custom_labels
+        )
+        if wants_ce_update and running and not recv_req.allow_running_kind_update:
+            skipped_fields.append(
+                "context_engineering metadata for running request "
+                "(set allow_running_kind_update=true to override)"
+            )
+            return updated_fields, skipped_fields
+
+        if recv_req.replace_custom_labels:
+            req.custom_labels = {}
+            updated_fields.append("custom_labels")
+        elif not isinstance(req.custom_labels, dict):
+            req.custom_labels = {}
+
+        if label_patch:
+            req.custom_labels.update(label_patch)
+            if "custom_labels" not in updated_fields:
+                updated_fields.append("custom_labels")
+
+        if recv_req.context_engineering_kind is not None:
+            kind = str(recv_req.context_engineering_kind).lower()
+            if kind not in {"", "main", "compact"}:
+                skipped_fields.append(
+                    "context_engineering_kind must be one of '', 'main', or 'compact'"
+                )
+            else:
+                req.context_engineering_kind = kind
+                if kind:
+                    req.custom_labels["request_class"] = kind
+                else:
+                    req.custom_labels.pop("request_class", None)
+                    req.custom_labels.pop("call_kind", None)
+                updated_fields.append("context_engineering_kind")
+        elif label_patch or recv_req.replace_custom_labels:
+            req.context_engineering_kind = req._derive_context_engineering_kind()
+            updated_fields.append("context_engineering_kind")
+
+        if recv_req.context_engineering_pair_key is not None:
+            pair_key = str(recv_req.context_engineering_pair_key)
+            req.context_engineering_pair_key = pair_key or None
+            if pair_key:
+                req.custom_labels["pair_key"] = pair_key
+            else:
+                req.custom_labels.pop("pair_key", None)
+            updated_fields.append("context_engineering_pair_key")
+        elif label_patch or recv_req.replace_custom_labels:
+            req.context_engineering_pair_key = (
+                req._derive_context_engineering_pair_key()
+            )
+            updated_fields.append("context_engineering_pair_key")
+
+        if label_patch or recv_req.replace_custom_labels:
+            req.allow_compact_drain = req._derive_allow_compact_drain()
+            updated_fields.append("allow_compact_drain")
+
+        return list(dict.fromkeys(updated_fields)), skipped_fields
 
     def abort_request(self, recv_req: AbortReq):
         if (chunked_req := self.chunked_req) is not None:
