@@ -3431,9 +3431,6 @@ class Scheduler(
                     compact_attention_cost_ratio=(
                         self.server_args.context_engineering_compact_attention_cost_ratio
                     ),
-                    main_turn_decode_max_batch_size=(
-                        self.server_args.context_engineering_main_turn_decode_max_batch_size
-                    ),
                 ):
                     continue
 
@@ -3982,17 +3979,6 @@ class Scheduler(
             batch.filter_batch(
                 keep_indices=[i for i, req in enumerate(batch.reqs) if id(req) not in paused_ids]
             )
-            logger.debug(
-                "Context-engineering %s radix-paused %d compact requests.",
-                reason,
-                len(actually_paused),
-            )
-            self.metrics_reporter.log_context_engineering_transition(
-                event="context_engineering_park",
-                reason=f"{reason}_radix_evictable",
-                stage="decode",
-                reqs=actually_paused,
-            )
             return []
 
         if self._gpu_resident_compact_pause_enabled():
@@ -4006,17 +3992,6 @@ class Scheduler(
                 self.paused_compact_queue.append(req)
             self.metrics_reporter.num_paused_reqs += len(retracted_reqs)
             batch.filter_batch(keep_indices=keep_indices)
-            logger.debug(
-                "Context-engineering %s GPU-paused %d compact requests.",
-                reason,
-                len(retracted_reqs),
-            )
-            self.metrics_reporter.log_context_engineering_transition(
-                event="context_engineering_park",
-                reason=reason,
-                stage="decode",
-                reqs=retracted_reqs,
-            )
             return []
 
         for idx in range(len(batch.reqs) - 1, -1, -1):
@@ -4028,16 +4003,6 @@ class Scheduler(
                 batch.release_req(idx, len(keep_indices), self.server_args)
 
         batch.filter_batch(keep_indices=keep_indices)
-        logger.debug(
-            "Context-engineering %s retracted %d compact requests.",
-            reason,
-            len(retracted_reqs),
-        )
-        self._log_context_engineering_retract(
-            reason=reason,
-            stage="decode",
-            retracted_reqs=retracted_reqs,
-        )
         return retracted_reqs
 
     def _log_context_engineering_retract(
@@ -4047,12 +4012,7 @@ class Scheduler(
         stage: str,
         retracted_reqs: List[Req],
     ) -> None:
-        self.metrics_reporter.log_context_engineering_transition(
-            event="context_engineering_retract",
-            reason=reason,
-            stage=stage,
-            reqs=retracted_reqs,
-        )
+        return
 
     def _log_context_engineering_resume(
         self,
@@ -4061,12 +4021,7 @@ class Scheduler(
         stage: str,
         resumed_reqs: List[Req],
     ) -> None:
-        self.metrics_reporter.log_context_engineering_transition(
-            event="context_engineering_resume",
-            reason=reason,
-            stage=stage,
-            reqs=resumed_reqs,
-        )
+        return
 
     def record_batch_in_overlap(self, batch: ScheduleBatch):
         # FIXME(lsyin): hacky way to keep a reference to avoid GPU tensors being freed by torch GC

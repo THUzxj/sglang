@@ -29,6 +29,7 @@ select_decode_keep_indices = _scheduler.select_decode_keep_indices
 select_main_turn_decode_keep_indices = (
     _scheduler.select_main_turn_decode_keep_indices
 )
+select_prebuilt_admission_indices = _scheduler.select_prebuilt_admission_indices
 can_resume_retracted_decode_req = _scheduler.can_resume_retracted_decode_req
 can_resume_compact_req = _scheduler.can_resume_compact_req
 build_compact_resume_context = _scheduler.build_compact_resume_context
@@ -188,17 +189,83 @@ def test_select_main_turn_decode_keep_indices_is_disabled_by_default():
     assert keep == [0, 1]
 
 
-def test_should_try_prefill_request_holds_main_when_decode_limit_is_full():
+def test_select_prebuilt_admission_holds_compact_until_paired_main_arrives():
+    compact_a = FakeReq("compact-a", "compact", "a", allow_compact_drain=True)
+
+    assert select_prebuilt_admission_indices(
+        [compact_a], [], available_batch_slots=2, main_turn_limit=64
+    ) == []
+
+
+def test_select_prebuilt_admission_selects_main_before_earlier_compact():
+    compact_a = FakeReq("compact-a", "compact", "a")
+    main_a = FakeReq("main-a", "main", "a")
+
+    assert select_prebuilt_admission_indices(
+        [compact_a, main_a], [], available_batch_slots=2, main_turn_limit=64
+    ) == [1, 0]
+
+
+def test_select_prebuilt_admission_allows_compact_for_running_main():
+    compact_a = FakeReq("compact-a", "compact", "a")
+    running_main_a = FakeReq("main-a", "main", "a")
+
+    assert select_prebuilt_admission_indices(
+        [compact_a],
+        [running_main_a],
+        available_batch_slots=1,
+        main_turn_limit=64,
+    ) == [0]
+
+
+def test_select_prebuilt_admission_holds_pair_when_main_limit_is_full():
+    compact_b = FakeReq("compact-b", "compact", "b")
+    main_b = FakeReq("main-b", "main", "b")
+    running_main_a = FakeReq("main-a", "main", "a")
+
+    assert select_prebuilt_admission_indices(
+        [compact_b, main_b],
+        [running_main_a],
+        available_batch_slots=2,
+        main_turn_limit=1,
+    ) == []
+
+
+def test_select_prebuilt_admission_remembers_main_that_already_left_decode():
+    compact_a = FakeReq("compact-a", "compact", "a")
+
+    assert select_prebuilt_admission_indices(
+        [compact_a],
+        [],
+        available_batch_slots=1,
+        main_turn_limit=64,
+        admitted_main_pair_keys={"a"},
+    ) == [0]
+
+
+def test_select_prebuilt_admission_prioritizes_non_compact_requests():
+    foreground = FakeReq("foreground")
+    compact_a = FakeReq("compact-a", "compact", "a")
+    main_a = FakeReq("main-a", "main", "a")
+
+    assert select_prebuilt_admission_indices(
+        [foreground, compact_a, main_a],
+        [],
+        available_batch_slots=2,
+        main_turn_limit=None,
+    ) == [0, 2]
+
+
+def test_should_try_prefill_request_does_not_apply_decode_limit_to_main():
     running_main = FakeReq("main-a", "main", "a")
     waiting_main = FakeReq("main-b", "main", "b")
 
-    assert not should_try_prefill_request(
+    assert should_try_prefill_request(
         waiting_main,
         can_run_reqs=[],
         running_reqs=[running_main],
         waiting_queue=[waiting_main],
         attention_budget=None,
-        main_turn_decode_max_batch_size=1,
     )
 
 

@@ -185,7 +185,6 @@ def should_try_prefill_request(
     waiting_queue: Iterable[Any],
     attention_budget: Optional[int],
     compact_attention_cost_ratio: float = 1.0,
-    main_turn_decode_max_batch_size: Optional[int] = None,
 ) -> bool:
     """Return whether the scheduler should attempt to prefill this request.
 
@@ -199,14 +198,7 @@ def should_try_prefill_request(
     running_req_list = list(running_reqs)
 
     if is_context_engineering_main(req):
-        if main_turn_decode_max_batch_size is None:
-            return True
-        active_main_turns = sum(
-            1
-            for active_req in running_req_list + can_run_req_list
-            if is_context_engineering_main(active_req)
-        )
-        return active_main_turns < main_turn_decode_max_batch_size
+        return True
 
     if not is_context_engineering_compact(req):
         return True
@@ -214,10 +206,10 @@ def should_try_prefill_request(
     # A compact that was genuinely retracted for KV pressure must wait for its
     # paired main (or explicit compact drain).  Fresh compact requests may still
     # perform compact-only prefill as required by the pair scheduler design.
-    if getattr(req, "is_retracted", False) and not can_resume_compact_req(
-        req, running_req_list + can_run_req_list
-    ):
-        return False
+    # if getattr(req, "is_retracted", False) and not can_resume_compact_req(
+    #     req, running_req_list + can_run_req_list
+    # ):
+    #     return False
 
     active_reqs = running_req_list + can_run_req_list
     if attention_budget is not None:
@@ -252,6 +244,72 @@ def select_main_turn_decode_keep_indices(
             kept_main_turns += 1
         keep_indices.append(idx)
     return keep_indices
+
+
+def select_prebuilt_admission_indices(
+    waiting_reqs: List[Any],
+    running_reqs: Iterable[Any],
+    *,
+    available_batch_slots: int,
+    main_turn_limit: Optional[int],
+    admitted_main_pair_keys: Iterable[str] = (),
+) -> List[int]:
+    """Select requests that may enter PD decode from its waiting queue.
+
+    A fresh compact must enter together with its paired main, or while that
+    main is already running. This prevents exposing the compact's prefill
+    token only to park it immediately until the main reaches decode.
+    """
+
+    if available_batch_slots <= 0:
+        return []
+
+    selected_indices: List[int] = []
+    selected_ids: set[int] = set()
+    active_main_turns = 0
+    runnable_pair_keys = set(admitted_main_pair_keys)
+
+    for req in running_reqs:
+        if not is_context_engineering_main(req):
+            continue
+        active_main_turns += 1
+        pair_key = context_engineering_pair_key(req)
+        if pair_key:
+            runnable_pair_keys.add(pair_key)
+
+    # Select foreground and main requests first. In particular, this lets a
+    # main behind its compact in transfer-completion order establish the pair.
+    for idx, req in enumerate(waiting_reqs):
+        if len(selected_indices) >= available_batch_slots:
+            break
+        if is_context_engineering_compact(req):
+            continue
+        if (
+            main_turn_limit is not None
+            and is_context_engineering_main(req)
+            and active_main_turns >= main_turn_limit
+        ):
+            continue
+        selected_indices.append(idx)
+        selected_ids.add(id(req))
+        if is_context_engineering_main(req):
+            active_main_turns += 1
+            pair_key = context_engineering_pair_key(req)
+            if pair_key:
+                runnable_pair_keys.add(pair_key)
+
+    # A compact drain controls what happens after a compact has entered
+    # decode; it deliberately does not bypass this initial pair rendezvous.
+    for idx, req in enumerate(waiting_reqs):
+        if len(selected_indices) >= available_batch_slots:
+            break
+        if id(req) in selected_ids or not is_context_engineering_compact(req):
+            continue
+        pair_key = context_engineering_pair_key(req)
+        if pair_key and pair_key in runnable_pair_keys:
+            selected_indices.append(idx)
+
+    return selected_indices
 
 
 def select_decode_keep_indices(

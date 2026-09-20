@@ -68,6 +68,10 @@ from sglang.srt.managers.schedule_batch import (
     ScheduleBatch,
 )
 from sglang.srt.managers.schedule_policy import match_prefix_for_req
+from sglang.srt.managers.pair_scheduler import (
+    context_engineering_pair_key,
+    select_prebuilt_admission_indices,
+)
 from sglang.srt.managers.utils import GenerationBatchResult
 from sglang.srt.mem_cache.allocator import BaseTokenToKVPoolAllocator
 from sglang.srt.mem_cache.base_prefix_cache import (
@@ -559,7 +563,6 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
 
             # Fast path: cache-only lookup, no network calls
             prefill_dp_rank = self._resolve_prefill_dp_rank(req)
-            logger.debug(f"prefill_dp_rank: {prefill_dp_rank}")
             if prefill_dp_rank is not None:
                 decode_req.kv_receiver.init(prefill_dp_rank)
                 return
@@ -726,7 +729,6 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
         length = req.context_engineering_pause_committed_len
         node_id = req.context_engineering_pause_node
         if length <= 0 or node_id is None or self.req_to_token_pool.available_size() < 1:
-            logger.debug("Compact local cache resume deferred rid=%s reason=req_slot", req.rid)
             return False
 
         all_token_ids = req.origin_input_ids + req.output_ids
@@ -754,7 +756,6 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
             self.tree_cache, req, token_ids, include_req=True
         )
         if mamba_match.best_match_node != node_id:
-            logger.debug("Compact local cache resume deferred rid=%s reason=mamba_match expected=%s actual=%s", req.rid, node_id, mamba_match.best_match_node)
             return False
         mamba_component = self.tree_cache.tree_core.get_component_device_value(
             node_id, ComponentType.MAMBA
@@ -763,7 +764,6 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
             node_id, ComponentType.MAMBA
         )
         if mamba_component is None and not mamba_on_host:
-            logger.debug("Compact local cache resume deferred rid=%s reason=mamba_missing", req.rid)
             return False
 
         full_match = match_prefix_for_req(
@@ -777,7 +777,6 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
         total_prefix_len = prefix_len + full_match.host_hit_length
         fill_len = self._pre_alloc_fill_len(req)
         if total_prefix_len != length or fill_len != length:
-            logger.debug("Compact local cache resume deferred rid=%s reason=kv_match expected=%d actual=%d fill=%d", req.rid, length, total_prefix_len, fill_len)
             return False
 
         pool = self.req_to_token_pool
@@ -793,10 +792,6 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
             + self.tree_cache.mamba_evictable_size()
             < required_mamba_slots
         ):
-            logger.debug(
-                "Compact local cache resume deferred rid=%s reason=mamba_capacity",
-                req.rid,
-            )
             return False
 
         pm = DecodePrefixMatch(
@@ -819,7 +814,6 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
             )
             available = self.token_to_kv_pool_allocator.available_size()
             if available + self.tree_cache.full_evictable_size() < needed:
-                logger.debug("Compact local cache resume deferred rid=%s reason=kv_capacity needed=%d available=%d evictable=%d", req.rid, needed, available, self.tree_cache.full_evictable_size())
                 return False
             self._pre_alloc(req, full_match.device_indices, prefix_len, length)
             allocated = True
@@ -2638,49 +2632,70 @@ class SchedulerDisaggregationDecodeMixin:
         num_not_used_batch = batch_size - curr_batch_size
 
         # pop req from waiting queue
-        can_run_list: List[Req] = []
-        waiting_queue: List[Req] = []
+        pair_scheduler_active = self._pair_scheduler_active()
         main_turn_limit = (
             self.server_args.context_engineering_main_turn_decode_max_batch_size
-            if self._pair_scheduler_active()
+            if pair_scheduler_active
             else None
         )
-        active_main_turns = sum(
-            1
-            for req in running_batch.reqs
-            if req.is_context_engineering_main()
-        )
+        if pair_scheduler_active:
+            waiting_compact_pair_keys = {
+                context_engineering_pair_key(req)
+                for req in self.waiting_queue
+                if req.is_context_engineering_compact()
+                and context_engineering_pair_key(req)
+            }
+            admitted_main_pair_keys = getattr(
+                self, "_context_engineering_admitted_main_pair_keys", set()
+            )
+            admitted_main_pair_keys.intersection_update(waiting_compact_pair_keys)
+            can_run_indices = select_prebuilt_admission_indices(
+                self.waiting_queue,
+                running_batch.reqs,
+                available_batch_slots=num_not_used_batch,
+                main_turn_limit=main_turn_limit,
+                admitted_main_pair_keys=admitted_main_pair_keys,
+            )
+        else:
+            can_run_indices = list(
+                range(min(num_not_used_batch, len(self.waiting_queue)))
+            )
 
-        for req in self.waiting_queue:
-            # we can only add at least `num_not_used_batch` new batch to the running queue
-            if len(can_run_list) < num_not_used_batch:
-                if (
-                    main_turn_limit is not None
-                    and req.is_context_engineering_main()
-                    and active_main_turns >= main_turn_limit
-                ):
-                    waiting_queue.append(req)
-                    continue
-                can_run_list.append(req)
-                if req.is_context_engineering_main():
-                    active_main_turns += 1
-                # Fresh decode-radix requests were matched and locked in
-                # pop_preallocated. A CPU-restored retraction owns private KV;
-                # rematching here would label those pages cache-owned without
-                # acquiring a lock or transferring the req_to_token row.
-                tree_cache = (
-                    self.tree_cache
-                    if not get_disagg().disaggregation_decode_enable_radix_cache
-                    else None
-                )
-                req.init_next_round_input(tree_cache)
-                # Truncate fill_len to kv_committed_len so cache_unfinished_req
-                # only sees committed KV (full array includes one uncommitted
-                # token because init_next_round_input rebuilt it as full).
-                if req.kv_committed_len is not None:
-                    req.set_extend_range(len(req.prefix_indices), req.kv_committed_len)
-            else:
-                waiting_queue.append(req)
+        can_run_index_set = set(can_run_indices)
+        can_run_list = [self.waiting_queue[idx] for idx in can_run_indices]
+        if pair_scheduler_active:
+            admitted_main_pair_keys.update(
+                pair_key
+                for req in can_run_list
+                if req.is_context_engineering_main()
+                and (pair_key := context_engineering_pair_key(req))
+                in waiting_compact_pair_keys
+            )
+            self._context_engineering_admitted_main_pair_keys = (
+                admitted_main_pair_keys
+            )
+        waiting_queue = [
+            req
+            for idx, req in enumerate(self.waiting_queue)
+            if idx not in can_run_index_set
+        ]
+
+        for req in can_run_list:
+            # Fresh decode-radix requests were matched and locked in
+            # pop_preallocated. A CPU-restored retraction owns private KV;
+            # rematching here would label those pages cache-owned without
+            # acquiring a lock or transferring the req_to_token row.
+            tree_cache = (
+                self.tree_cache
+                if not get_disagg().disaggregation_decode_enable_radix_cache
+                else None
+            )
+            req.init_next_round_input(tree_cache)
+            # Truncate fill_len to kv_committed_len so cache_unfinished_req
+            # only sees committed KV (full array includes one uncommitted
+            # token because init_next_round_input rebuilt it as full).
+            if req.kv_committed_len is not None:
+                req.set_extend_range(len(req.prefix_indices), req.kv_committed_len)
 
         self.waiting_queue = waiting_queue
         if len(can_run_list) == 0:
