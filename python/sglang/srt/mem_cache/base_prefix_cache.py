@@ -78,6 +78,7 @@ class InsertParams:
     # General
     chunked: bool = False
     priority: int = 0
+    full_kv_only: bool = False
 
 
 @dataclasses.dataclass

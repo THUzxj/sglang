@@ -121,7 +121,34 @@ class ScheduleBatchDisaggregationDecodeMixin:
         last_tokens: List[int] = []
         for req in self.reqs:
             last_tokens.append(req.output_ids[-1])
-            maybe_cache_unfinished_req(req, self.tree_cache)
+            logger.debug(
+                "Decode prebuilt cache insert begin: rid=%s origin_len=%d "
+                "output_len=%d fill_len=%d extend_start=%d extend_end=%d "
+                "kv_committed_len=%s prefix_len=%d cache_protected_len=%d "
+                "skip_radix_cache_insert=%s token_head=%s token_tail=%s "
+                "extra_key=%s",
+                req.rid,
+                len(req.origin_input_ids),
+                len(req.output_ids),
+                len(req.get_fill_ids()),
+                req.extend_range.start,
+                req.extend_range.end,
+                req.kv_committed_len,
+                len(req.prefix_indices),
+                getattr(req, "cache_protected_len", None),
+                getattr(req, "skip_radix_cache_insert", None),
+                list(req.get_fill_ids()[:3]),
+                list(req.get_fill_ids()[-3:]),
+                getattr(req, "extra_key", None),
+            )
+            maybe_cache_unfinished_req(req, self.tree_cache, full_kv_only=True)
+            logger.debug(
+                "Decode prebuilt cache insert end: rid=%s prefix_len=%d "
+                "cache_protected_len=%d",
+                req.rid,
+                len(req.prefix_indices),
+                getattr(req, "cache_protected_len", None),
+            )
             if req.grammar is not None:
                 # FIXME: this try-except block is for handling unexpected xgrammar issue.
                 try:

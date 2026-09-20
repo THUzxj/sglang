@@ -519,7 +519,22 @@ class MambaRadixCache(KVCacheEventMixin, BasePrefixCache):
                 best_match_node=self.root_node,
             )
 
-        value, last_node, best_value_len = self._match_prefix_helper(key)
+        value, last_node, best_value_len = self._match_prefix_helper(
+            key, match_full_kv_only=params.match_full_kv_only
+        )
+        if params.match_full_kv_only:
+            logger.debug(
+                "Mamba full-KV match walk: key_len=%d value_segments=%d "
+                "value_tokens=%d best_value_len=%d last_node_id=%s "
+                "last_node_evicted=%s last_node_mamba=%s",
+                len(key),
+                len(value),
+                sum(len(v) for v in value),
+                best_value_len,
+                getattr(last_node, "id", None),
+                last_node.evicted,
+                last_node.mamba_value is not None,
+            )
         return self._match_post_processor(params, value, last_node, best_value_len)
 
     def insert(self, params: InsertParams) -> InsertResult:
@@ -1066,7 +1081,7 @@ class MambaRadixCache(KVCacheEventMixin, BasePrefixCache):
             self.req_to_token_pool.mamba_allocator.free(mamba_value)
 
     def _match_prefix_helper(
-        self, key: RadixKey
+        self, key: RadixKey, match_full_kv_only: bool = False
     ) -> Tuple[List[torch.Tensor], TreeNode, int]:
         """
         Mamba prefix matching helper. It factors in the sliding window size such that
@@ -1104,6 +1119,12 @@ class MambaRadixCache(KVCacheEventMixin, BasePrefixCache):
         if node.mamba_value is not None:
             best_value_len = len(value)
             best_last_node = node
+
+        if match_full_kv_only:
+            # PD decode receives the Mamba state through the transfer. In this
+            # mode the caller needs the complete full-attention KV path even
+            # when the terminal radix node has no reusable Mamba checkpoint.
+            return value, node, len(value)
 
         return value, best_last_node, best_value_len
 

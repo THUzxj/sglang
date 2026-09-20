@@ -209,7 +209,9 @@ class MambaComponent(TreeComponent):
         result: InsertResult,
         cache_actions: list[CacheAction | ComponentAction],
     ) -> None:
-        assert params.mamba_value is not None
+        if params.mamba_value is None:
+            assert params.full_kv_only
+            return
         if is_new_leaf:
             node.component_data[self.component_type].value = params.mamba_value
             self.tree_core.lru_lists[self.component_type].insert_mru(node)

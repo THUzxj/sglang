@@ -973,11 +973,27 @@ class HiMambaRadixCache(MambaRadixCache):
             page_aligned_len = len(key) // self.page_size * self.page_size
             key = key[:page_aligned_len]
 
-        value, best_last_node, best_value_len = self._match_prefix_helper(key)
+        value, best_last_node, best_value_len = self._match_prefix_helper(
+            key, match_full_kv_only=params.match_full_kv_only
+        )
+        if params.match_full_kv_only:
+            logger.debug(
+                "HiMamba full-KV match walk: key_len=%d value_segments=%d "
+                "value_tokens=%d best_value_len=%d last_node_id=%s "
+                "last_node_evicted=%s last_node_mamba=%s",
+                len(key),
+                len(value),
+                sum(len(v) for v in value),
+                best_value_len,
+                getattr(best_last_node, "id", None),
+                best_last_node.evicted,
+                best_last_node.mamba_value is not None
+                or best_last_node.mamba_backuped,
+            )
         return self._match_post_processor(params, value, best_last_node, best_value_len)
 
     def _match_prefix_helper(
-        self, key: RadixKey
+        self, key: RadixKey, match_full_kv_only: bool = False
     ) -> Tuple[List[torch.Tensor], TreeNode, int]:
         """Walk tree to find best_last_node (mamba boundary)."""
         node = self.root_node
@@ -1016,6 +1032,12 @@ class HiMambaRadixCache(MambaRadixCache):
             best_value_len = len(value)
             best_last_node = node
 
+        if match_full_kv_only:
+            # PD decode receives the Mamba state through the transfer. Return
+            # the complete full-attention KV path even when the terminal node
+            # has no reusable Mamba checkpoint.
+            return value, node, len(value)
+
         return value, best_last_node, best_value_len
 
     def _match_post_processor(
@@ -1033,7 +1055,15 @@ class HiMambaRadixCache(MambaRadixCache):
         while lru_node != self.root_node and lru_node.evicted:
             lru_node = lru_node.parent
         self.full_lru_list.reset_node_and_parents_mru(lru_node, self.root_node)
-        self.mamba_lru_list.reset_node_and_parents_mru(best_last_node, self.root_node)
+        mamba_node = best_last_node
+        if params.match_full_kv_only:
+            while (
+                mamba_node != self.root_node
+                and mamba_node.mamba_value is None
+                and not mamba_node.mamba_backuped
+            ):
+                mamba_node = mamba_node.parent
+        self.mamba_lru_list.reset_node_and_parents_mru(mamba_node, self.root_node)
 
         cur_time = get_last_access_time()
         node_update = best_last_node
@@ -1071,7 +1101,6 @@ class HiMambaRadixCache(MambaRadixCache):
             1 if (last_host_node.mamba_evicted and last_host_node.mamba_backuped) else 0
         )
 
-        mamba_node = best_last_node
         if cow_mamba and mamba_node.mamba_value is not None:
             if req.mamba_pool_idx is None:
                 dst_index = self._alloc_with_evict(

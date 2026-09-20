@@ -1168,6 +1168,51 @@ class UnifiedRadixCacheSuite:
         )
         cache.sanity_check()
 
+    def test_cache_unfinished_req_full_kv_only_without_mamba_checkpoint(self):
+        if not (self.cfg.has_mamba and self.cfg.enable_mamba_extra_buffer):
+            self.skipTest("requires Mamba extra buffer")
+
+        cache, allocator, req_to_token_pool = build_fixture(self.cfg)
+
+        req = self._make_req(req_to_token_pool)
+        tokens = self._make_seq(1, 3)
+        req.origin_input_ids = array("q", tokens)
+        req.output_ids = array("q")
+        req.full_untruncated_fill_ids = array("q", tokens)
+        req.set_extend_range(
+            len(req.prefix_indices), len(req.full_untruncated_fill_ids)
+        )
+        kv_len = len(tokens)
+        kv_indices = self._alloc(allocator, kv_len)
+        req_to_token_pool.write((req.req_pool_idx, slice(0, kv_len)), kv_indices)
+        req.kv_committed_len = kv_len
+        req.last_node = cache.root_node.id
+        req.cache_protected_len = 0
+        req.swa_uuid_for_lock = None
+        req.extra_key = None
+        req.mamba_last_track_seqlen = None
+
+        cache.cache_unfinished_req(req, full_kv_only=True)
+
+        key = RadixKey(array("q", tokens))
+        full_only_match = cache.match_prefix(
+            MatchPrefixParams(key=key, match_full_kv_only=True)
+        )
+        self.assertEqual(len(full_only_match.device_indices), kv_len)
+
+        all_components_match = cache.match_prefix(MatchPrefixParams(key=key))
+        self.assertEqual(len(all_components_match.device_indices), 0)
+
+        node = cache.tree_core.node_by_id(full_only_match.last_device_node)
+        self.assertIsNotNone(node.component_data[ComponentType.FULL].value)
+        self.assertIsNone(node.component_data[ComponentType.MAMBA].value)
+
+        cache.dec_lock_ref(
+            req.last_node,
+            DecLockRefParams(swa_uuid_for_lock=getattr(req, "swa_uuid_for_lock", None)),
+        )
+        cache.sanity_check()
+
     def test_swa_unfinished_req_preserves_existing_eviction_boundary(self):
         if not self.cfg.has_swa or self.cfg.has_mamba:
             self.skipTest("requires SWA without Mamba")

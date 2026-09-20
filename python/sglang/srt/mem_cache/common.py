@@ -97,9 +97,24 @@ def free_swa_out_of_window_slots(
 
 def maybe_cache_unfinished_req(req: Req, tree_cache: BasePrefixCache, **kwargs):
     if getattr(req, "skip_radix_cache_insert", False):
+        logger.debug(
+            "Decode radix cache insert skipped: rid=%s origin_len=%d "
+            "kv_committed_len=%s",
+            req.rid,
+            len(req.origin_input_ids),
+            getattr(req, "kv_committed_len", None),
+        )
         return
 
     tree_cache.cache_unfinished_req(req, **kwargs)
+    logger.debug(
+        "Decode radix cache insert done: rid=%s fill_len=%d prefix_len=%d "
+        "cache_protected_len=%d",
+        req.rid,
+        len(req.get_fill_ids()),
+        len(req.prefix_indices),
+        getattr(req, "cache_protected_len", 0),
+    )
 
 
 def evict_from_tree_cache(tree_cache: BasePrefixCache | None, num_tokens: int):

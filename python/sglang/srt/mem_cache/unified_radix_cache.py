@@ -811,7 +811,13 @@ class UnifiedRadixCache(BasePrefixCache):
             ):
                 self.session_refs.register_session_ref(req)
 
-    def cache_unfinished_req(self, req: Req, chunked: bool = False, **kwargs) -> None:
+    def cache_unfinished_req(
+        self,
+        req: Req,
+        chunked: bool = False,
+        full_kv_only: bool = False,
+        **kwargs,
+    ) -> None:
         if self.session.try_cache_unfinished_req(req, chunked=chunked, **kwargs):
             return
 
@@ -834,9 +840,12 @@ class UnifiedRadixCache(BasePrefixCache):
             prev_prefix_len=protected_len,
             chunked=chunked,
             priority=getattr(req, "priority", 0) or 0,
+            full_kv_only=full_kv_only,
         )
         effective_cache_len = len(token_ids)
         for comp in self._components_tuple:
+            if full_kv_only and comp.component_type == ComponentType.MAMBA:
+                continue
             cl = comp.prepare_for_caching_req(
                 req=req,
                 insert_params=insert_params,
@@ -875,7 +884,9 @@ class UnifiedRadixCache(BasePrefixCache):
         result = self.insert(insert_params)
 
         # Match prefix
-        match_result = self.match_prefix(MatchPrefixParams(key=radix_key))
+        match_result = self.match_prefix(
+            MatchPrefixParams(key=radix_key, match_full_kv_only=full_kv_only)
+        )
         new_indices = match_result.device_indices
         new_last_node = match_result.last_device_node
         new_prefix_len = result.prefix_len
@@ -899,7 +910,7 @@ class UnifiedRadixCache(BasePrefixCache):
         # whole batch before locking would break that. Off = original full lock.
         skip_lock_components = (
             (ComponentType.MAMBA,)
-            if envs.SGLANG_OPT_MAMBA_SKIP_DECODE_LOCK.get()
+            if full_kv_only or envs.SGLANG_OPT_MAMBA_SKIP_DECODE_LOCK.get()
             else ()
         )
         lock_result = self.inc_lock_ref(
