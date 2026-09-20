@@ -657,6 +657,9 @@ class SchedulerMetricsReporter:
             prefill_stats.log_input_tokens
             - prefill_stats.reprocessed_log_input_tokens
         )
+        queue_context_stats = batch_context_engineering_stats(
+            self.scheduler.waiting_queue
+        )
 
         msg = (
             f"Prefill batch{iter_msg}, "
@@ -684,6 +687,9 @@ class SchedulerMetricsReporter:
             f"{token_usage_msg}"
             f"#running-req: {prefill_stats.num_running_reqs.total}, "
             f"#queue-req: {len(self.scheduler.waiting_queue)}, "
+            f"#queue-main-req: {queue_context_stats['main']}, "
+            f"#queue-ce-req: {queue_context_stats['compact']}, "
+            f"#queue-other-req: {queue_context_stats['foreground']}, "
             f"#pending-token: {prefill_stats.num_pending_tokens}, "
         )
         if batch is not None:
