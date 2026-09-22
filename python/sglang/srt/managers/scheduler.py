@@ -1135,6 +1135,10 @@ class Scheduler(
         # radix/HiCache owns the committed KV.  This queue is intentionally
         # separate from both fresh prefill and PD's CPU-backed retracted queue.
         self.paused_compact_queue: List[Req] = []
+        # Radix pauses selected while the previous decode result is still in
+        # flight. The request is removed from the next forward immediately, but
+        # retains its GPU KV ownership until that result has been committed.
+        self.pending_compact_pause_queue: List[Req] = []
         # The running decoding batch for continuous batching
         self.running_batch: ScheduleBatch = ScheduleBatch(reqs=[], batch_is_full=False)
         # The current forward batch
@@ -3582,6 +3586,13 @@ class Scheduler(
             == "radix_evictable"
         )
 
+    def _deferred_compact_pause_enabled(self) -> bool:
+        return bool(
+            self._radix_evictable_compact_pause_enabled()
+            and self.enable_overlap
+            and self.disaggregation_mode == DisaggregationMode.DECODE
+        )
+
     def _park_compact_in_radix_cache(self, req: Req) -> bool:
         """Detach a compact Req while leaving committed KV evictable in radix."""
 
@@ -3666,6 +3677,45 @@ class Scheduler(
         req.is_context_engineering_paused = True
         req.is_context_engineering_cache_paused = True
         return True
+
+    @scheduler_nvtx_method("scheduler.finalize_pending_compact_pauses")
+    def _finalize_pending_compact_pauses(self, completed_batch: ScheduleBatch) -> None:
+        """Transfer deferred compact KV ownership after its decode result is ready."""
+
+        if not self.pending_compact_pause_queue:
+            return
+
+        completed_ids = {id(req) for req in completed_batch.reqs}
+        remaining = []
+        paused_count = 0
+        paused_ids = {id(req) for req in self.paused_compact_queue}
+
+        for req in self.pending_compact_pause_queue:
+            if id(req) not in completed_ids:
+                remaining.append(req)
+                continue
+
+            req.is_context_engineering_pause_pending = False
+
+            # Result processing may have finished the request and released its
+            # KV. In that case there is no live state left to park.
+            if req.finished() or req.req_pool_idx is None:
+                continue
+
+            parked = self._park_compact_in_radix_cache(req)
+            if not parked:
+                # A local Mamba checkpoint can miss a page boundary or host
+                # capacity. Keep ownership on GPU and retry normal admission
+                # instead of dropping the request or exposing its pages.
+                req.is_context_engineering_paused = True
+
+            if id(req) not in paused_ids:
+                self.paused_compact_queue.append(req)
+                paused_ids.add(id(req))
+                paused_count += 1
+
+        self.pending_compact_pause_queue = remaining
+        self.metrics_reporter.num_paused_reqs += paused_count
 
     def _order_context_engineering_waiting_queue(
         self, waiting_queue: List[Req]
@@ -3965,19 +4015,42 @@ class Scheduler(
         reason = "no_main" if compact_only else "decode_budget"
         if self._radix_evictable_compact_pause_enabled():
             paused_ids = {id(req) for req in self.paused_compact_queue}
-            actually_paused = []
+            if not self._deferred_compact_pause_enabled():
+                actually_paused = []
+                for req in retracted_reqs:
+                    if id(req) in paused_ids:
+                        raise AssertionError(
+                            f"Compact request {req.rid} is already cache-paused"
+                        )
+                    if self._park_compact_in_radix_cache(req):
+                        self.paused_compact_queue.append(req)
+                        actually_paused.append(req)
+                self.metrics_reporter.num_paused_reqs += len(actually_paused)
+                actually_paused_ids = {id(req) for req in actually_paused}
+                batch.filter_batch(
+                    keep_indices=[
+                        i
+                        for i, req in enumerate(batch.reqs)
+                        if id(req) not in actually_paused_ids
+                    ]
+                )
+                return []
+
+            pending_ids = {id(req) for req in self.pending_compact_pause_queue}
+            newly_pending = []
             for req in retracted_reqs:
-                if id(req) in paused_ids:
+                if id(req) in paused_ids or id(req) in pending_ids:
                     raise AssertionError(
-                        f"Compact request {req.rid} is already cache-paused"
+                        f"Compact request {req.rid} is already cache-paused or pending"
                     )
-                if self._park_compact_in_radix_cache(req):
-                    self.paused_compact_queue.append(req)
-                    actually_paused.append(req)
-            self.metrics_reporter.num_paused_reqs += len(actually_paused)
-            paused_ids = {id(req) for req in actually_paused}
+                req.is_context_engineering_pause_pending = True
+                self.pending_compact_pause_queue.append(req)
+                newly_pending.append(req)
+            pending_ids = {id(req) for req in newly_pending}
             batch.filter_batch(
-                keep_indices=[i for i, req in enumerate(batch.reqs) if id(req) not in paused_ids]
+                keep_indices=[
+                    i for i, req in enumerate(batch.reqs) if id(req) not in pending_ids
+                ]
             )
             return []
 
@@ -4541,6 +4614,7 @@ class Scheduler(
         # Waiting queues: waiting + bootstrapping + preallocation + kv transfer (decode)
         idle &= len(self.waiting_queue) == 0
         idle &= len(self.paused_compact_queue) == 0
+        idle &= len(self.pending_compact_pause_queue) == 0
 
         if (
             for_health_check
@@ -5254,6 +5328,7 @@ class Scheduler(
             # Process the results of the last batch
             tmp_batch, tmp_result = self.result_queue.popleft()
             self.process_batch_result(tmp_batch, tmp_result)
+            self._finalize_pending_compact_pauses(tmp_batch)
 
         retract_reqs = [r for r in self.running_batch.reqs if not r.finished()]
         if (

@@ -169,6 +169,135 @@ def test_radix_evictable_pause_rejects_missing_host_backup(monkeypatch):
     assert req.is_context_engineering_cache_parking is False
 
 
+def test_finalize_pending_compact_pause_after_result_commit(monkeypatch):
+    scheduler = scheduler_module.Scheduler.__new__(scheduler_module.Scheduler)
+    scheduler.pending_compact_pause_queue = []
+    scheduler.paused_compact_queue = []
+    scheduler.metrics_reporter = SimpleNamespace(num_paused_reqs=0)
+
+    req = SimpleNamespace(
+        req_pool_idx=3,
+        is_context_engineering_pause_pending=True,
+        finished=lambda: False,
+    )
+    scheduler.pending_compact_pause_queue.append(req)
+    park_calls = []
+    monkeypatch.setattr(
+        scheduler,
+        "_park_compact_in_radix_cache",
+        lambda actual_req: park_calls.append(actual_req) or True,
+    )
+
+    scheduler._finalize_pending_compact_pauses(SimpleNamespace(reqs=[req]))
+
+    assert park_calls == [req]
+    assert req.is_context_engineering_pause_pending is False
+    assert scheduler.pending_compact_pause_queue == []
+    assert scheduler.paused_compact_queue == [req]
+    assert scheduler.metrics_reporter.num_paused_reqs == 1
+
+
+def test_finalize_pending_compact_pause_keeps_gpu_ownership_on_park_failure(
+    monkeypatch,
+):
+    scheduler = scheduler_module.Scheduler.__new__(scheduler_module.Scheduler)
+    scheduler.pending_compact_pause_queue = []
+    scheduler.paused_compact_queue = []
+    scheduler.metrics_reporter = SimpleNamespace(num_paused_reqs=0)
+
+    req = SimpleNamespace(
+        req_pool_idx=3,
+        is_context_engineering_pause_pending=True,
+        is_context_engineering_paused=False,
+        finished=lambda: False,
+    )
+    scheduler.pending_compact_pause_queue.append(req)
+    monkeypatch.setattr(
+        scheduler, "_park_compact_in_radix_cache", lambda actual_req: False
+    )
+
+    scheduler._finalize_pending_compact_pauses(SimpleNamespace(reqs=[req]))
+
+    assert req.is_context_engineering_pause_pending is False
+    assert req.is_context_engineering_paused is True
+    assert req.req_pool_idx == 3
+    assert scheduler.paused_compact_queue == [req]
+    assert scheduler.metrics_reporter.num_paused_reqs == 1
+
+
+def test_finalize_pending_compact_pause_skips_finished_request(monkeypatch):
+    scheduler = scheduler_module.Scheduler.__new__(scheduler_module.Scheduler)
+    scheduler.pending_compact_pause_queue = []
+    scheduler.paused_compact_queue = []
+    scheduler.metrics_reporter = SimpleNamespace(num_paused_reqs=0)
+
+    req = SimpleNamespace(
+        req_pool_idx=None,
+        is_context_engineering_pause_pending=True,
+        finished=lambda: True,
+    )
+    scheduler.pending_compact_pause_queue.append(req)
+    park = MagicMock()
+    monkeypatch.setattr(scheduler, "_park_compact_in_radix_cache", park)
+
+    scheduler._finalize_pending_compact_pauses(SimpleNamespace(reqs=[req]))
+
+    park.assert_not_called()
+    assert req.is_context_engineering_pause_pending is False
+    assert scheduler.pending_compact_pause_queue == []
+    assert scheduler.paused_compact_queue == []
+    assert scheduler.metrics_reporter.num_paused_reqs == 0
+
+
+def test_radix_pause_is_deferred_until_decode_result_commit(monkeypatch):
+    scheduler = scheduler_module.Scheduler.__new__(scheduler_module.Scheduler)
+    scheduler.disaggregation_mode = DisaggregationMode.DECODE
+    scheduler.enable_overlap = True
+    scheduler.server_args = SimpleNamespace(
+        enable_pair_scheduler=True,
+        context_engineering_compact_pause_mode="radix_evictable",
+        context_engineering_compact_decode_max_batch_size=1,
+        context_engineering_decode_attention_token_budget=None,
+        context_engineering_compact_attention_cost_ratio=1.0,
+    )
+    scheduler.waiting_queue = []
+    scheduler.pending_compact_pause_queue = []
+    scheduler.paused_compact_queue = []
+    scheduler.metrics_reporter = SimpleNamespace(num_paused_reqs=0)
+
+    main_req = SimpleNamespace(is_context_engineering_compact=lambda: False)
+    compact_req = SimpleNamespace(
+        rid="compact",
+        is_context_engineering_compact=lambda: True,
+        is_context_engineering_pause_pending=False,
+    )
+    batch = SimpleNamespace(reqs=[main_req, compact_req])
+    kept_indices = []
+
+    def filter_batch(*, keep_indices):
+        kept_indices.extend(keep_indices)
+        batch.reqs = [batch.reqs[i] for i in keep_indices]
+
+    batch.filter_batch = filter_batch
+    monkeypatch.setattr(
+        scheduler_module,
+        "select_decode_keep_indices",
+        lambda *args, **kwargs: [0],
+    )
+    park = MagicMock()
+    monkeypatch.setattr(scheduler, "_park_compact_in_radix_cache", park)
+
+    assert scheduler._retract_compact_decode_over_budget(batch) == []
+
+    park.assert_not_called()
+    assert kept_indices == [0]
+    assert batch.reqs == [main_req]
+    assert compact_req.is_context_engineering_pause_pending is True
+    assert scheduler.pending_compact_pause_queue == [compact_req]
+    assert scheduler.paused_compact_queue == []
+    assert scheduler.metrics_reporter.num_paused_reqs == 0
+
+
 def test_local_cache_resume_restores_pending_token_and_radix_ownership(monkeypatch):
     node_id = 7
     mamba_match = SimpleNamespace(best_match_node=node_id)

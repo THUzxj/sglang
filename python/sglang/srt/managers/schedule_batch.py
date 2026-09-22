@@ -1007,6 +1007,9 @@ class Req(ReqDllmMixin):
         # state while releasing req_pool_idx/Req.kv.  The committed KV is owned
         # by radix cache and is rediscovered through prefix match on resume.
         self.is_context_engineering_cache_paused = False
+        # Selected for a radix pause but still owning GPU KV until the decode
+        # result that produced its pending token has been committed.
+        self.is_context_engineering_pause_pending = False
         self.context_engineering_pause_committed_len = 0
         self.context_engineering_pause_pending_token_id = None
         self.is_context_engineering_cache_parking = False

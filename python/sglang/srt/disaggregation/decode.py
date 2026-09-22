@@ -2501,6 +2501,7 @@ class SchedulerDisaggregationDecodeMixin:
         def pop_and_process():
             tmp_batch, tmp_result = self.result_queue.popleft()
             self.process_batch_result(tmp_batch, tmp_result)
+            self._finalize_pending_compact_pauses(tmp_batch)
 
         while True:
             # Receive requests
@@ -2509,20 +2510,6 @@ class SchedulerDisaggregationDecodeMixin:
             if self._engine_paused:
                 continue
             self.process_decode_queue()
-
-            # A compact may be parked while selecting the next batch. Drain
-            # its previous output first so output_ids and committed KV/Mamba
-            # describe the same decode position.
-            previous_result_processed = bool(
-                self.last_batch
-                and self._radix_evictable_compact_pause_enabled()
-                and any(
-                    req.is_context_engineering_compact()
-                    for req in self.last_batch.reqs
-                )
-            )
-            if previous_result_processed:
-                pop_and_process()
 
             # Get the next batch to run
             plan = self.get_next_disagg_decode_batch_to_run(
@@ -2539,7 +2526,7 @@ class SchedulerDisaggregationDecodeMixin:
                 batch, last_batch=self.last_batch
             )
 
-            if disable_overlap_for_batch and self.last_batch and not previous_result_processed:
+            if disable_overlap_for_batch and self.last_batch:
                 pop_and_process()
 
             # Launch the current batch
@@ -2552,7 +2539,7 @@ class SchedulerDisaggregationDecodeMixin:
 
             # Process the last batch
             if self.last_batch:
-                if not disable_overlap_for_batch and not previous_result_processed:
+                if not disable_overlap_for_batch:
                     pop_and_process()
             elif batch is None:
                 self.on_idle()
