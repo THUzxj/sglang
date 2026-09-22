@@ -250,6 +250,7 @@ class DecodeHiCacheTransferMixin:
                 host_hit_length=rematch.host_hit_length,
                 req=dr.req,
                 full_kv_only=pm.match_full_kv_only,
+                force=pm.restore_token_count > 0,
             )
         )
 

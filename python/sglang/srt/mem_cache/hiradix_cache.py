@@ -1347,7 +1347,11 @@ class HiRadixCache(RadixCache):
                 heapq.heappush(eviction_heap, (new_priority, x.parent))
 
     def load_back(
-        self, node: TreeNode, mem_quota: Optional[int] = None
+        self,
+        node: TreeNode,
+        mem_quota: Optional[int] = None,
+        *,
+        force: bool = False,
     ) -> Optional[torch.Tensor]:
 
         last_hit_node = node
@@ -1367,7 +1371,7 @@ class HiRadixCache(RadixCache):
 
         # load it all or not at all
         host_indices = torch.cat([n.host_value for n in nodes_to_load])
-        if len(host_indices) < self.load_back_threshold or (
+        if (not force and len(host_indices) < self.load_back_threshold) or (
             len(host_indices) > mem_quota + delta if mem_quota is not None else False
         ):
             # skip loading back if the total size is too small or exceeding the memory quota
@@ -1426,7 +1430,9 @@ class HiRadixCache(RadixCache):
         last_node = params.best_match_node
         mem_quota = params.mem_quota
         if last_node.evicted:
-            loading_values = self.load_back(last_node, mem_quota)
+            loading_values = self.load_back(
+                last_node, mem_quota, force=params.force
+            )
             if loading_values is not None:
                 logger.debug(
                     f"loading back {len(loading_values)} tokens for node {last_node.id}"

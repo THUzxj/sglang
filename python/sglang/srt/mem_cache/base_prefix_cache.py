@@ -168,6 +168,9 @@ class InitLoadBackParams:
     mem_quota: Optional[int] = None
     req: Optional[Req] = None
     full_kv_only: bool = False
+    # Request-critical restores bypass the small-transfer threshold, but still
+    # respect memory quota and device capacity checks.
+    force: bool = False
 
 
 class MatchResult(NamedTuple):

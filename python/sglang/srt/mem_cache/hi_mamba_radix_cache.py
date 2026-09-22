@@ -253,7 +253,12 @@ class HiMambaRadixCache(MambaRadixCache):
         return len(host_indices)
 
     def load_back(
-        self, node: TreeNode, mem_quota: Optional[int] = None, req=None
+        self,
+        node: TreeNode,
+        mem_quota: Optional[int] = None,
+        req=None,
+        *,
+        force: bool = False,
     ) -> Optional[torch.Tensor]:
         """Load full KV back from host."""
         last_hit_node = node
@@ -281,7 +286,10 @@ class HiMambaRadixCache(MambaRadixCache):
         if (
             len(full_host_indices) > 0
             and (
-                (len(full_host_indices) < self.load_back_threshold)
+                (
+                    not force
+                    and len(full_host_indices) < self.load_back_threshold
+                )
                 or (
                     len(full_host_indices) > mem_quota + delta
                     if mem_quota is not None
@@ -357,7 +365,9 @@ class HiMambaRadixCache(MambaRadixCache):
         mem_quota = params.mem_quota
         req = params.req
         if last_node.evicted or (last_node.mamba_evicted and last_node.mamba_backuped):
-            loading_values = self.load_back(last_node, mem_quota, req=req)
+            loading_values = self.load_back(
+                last_node, mem_quota, req=req, force=params.force
+            )
             if loading_values is not None:
                 logger.debug(
                     f"loading back {len(loading_values)} tokens for node {last_node.id}"

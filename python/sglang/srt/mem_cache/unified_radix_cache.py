@@ -1191,6 +1191,7 @@ class UnifiedRadixCache(BasePrefixCache):
         req=None,
         *,
         full_kv_only: bool = False,
+        force: bool = False,
     ) -> bool:
         """Load evicted KV data from host back to device (H→D)."""
         if self.cache_controller is None:
@@ -1223,6 +1224,7 @@ class UnifiedRadixCache(BasePrefixCache):
                 ancestor_lock_params=ancestor_lock_params,
                 host_anchor_params=host_anchor_params,
                 full_kv_only=full_kv_only,
+                force=force,
             )
             return success
         finally:
@@ -1239,6 +1241,7 @@ class UnifiedRadixCache(BasePrefixCache):
         ancestor_lock_params: DecLockRefParams,
         host_anchor_params: DecLockRefParams,
         full_kv_only: bool,
+        force: bool,
     ) -> bool:
         # Build the KV + per-component aux transfers.
         kv_xfer, comp_xfers = self.tree_core.build_load_back_spec(
@@ -1249,10 +1252,14 @@ class UnifiedRadixCache(BasePrefixCache):
             CacheTransferPhase.LOAD_BACK, kv_xfer, comp_xfers
         )
 
-        # Skip if there is nothing to load, or if the Full-KV transfer is too
-        # small / exceeds memory quota. Aux transfers should still run even
-        # when the Full-KV load is skipped by thresholding.
-        if (kv_tokens < self.load_back_threshold and not comp_xfers) or (
+        # Skip a non-critical small Full-KV transfer or one that exceeds its
+        # memory quota. Aux transfers should still run when Full-KV is skipped
+        # by thresholding; force only bypasses that threshold.
+        if (
+            not force
+            and kv_tokens < self.load_back_threshold
+            and not comp_xfers
+        ) or (
             mem_quota is not None and kv_tokens > mem_quota + result.delta
         ):
             self.dec_lock_ref(node_id, ancestor_lock_params)
@@ -2229,6 +2236,7 @@ class UnifiedRadixCache(BasePrefixCache):
                 mem_quota,
                 req=req,
                 full_kv_only=params.full_kv_only,
+                force=params.force,
             ):
                 new_indices = self.tree_core.collect_full_device_indices(
                     best_match_node_id, last_best_match_device_node_id

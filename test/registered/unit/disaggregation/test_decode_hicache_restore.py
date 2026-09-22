@@ -10,7 +10,12 @@ from sglang.srt.disaggregation.decode_hicache_mixin import (
     DecodePrefixMatch,
     HiCacheRestoreResult,
 )
-from sglang.srt.mem_cache.base_prefix_cache import IncLockRefResult
+from sglang.srt.mem_cache.base_prefix_cache import (
+    DecLockRefParams,
+    IncLockRefResult,
+)
+from sglang.srt.mem_cache.hicache_storage import PoolName, PoolTransfer
+from sglang.srt.mem_cache.unified_radix_cache import UnifiedRadixCache
 from sglang.srt.mem_cache.unified_cache.components.tree_component import ComponentType
 from sglang.test.ci.ci_register import register_cpu_ci
 
@@ -104,9 +109,97 @@ class TestDecodeHiCacheRestore(unittest.TestCase):
             self.assertFalse(call.kwargs["update_req"])
         init_params = queue.tree_cache.init_load_back.call_args.args[0]
         self.assertTrue(init_params.full_kv_only)
+        self.assertTrue(init_params.force)
         queue.tree_cache.inc_lock_ref.assert_called_once_with(
             "restored-device-node"
         )
+
+    @patch("sglang.srt.disaggregation.decode_hicache_mixin.match_prefix_for_req")
+    def test_full_kv_only_small_l2_restore_is_forced(self, mock_match_prefix):
+        for l2_hit in range(1, 10):
+            with self.subTest(l2_hit=l2_hit):
+                queue = self._make_queue()
+                decode_req = self._make_decode_req()
+                decode_req.prefix_match.l2_host_hit_length = l2_hit
+
+                mock_match_prefix.reset_mock()
+                mock_match_prefix.side_effect = [
+                    SimpleNamespace(
+                        device_indices=torch.arange(5, dtype=torch.int64),
+                        best_match_node="host-node",
+                        host_hit_length=l2_hit,
+                    ),
+                    SimpleNamespace(
+                        device_indices=torch.arange(
+                            100, 105 + l2_hit, dtype=torch.int64
+                        ),
+                        last_device_node="restored-device-node",
+                    ),
+                ]
+                queue.tree_cache.init_load_back.return_value = (
+                    torch.arange(l2_hit, dtype=torch.int64),
+                    "host-node",
+                )
+                queue.tree_cache.inc_lock_ref.return_value = IncLockRefResult()
+
+                self.assertTrue(
+                    queue._try_hicache_queue_load_back(decode_req)
+                )
+                init_params = queue.tree_cache.init_load_back.call_args.args[0]
+                self.assertTrue(init_params.full_kv_only)
+                self.assertTrue(init_params.force)
+                self.assertEqual(init_params.host_hit_length, l2_hit)
+                self.assertEqual(
+                    len(decode_req.hicache_restored_kv_indices), l2_hit
+                )
+
+    def test_force_bypasses_unified_load_back_threshold(self):
+        for l2_hit in range(1, 10):
+            with self.subTest(l2_hit=l2_hit):
+                cache = UnifiedRadixCache.__new__(UnifiedRadixCache)
+                cache.tree_core = MagicMock()
+                cache.tree_core.build_load_back_spec.return_value = (
+                    PoolTransfer(
+                        name=PoolName.KV,
+                        host_indices=torch.arange(l2_hit),
+                    ),
+                    {},
+                )
+                cache.tree_core.commit_load_back.return_value = []
+                cache._build_sidecar_transfers = MagicMock(return_value=[])
+                cache.load_back_threshold = 10
+                cache.supports_swa = MagicMock(return_value=False)
+                cache.token_to_kv_pool_allocator = MagicMock()
+                cache.token_to_kv_pool_allocator.available_size.return_value = 10
+                cache.cache_controller = MagicMock()
+                cache.cache_controller.load.return_value = torch.arange(l2_hit)
+                cache.dec_lock_ref = MagicMock()
+                cache.dec_host_lock_ref = MagicMock()
+                cache.inc_lock_ref = MagicMock(
+                    return_value=IncLockRefResult()
+                )
+                cache._apply_cache_actions = MagicMock()
+                cache.ongoing_load_back = {}
+
+                common = dict(
+                    node_id=7,
+                    mem_quota=None,
+                    req=None,
+                    result=IncLockRefResult(delta=0),
+                    ancestor_lock_params=DecLockRefParams(),
+                    host_anchor_params=DecLockRefParams(),
+                    full_kv_only=True,
+                )
+                self.assertTrue(
+                    cache._load_back_transfers(**common, force=True)
+                )
+                cache.cache_controller.load.assert_called_once()
+
+                cache.cache_controller.load.reset_mock()
+                self.assertFalse(
+                    cache._load_back_transfers(**common, force=False)
+                )
+                cache.cache_controller.load.assert_not_called()
 
     def test_commit_rejects_wrong_restore_length_before_mutating_cache(self):
         queue = self._make_queue()
