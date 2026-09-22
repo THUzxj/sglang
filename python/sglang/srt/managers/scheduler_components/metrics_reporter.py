@@ -889,6 +889,12 @@ class SchedulerMetricsReporter:
 
         pool_stats = self.scheduler.pool_stats_observer.get_pool_stats()
         token_usage_msg = ", ".join(pool_stats.get_decode_usage_msg_parts()) + ", "
+        decode_kv_read_tokens = _decode_total_seq_lens(batch)
+        decode_kv_read_tokens_per_req = (
+            batch.seq_lens_cpu.tolist()
+            if batch.seq_lens_cpu is not None
+            else [req.seqlen for req in batch.reqs]
+        )
 
         if RECORD_STEP_TIME:
             self.step_time_dict[num_running_reqs].append(
@@ -901,7 +907,12 @@ class SchedulerMetricsReporter:
             else self.scheduler.forward_ct
         )
         iter_msg = f" [{batch_iter}]" if LOG_FORWARD_ITERS else ""
-        msg = f"Decode batch{iter_msg}, #running-req: {num_running_reqs}, {token_usage_msg}"
+        msg = (
+            f"Decode batch{iter_msg}, #running-req: {num_running_reqs}, "
+            f"#decode-kv-read-token: {decode_kv_read_tokens}, "
+            f"decode-kv-read-token-per-req: {decode_kv_read_tokens_per_req}, "
+            f"{token_usage_msg}"
+        )
 
         spec_num_steps = 0
         spec_num_draft_tokens = 0
@@ -962,9 +973,22 @@ class SchedulerMetricsReporter:
         cache_hit_rate = 0.0
 
         if self.scheduler.disaggregation_mode == DisaggregationMode.DECODE:
+            prealloc_queue = self.scheduler.disagg_decode_prealloc_queue.queue
+            transfer_queue = self.scheduler.disagg_decode_transfer_queue.queue
+            prealloc_context_stats = batch_context_engineering_stats(
+                decode_req.req for decode_req in prealloc_queue
+            )
+            transfer_context_stats = batch_context_engineering_stats(
+                decode_req.req for decode_req in transfer_queue
+            )
             msg += f"pre-allocated usage: {self.scheduler.disagg_decode_prealloc_queue.num_tokens_pre_allocated / self.scheduler.max_total_num_tokens:.2f}, "
-            msg += f"#prealloc-req: {len(self.scheduler.disagg_decode_prealloc_queue.queue)}, "
-            msg += f"#transfer-req: {len(self.scheduler.disagg_decode_transfer_queue.queue)}, "
+            msg += f"#prealloc-req: {len(prealloc_queue)}, "
+            msg += f"#prealloc-main: {prealloc_context_stats['main']}, "
+            msg += f"#prealloc-compact: {prealloc_context_stats['compact']}, "
+            msg += f"#transfer-req: {len(transfer_queue)}, "
+            msg += f"#transfer-main: {transfer_context_stats['main']}, "
+            msg += f"#transfer-compact: {transfer_context_stats['compact']}, "
+            msg += f"#free-req-slots: {self.scheduler.req_to_token_pool.available_size()}, "
             msg += f"#retracted-req: {len(self.scheduler.disagg_decode_prealloc_queue.retracted_queue)}, "
 
         if (
