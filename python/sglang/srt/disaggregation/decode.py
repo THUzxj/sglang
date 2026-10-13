@@ -806,12 +806,18 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
         Match a request against the decode-side radix cache, lock the matched
         node to prevent eviction, and return the matched prefix information.
         """
+        match_full_kv_only = (
+            self.tree_cache.supports_mamba()
+            and not self.tree_cache.supports_swa()
+            and StateType.MAMBA in self.kv_manager.kv_args.state_types
+        )
         result = match_prefix_for_req(
             self.tree_cache,
             req,
             req.origin_input_ids,
-            cow_mamba=self.tree_cache.supports_mamba(),
+            cow_mamba=self.tree_cache.supports_mamba() and not match_full_kv_only,
             include_req=True,
+            match_full_kv_only=match_full_kv_only,
         )
         # Keep aggregated scheduling semantics while preserving the SWA lock
         # boundary needed for the matching dec_lock_ref; the full receipt
@@ -819,7 +825,9 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
         req.lock_receipt = self.tree_cache.inc_lock_ref(
             result.last_device_node
         ).to_dec_params()
-        return self._build_decode_prefix_match(req, result)
+        return self._build_decode_prefix_match(
+            req, result, match_full_kv_only=match_full_kv_only
+        )
 
     def _resolve_prefill_dp_rank(self, req: Req) -> Optional[int]:
         prefill_info = self.kv_manager.prefill_info_table.get(_bootstrap_addr(req))

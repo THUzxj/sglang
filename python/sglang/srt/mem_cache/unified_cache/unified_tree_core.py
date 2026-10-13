@@ -822,6 +822,12 @@ class UnifiedTreeCore(UnifiedTreeCoreInterface):
         key, _ = key.maybe_to_bigram_view(self.is_eagle)
         if len(key) == 0:
             return self._empty_match_result
+
+        match_components = (
+            (self.components_by_type[BASE_COMPONENT_TYPE],)
+            if params.match_full_kv_only
+            else self.components
+        )
         key = key.page_aligned(self.page_size)
         if len(key) == 0:
             return self._empty_match_result
@@ -833,7 +839,7 @@ class UnifiedTreeCore(UnifiedTreeCoreInterface):
             best_match_device_value_len,
             full_kv_hit_length,
             action,
-        ) = self._match_prefix_helper(key)
+        ) = self._match_prefix_helper(key, match_components)
         return self._match_post_processor(
             params,
             value,
@@ -842,10 +848,11 @@ class UnifiedTreeCore(UnifiedTreeCoreInterface):
             best_match_device_value_len,
             full_kv_hit_length,
             action,
+            match_components,
         )
 
     def _match_prefix_helper(
-        self, key: RadixKey
+        self, key: RadixKey, match_components: Sequence[TreeComponent]
     ) -> tuple[
         list[torch.Tensor],
         UnifiedTreeNode,
@@ -870,16 +877,16 @@ class UnifiedTreeCore(UnifiedTreeCoreInterface):
         separate_device_match = self.enable_hicache
         if separate_device_match:
             validators = tuple(
-                comp.create_match_validator() for comp in self.components
+                comp.create_match_validator() for comp in match_components
             )
             device_validators = tuple(
                 comp.create_match_validator(match_device_only=True)
-                for comp in self.components
+                for comp in match_components
             )
         else:
             validators = tuple(
                 comp.create_match_validator(match_device_only=True)
-                for comp in self.components
+                for comp in match_components
             )
 
         def _all_valid(validators, node):
@@ -969,9 +976,10 @@ class UnifiedTreeCore(UnifiedTreeCoreInterface):
         best_match_device_value_len: int,
         full_kv_hit_length: int,
         action: Optional[CacheAction | ComponentAction],
+        match_components: Sequence[TreeComponent],
     ) -> MatchResult:
         node_update = best_match_node
-        for comp in self.components:
+        for comp in match_components:
             if comp.component_type == BASE_COMPONENT_TYPE:
                 continue  # Full uses last_access_time, not LRU
             comp.refresh_lru(LRURefreshPhase.MATCH_END, node_update, self.root_node)
@@ -1003,7 +1011,7 @@ class UnifiedTreeCore(UnifiedTreeCoreInterface):
             full_kv_hit_length=full_kv_hit_length,
         )
 
-        for component in self.components:
+        for component in match_components:
             result = component.finalize_match_result_in_tree_core(
                 result=result,
                 params=params,
@@ -2400,7 +2408,11 @@ class UnifiedTreeCore(UnifiedTreeCoreInterface):
         )
 
     def build_load_back_spec(
-        self, node_id: NodeId, req: Optional[Req] = None
+        self,
+        node_id: NodeId,
+        req: Optional[Req] = None,
+        *,
+        full_kv_only: bool = False,
     ) -> tuple[PoolTransfer, dict[ComponentType, list[PoolTransfer]]]:
         """Build the H->D load-back KV transfer plus per-component aux transfers."""
         # Component hooks take primitives, not Req: extract its fields here.
@@ -2410,7 +2422,7 @@ class UnifiedTreeCore(UnifiedTreeCoreInterface):
             node, CacheTransferPhase.LOAD_BACK
         )[0]
         comp_xfers: dict[ComponentType, list[PoolTransfer]] = {}
-        for comp in self.components:
+        for comp in (() if full_kv_only else self.components):
             if comp.component_type == BASE_COMPONENT_TYPE:
                 continue
             t = comp.build_hicache_transfers(

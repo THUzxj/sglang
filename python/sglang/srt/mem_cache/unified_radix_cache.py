@@ -550,7 +550,9 @@ class UnifiedRadixCache(BasePrefixCache):
         same_results=["result.full_kv_hit_length", "result.swa_host_hit_length"],
     )
     def match_prefix(self, params: MatchPrefixParams) -> MatchResult:
-        result = self.session.try_match_prefix(params)
+        result = (
+            None if params.match_full_kv_only else self.session.try_match_prefix(params)
+        )
         if result is not None:
             return result
         if self.disable:
@@ -559,7 +561,12 @@ class UnifiedRadixCache(BasePrefixCache):
         # Apply the walk's actions (e.g. a pending write-through relocation on
         # a split) before the finalizers, which can evict or raise.
         self._apply_cache_actions(result.cache_actions)
-        for component in self._components_tuple:
+        match_components = (
+            (self.components[BASE_COMPONENT_TYPE],)
+            if params.match_full_kv_only
+            else self._components_tuple
+        )
+        for component in match_components:
             result = component.finalize_match_result_in_cache(params, result)
         # Finalizers must not emit actions; the walk's were applied above.
         assert not result.cache_actions
@@ -1732,6 +1739,9 @@ class UnifiedRadixCache(BasePrefixCache):
         node_id: NodeId,
         mem_quota: Optional[int] = None,
         req=None,
+        *,
+        full_kv_only: bool = False,
+        force: bool = False,
     ) -> bool:
         """Load evicted KV data from host back to device (H→D)."""
         if self.cache_controller is None:
@@ -1745,9 +1755,14 @@ class UnifiedRadixCache(BasePrefixCache):
 
         # Let each component pre-allocate per-request state for the load-back;
         # the finally below lets components recover it unless the load succeeds.
+        load_components = (
+            (self.components[BASE_COMPONENT_TYPE],)
+            if full_kv_only
+            else self._components_tuple
+        )
         preps: dict[ComponentType, PrepareLoadBackResult] = {
             comp.component_type: comp.prepare_load_back(node_id, req=req)
-            for comp in self._components_tuple
+            for comp in load_components
         }
         success = False
         try:
@@ -1758,10 +1773,12 @@ class UnifiedRadixCache(BasePrefixCache):
                 result=result,
                 ancestor_lock_params=ancestor_lock_params,
                 host_anchor_params=host_anchor_params,
+                full_kv_only=full_kv_only,
+                force=force,
             )
             return success
         finally:
-            for comp in self._components_tuple:
+            for comp in load_components:
                 comp.finalize_load_back(req, preps[comp.component_type], success)
 
     def _load_back_transfers(
@@ -1773,9 +1790,13 @@ class UnifiedRadixCache(BasePrefixCache):
         result: IncLockRefResult,
         ancestor_lock_params: DecLockRefParams,
         host_anchor_params: DecLockRefParams,
+        full_kv_only: bool,
+        force: bool,
     ) -> bool:
         # Build the KV + per-component aux transfers.
-        kv_xfer, comp_xfers = self.tree_core.build_load_back_spec(node_id, req=req)
+        kv_xfer, comp_xfers = self.tree_core.build_load_back_spec(
+            node_id, req=req, full_kv_only=full_kv_only
+        )
         kv_tokens = len(kv_xfer.host_indices)
         sidecar_xfers = self._build_sidecar_transfers(
             CacheTransferPhase.LOAD_BACK, kv_xfer, comp_xfers
@@ -1786,7 +1807,10 @@ class UnifiedRadixCache(BasePrefixCache):
         # when the Full-KV load is skipped by thresholding. max(1, ...): an
         # entirely empty spec (e.g. foreign-pin rejection) must never report
         # success, even at load_back_threshold <= 0.
-        if (kv_tokens < max(1, self.load_back_threshold) and not comp_xfers) or (
+        if (
+            not comp_xfers
+            and (kv_tokens == 0 or (not force and kv_tokens < self.load_back_threshold))
+        ) or (
             mem_quota is not None and kv_tokens + result.delta > mem_quota
         ):
             self.dec_lock_ref(node_id, ancestor_lock_params)
@@ -3424,7 +3448,13 @@ class UnifiedRadixCache(BasePrefixCache):
                 and (req.swa_host_hit_length > 0 or req.mamba_host_hit_length > 0)
             )
         ):
-            if self.load_back(best_match_node_id, mem_quota, req=req):
+            if self.load_back(
+                best_match_node_id,
+                mem_quota,
+                req=req,
+                full_kv_only=params.full_kv_only,
+                force=params.force,
+            ):
                 new_indices = self.tree_core.collect_full_device_indices(
                     best_match_node_id, last_best_match_device_node_id
                 )

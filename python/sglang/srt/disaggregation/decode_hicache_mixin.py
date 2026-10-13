@@ -31,6 +31,7 @@ class DecodePrefixMatch:
     last_device_node: Any
     last_host_node: Any = None
     prefetch_registered: bool = False
+    match_full_kv_only: bool = False
 
     @property
     def l1_prefix_len(self) -> int:
@@ -61,7 +62,9 @@ class HiCacheRestoreResult(Enum):
 class DecodeHiCachePreallocMixin:
     """HiCache hooks for ``DecodePreallocQueue``: issue prefetch + reserve tokens."""
 
-    def _build_decode_prefix_match(self, req: Req, result: Any) -> DecodePrefixMatch:
+    def _build_decode_prefix_match(
+        self, req: Req, result: Any, *, match_full_kv_only: bool = False
+    ) -> DecodePrefixMatch:
         """Convert a ``match_prefix_for_req`` result into ``DecodePrefixMatch``.
 
         Performs the optional L3 storage hit length query when decode-side
@@ -103,6 +106,7 @@ class DecodeHiCachePreallocMixin:
             last_host_node=(
                 result.last_host_node if l3_storage_hit_length > 0 else None
             ),
+            match_full_kv_only=match_full_kv_only,
         )
 
     def _start_hicache_prefetch(
@@ -221,12 +225,15 @@ class DecodeHiCacheTransferMixin:
             dr.req.origin_input_ids,
             cow_mamba=False,
             include_req=True,
+            match_full_kv_only=pm.match_full_kv_only,
         )
-        new_indices, restored_node = self.tree_cache.init_load_back(
+        load_result = self.tree_cache.init_load_back(
             InitLoadBackParams(
                 best_match_node=rematch.best_match_node,
                 host_hit_length=rematch.host_hit_length,
                 req=dr.req,
+                full_kv_only=pm.match_full_kv_only,
+                force=pm.restore_token_count > 0,
             )
         )
         # The rematch repointed req.last_node to feed init_load_back's device
@@ -235,6 +242,10 @@ class DecodeHiCacheTransferMixin:
         # before the commit hands over the restored lock hits the right node
         # (the receipt's anchor makes a mispaired release assert).
         dr.req.last_node = pm.last_device_node
+        if load_result is None:
+            dr.hicache_restore_status = HiCacheRestoreResult.FAILED
+            return False
+        new_indices, restored_node = load_result
         # Failback: total coverage < required prefix means device alloc likely failed.
         if len(rematch.device_indices) + len(new_indices) < pm.decode_prefix_len:
             logger.warning(

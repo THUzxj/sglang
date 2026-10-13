@@ -70,6 +70,7 @@ class MatchPrefixParams:
     # Mamba specific
     cow_mamba: bool = False
     req: Optional[Req] = None
+    match_full_kv_only: bool = False
 
 
 @dataclasses.dataclass
@@ -251,6 +252,8 @@ class InitLoadBackParams:
     host_hit_length: int
     mem_quota: Optional[int] = None
     req: Optional[Req] = None
+    full_kv_only: bool = False
+    force: bool = False
 
 
 class MatchResult(NamedTuple):
