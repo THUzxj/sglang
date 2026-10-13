@@ -1133,6 +1133,7 @@ class Req(ReqDllmMixin):
         self.context_engineering_kind = self._derive_context_engineering_kind()
         self.context_engineering_pair_key = self._derive_context_engineering_pair_key()
         self.allow_compact_drain = self._derive_allow_compact_drain()
+        self.is_context_engineering_paused = False
 
         # Lazy extra buffer: skip radix cache insert when prealloc failed at
         # boundary — the forward overwrites the only slot, corrupting the state.
@@ -3345,7 +3346,9 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
             spec_algorithm=self.spec_algorithm,
         )
 
-    def retract_decode(self) -> Tuple[List[Req], float, List[Req]]:
+    def retract_decode(
+        self, preferred_pair_key: Optional[str] = None
+    ) -> Tuple[List[Req], float, List[Req]]:
         """Retract the decoding requests when there is not enough memory."""
         sorted_indices = self._get_decode_retraction_order(self.reqs)
         sorted_indices = beam_retraction_order(sorted_indices, self.reqs)
@@ -3353,7 +3356,7 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
         retracted_reqs = []
         reqs_to_abort: List[Req] = []
         first_iter = True
-        continue_pair_key = None
+        continue_pair_key = preferred_pair_key
         while first_iter or (
             not self.check_decode_mem(selected_indices=sorted_indices)
         ):
