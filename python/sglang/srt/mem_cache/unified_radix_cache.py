@@ -38,7 +38,12 @@ from sglang.srt.mem_cache.buffer_mode.storage_existence_cache import (
     StorageExistenceCache,
 )
 from sglang.srt.mem_cache.common import RetractionBackup
-from sglang.srt.mem_cache.hicache_storage import PoolName, PoolTransfer, SidecarPoolSpec
+from sglang.srt.mem_cache.hicache_storage import (
+    PoolHitPolicy,
+    PoolName,
+    PoolTransfer,
+    SidecarPoolSpec,
+)
 from sglang.srt.mem_cache.hybrid_cache.hybrid_cache_controller import (
     HybridCacheController,
     PPPrefetchDecision,
@@ -2025,11 +2030,25 @@ class UnifiedRadixCache(BasePrefixCache):
         if len(prefetch_key) < self.prefetch_threshold:
             return 0
 
+        # A hybrid prefix is usable only when its trailing Mamba checkpoint
+        # exists as well as its Full KV pages.
+        extra_pools = (
+            [
+                PoolTransfer(
+                    name=PoolName.MAMBA,
+                    keys=["__trailing_page__"],
+                    hit_policy=PoolHitPolicy.TRAILING_PAGES,
+                )
+            ]
+            if ComponentType.MAMBA in self.tree_components
+            else None
+        )
         operation = PrefetchOperation(
             CacheRequestHandle("__storage_hit_query__", 0),
             prefetch_key,
             last_hash,
             prefix_keys,
+            pool_transfers=extra_pools,
         )
         _, storage_hit_count = self.cache_controller._storage_hit_query(operation)
         storage_hit_count_tensor = torch.tensor(storage_hit_count, dtype=torch.int)
