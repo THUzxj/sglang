@@ -1384,6 +1384,26 @@ class UnifiedRadixCache(BasePrefixCache):
         self._free_values(result.device_frees, result.host_frees)
         return result.tracker.get(component_type, 0)
 
+    def protect_cache_paused_node(self, node_id: NodeId) -> Optional[DecLockRefParams]:
+        """Keep a paused request's L2 checkpoint while its L1 KV stays evictable."""
+        if self.cache_controller is None or self.host_memory_mode == "buffer_only":
+            return None
+        node = self.tree_core.node_by_id(node_id)
+        needs_mamba_backup = (
+            self.supports_mamba()
+            and node.component_data[ComponentType.MAMBA].host_value is None
+        )
+        if not node.backuped or needs_mamba_backup:
+            self.backup_node_for_write_back(node_id)
+        if not node.backuped:
+            return None
+        if (
+            self.supports_mamba()
+            and node.component_data[ComponentType.MAMBA].host_value is None
+        ):
+            return None
+        return self.inc_host_lock_ref(node_id).to_dec_params()
+
     # ---- Decode retraction ----
 
     def supports_retraction_backup(self) -> bool:
