@@ -70,6 +70,8 @@ class InsertParams:
 
     # Mamba specific
     mamba_value: Optional[torch.Tensor] = None
+    mamba_request_id: Optional[str] = None
+    mamba_req_pool_idx: Optional[int] = None
 
     # SWA specific
     prev_prefix_len: int = 0

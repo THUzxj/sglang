@@ -102,6 +102,10 @@ class PoolStats:
                 ]
             parts += [
                 f"mamba num: {self.mamba_num_used}",
+                # Includes active and radix-cached slots currently allocated
+                # from the active Mamba pool.
+                "mamba allocated: "
+                f"{self.mamba_num_used + self.mamba_evictable_size}",
                 f"mamba usage: {self.mamba_usage:.2f}",
             ]
         if self.is_hisparse:

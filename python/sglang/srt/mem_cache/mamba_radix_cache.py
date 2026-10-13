@@ -80,6 +80,8 @@ class TreeNode:
         self.key: RadixKey = None
         self.value: Optional[torch.Tensor] = None
         self.mamba_value: Optional[torch.Tensor] = None
+        self.mamba_request_id: Optional[str] = None
+        self.mamba_req_pool_idx: Optional[int] = None
         self.mamba_host_value: Optional[torch.Tensor] = None
         # invariant: for any node, if mamba_lock_ref is locked, full_lock_ref must be locked;
         # if full_lock_ref is locked, mamba_lock_ref doesn't need to be locked. So,
@@ -544,12 +546,15 @@ class MambaRadixCache(KVCacheEventMixin, BasePrefixCache):
         key = params.key
         value = params.value
         mamba_value = params.mamba_value
+        mamba_request_id = params.mamba_request_id
+        mamba_req_pool_idx = params.mamba_req_pool_idx
         prev_prefix_len = params.prev_prefix_len
 
         if value is None:
             value = torch.tensor([x for x in key.raw_token_ids()], dtype=torch.int64)
         prefix_len, mamba_exist = self._insert_helper(
-            self.root_node, key, value, mamba_value, params.chunked, prev_prefix_len
+            self.root_node, key, value, mamba_value, params.chunked, prev_prefix_len,
+            mamba_request_id, mamba_req_pool_idx
         )
         return InsertResult(prefix_len=prefix_len, mamba_exist=mamba_exist)
 
@@ -645,6 +650,8 @@ class MambaRadixCache(KVCacheEventMixin, BasePrefixCache):
                     key=RadixKey(token_ids[:page_aligned_len], req.extra_key),
                     value=page_aligned_kv_indices,
                     mamba_value=mamba_value,
+                    mamba_request_id=getattr(req, "rid", None),
+                    mamba_req_pool_idx=getattr(req, "req_pool_idx", None),
                     prev_prefix_len=req.cache_protected_len,
                 )
             )
@@ -755,6 +762,8 @@ class MambaRadixCache(KVCacheEventMixin, BasePrefixCache):
                 key=RadixKey(page_aligned_token_ids, req.extra_key),
                 value=page_aligned_kv_indices,
                 mamba_value=mamba_value_donated,
+                mamba_request_id=getattr(req, "rid", None),
+                mamba_req_pool_idx=getattr(req, "req_pool_idx", None),
                 prev_prefix_len=req.cache_protected_len,
                 chunked=chunked,
             )
@@ -820,7 +829,7 @@ class MambaRadixCache(KVCacheEventMixin, BasePrefixCache):
         # Tree values are page-aligned copies of a kv row: page-exact segment.
         self.token_to_kv_pool_allocator.free_segment(x.value, start_pos=0)
         full_num_evicted = len(x.value)
-        self._free_mamba_value(x.mamba_value)
+        self._free_mamba_node(x)
         mamba_num_evicted = len(x.mamba_value)
 
         # 2. get the next node, update the lru lists
@@ -873,7 +882,7 @@ class MambaRadixCache(KVCacheEventMixin, BasePrefixCache):
 
             if len(x.children) > 0:
                 # 1. an internal node, free mamba tokens.
-                self._free_mamba_value(x.mamba_value)
+                self._free_mamba_node(x)
                 mamba_num_evicted += len(x.mamba_value)
 
                 # 2. get the next node, update the lru lists
@@ -1080,6 +1089,23 @@ class MambaRadixCache(KVCacheEventMixin, BasePrefixCache):
         else:
             self.req_to_token_pool.mamba_allocator.free(mamba_value)
 
+    def _free_mamba_node(self, node: TreeNode) -> None:
+        """Free a cached state while attributing it to its creator request."""
+        logger.info(
+            "Mamba radix eviction: node_id=%s request_id=%s req_pool_idx=%s "
+            "mamba_states=%d",
+            node.id,
+            node.mamba_request_id,
+            node.mamba_req_pool_idx,
+            len(node.mamba_value),
+        )
+        with self.req_to_token_pool.mamba_allocator.event_context(
+            "mamba_cache_node",
+            request_id=node.mamba_request_id,
+            req_pool_idx=node.mamba_req_pool_idx,
+        ):
+            self._free_mamba_value(node.mamba_value)
+
     def _match_prefix_helper(
         self, key: RadixKey, match_full_kv_only: bool = False
     ) -> Tuple[List[torch.Tensor], TreeNode, int]:
@@ -1248,6 +1274,8 @@ class MambaRadixCache(KVCacheEventMixin, BasePrefixCache):
         mamba_value,
         chunked: bool = False,
         prev_prefix_len: int = 0,
+        mamba_request_id: Optional[str] = None,
+        mamba_req_pool_idx: Optional[int] = None,
     ) -> Tuple[int, bool]:
         # Refresh the full LRU from root to leaf (the whole path is reused as prefix).
         # The mamba states of these existing nodes were not recomputed this insert, so
@@ -1296,6 +1324,8 @@ class MambaRadixCache(KVCacheEventMixin, BasePrefixCache):
             new_node.key = key
             new_node.value = value.clone()
             new_node.mamba_value = mamba_value
+            new_node.mamba_request_id = mamba_request_id
+            new_node.mamba_req_pool_idx = mamba_req_pool_idx
             self.full_lru_list.insert_mru(new_node)
             self.mamba_lru_list.insert_mru(new_node)
             node.children[child_key] = new_node
@@ -1304,6 +1334,8 @@ class MambaRadixCache(KVCacheEventMixin, BasePrefixCache):
             self._record_store_event(new_node)
         elif node.mamba_value is None:  # add for mamba tombstone
             node.mamba_value = mamba_value
+            node.mamba_request_id = mamba_request_id
+            node.mamba_req_pool_idx = mamba_req_pool_idx
             self.full_lru_list.reset_node_mru(node)
             self.mamba_lru_list.insert_mru(node)
             self.mamba_evictable_size_ += len(mamba_value)
