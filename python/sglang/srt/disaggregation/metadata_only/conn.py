@@ -302,16 +302,8 @@ class MetadataOnlyKVManager(CommonKVManager):
                 try:
                     room = int(msg[1].decode("ascii"))
                     dst_aux_index = int(msg[2].decode("ascii"))
-                    pp_rank = int(msg[3].decode("ascii"))
+                    _pp_rank = int(msg[3].decode("ascii"))
                     frames = msg[4:]
-                    logger.debug(
-                        "metadata_only received aux metadata: room=%s "
-                        "dst_aux_index=%s pp_rank=%s frames=%s",
-                        room,
-                        dst_aux_index,
-                        pp_rank,
-                        _frame_summary(frames),
-                    )
                     if self.metadata_buffers is None:
                         raise RuntimeError("metadata buffers are not registered")
                     slots = _metadata_slots(self.metadata_buffers, dst_aux_index)
@@ -324,13 +316,6 @@ class MetadataOnlyKVManager(CommonKVManager):
                         _copy_bytes_to_tensor(frame, slot)
                     self.metadata_buffers.bootstrap_room[dst_aux_index, 0] = room
                     self.update_status(room, KVPoll.Success)
-                    logger.debug(
-                        "metadata_only applied aux metadata: room=%s "
-                        "dst_aux_index=%s status=%s",
-                        room,
-                        dst_aux_index,
-                        self.check_status(room),
-                    )
                 except Exception as exc:
                     logger.exception("Failed to apply metadata-only aux payload")
                     if "room" in locals():
@@ -498,24 +483,6 @@ class MetadataOnlyKVReceiver(CommonKVReceiver):
         for bootstrap_info in self.bootstrap_infos:
             sock, lock = self._connect_to_bootstrap_server(bootstrap_info)
             is_dummy = bootstrap_info["is_dummy"]
-            logger.debug(
-                "metadata_only sending decode metadata: room=%s "
-                "prefill_rank=%s:%s decode_rank=%s:%s aux_index=%s "
-                "dst_pages=%s state_indices=%s packed_state_bytes=%s "
-                "decode_prefix_len=%s is_dummy=%s required_dst_info_num=%s",
-                self.bootstrap_room,
-                bootstrap_info.get("rank_ip"),
-                bootstrap_info.get("rank_port"),
-                self.kv_mgr.local_ip,
-                self.kv_mgr.rank_port,
-                aux_index,
-                _array_summary(kv_indices if not is_dummy else np.array([], dtype=np.int32)),
-                _state_indices_summary(state_indices if not is_dummy else None),
-                len(packed_state_indices) if not is_dummy else 0,
-                decode_prefix_len or 0,
-                is_dummy,
-                self.required_dst_info_num,
-            )
             try:
                 with lock:
                     sock.send_multipart(
