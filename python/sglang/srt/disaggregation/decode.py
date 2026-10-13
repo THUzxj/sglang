@@ -608,13 +608,35 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
             token_ids,
             match_full_kv_only=match_full_kv_only,
         )
+        # Make prefix misses actionable without inferring eviction causality from
+        # a single match.  The status describes the longest observable KV path
+        # and whether a host/storage fallback contributed to the match.
+        expected_kv_len = len(token_ids)
+        missing_kv_len = max(0, expected_kv_len - result.full_kv_hit_length)
+        has_l2 = prefix_match.l2_host_hit_length > 0
+        has_l3 = prefix_match.l3_storage_hit_length > 0
+        has_fallback = has_l2 or has_l3
+        if missing_kv_len == 0:
+            kv_match_status = "full"
+        elif prefix_match.l1_prefix_len > 0 and has_fallback:
+            kv_match_status = "partial_device_with_fallback"
+        elif prefix_match.l1_prefix_len > 0:
+            kv_match_status = "partial_device_only"
+        elif has_l2:
+            kv_match_status = "partial_host_only"
+        elif has_l3:
+            kv_match_status = "partial_storage_only"
+        else:
+            kv_match_status = "no_prefix"
+        kv_fallback = "l2+l3" if has_l2 and has_l3 else "l2" if has_l2 else "l3" if has_l3 else "none"
         if self.scheduler.metrics_reporter.is_stats_logging_rank:
             logger.info(
                 "Decode prefix match: rid=%s kind=%s pair_key=%s mode=%s "
                 "input_len=%d l1_hit=%d l2_hit=%d l3_hit=%d "
                 "decode_prefix_len=%d full_kv_hit=%d "
                 "mamba_host_hit=%d mamba_branching_seqlen=%s "
-                "cache_protected_len=%s",
+                "cache_protected_len=%s kv_match_status=%s "
+                "kv_missing_tokens=%d kv_fallback=%s",
                 req.rid,
                 "compact" if req.is_context_engineering_compact() else "main",
                 req.context_engineering_pair_key,
@@ -628,6 +650,9 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
                 result.mamba_host_hit_length,
                 result.mamba_branching_seqlen,
                 result.cache_protected_len,
+                kv_match_status,
+                missing_kv_len,
+                kv_fallback,
             )
         return prefix_match
 
@@ -815,7 +840,14 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
             available = self.token_to_kv_pool_allocator.available_size()
             if available + self.tree_cache.full_evictable_size() < needed:
                 return False
-            self._pre_alloc(req, full_match.device_indices, prefix_len, length)
+            if (
+                self._pre_alloc(req, full_match.device_indices, prefix_len, length)
+                is None
+            ):
+                self.req_to_token_pool.free(req)
+                req.kv = None
+                req.kv_committed_len = 0
+                return False
             allocated = True
             # [0, length) is still owned by the locked radix node. Mark it as
             # protected exactly as pop_preallocated does for ordinary
@@ -985,10 +1017,18 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
             if uses_swa_tail_prealloc and swa_required > swa_allocatable_tokens:
                 break
 
+            if self._pre_alloc(req) is None:
+                # Keep the request in the retracted queue for a later retry.
+                # _pre_alloc has already reserved a request-pool slot, so
+                # release it before abandoning this attempt.
+                self.req_to_token_pool.free(req)
+                req.kv = None
+                req.kv_committed_len = 0
+                break
+
             resumed_reqs.append(req)
             indices_to_remove.add(i)
             req.is_retracted = False
-            self._pre_alloc(req)
             full_allocatable_tokens -= full_required
             if uses_swa_tail_prealloc:
                 swa_allocatable_tokens -= swa_required
@@ -1381,6 +1421,14 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
                     "for PD + chunked prefill."
                 )
 
+            # Resolve storage prefetch before allocation. A rejected prefetch
+            # can remove the L3 portion of the prefix, which must be reflected
+            # in allocation and PD metadata below.
+            if self.scheduler.enable_decode_hicache:
+                self._start_hicache_prefetch(decode_req.req, prefix_match)
+                if prefix_match is not None:
+                    total_prefix_len = prefix_match.decode_prefix_len
+
             dst_kv_indices = self._pre_alloc(
                 decode_req.req,
                 prefix_indices,
@@ -1394,12 +1442,13 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
                 self.req_to_token_pool.free(decode_req.req)
                 decode_req.req.kv = None
                 decode_req.req.kv_committed_len = 0
+                if prefix_match is not None and prefix_match.prefetch_registered:
+                    self.tree_cache.release_aborted_request(decode_req.req.rid)
+                    prefix_match.prefetch_registered = False
                 if prefix_len > 0:
                     self._release_prefix_lock(decode_req.req)
                 break
             decode_req.prefix_match = prefix_match
-            if self.scheduler.enable_decode_hicache:
-                self._start_hicache_prefetch(decode_req.req, prefix_match)
             hisparse_req_budget -= 1
             # Recompute from actual pool state for the next queue entry.
             # This accounts for page rounding and newly locked evictable cache.
@@ -1858,7 +1907,7 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
         prefix_indices: Optional[torch.Tensor] = None,
         prefix_len: Optional[int] = None,
         total_prefix_len: Optional[int] = None,
-    ) -> torch.Tensor:
+    ) -> Optional[torch.Tensor]:
         """Pre-allocate the memory for req_to_token and token_kv_pool.
 
         ``prefix_len`` is the L1 device-resident prefix length (already
@@ -1956,16 +2005,23 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
                 swa_tail_len=swa_tail_len,
                 req_to_token_pool=self.req_to_token_pool,
             )
-        assert kv_loc is not None, (
-            f"KV cache is full! Bug in memory estimation. "
-            f"available={self.token_to_kv_pool_allocator.available_size()}, "
-            f"evictable={self.tree_cache.evictable_size()}, "
-            f"protected={self.tree_cache.protected_size()}, "
-            f"required_alloc={required_alloc_tokens}, delta={delta_len}, "
-            f"fill={fill_len}, prefix={prefix_len}, total_prefix={total_prefix_len}, "
-            f"page_size={self.token_to_kv_pool_allocator.page_size}, "
-            f"req={req.rid}"
-        )
+        if kv_loc is None:
+            logger.warning(
+                "Decode KV allocation deferred: "
+                "available=%s evictable=%s protected=%s required_alloc=%s "
+                "delta=%s fill=%s prefix=%s total_prefix=%s page_size=%s req=%s",
+                self.token_to_kv_pool_allocator.available_size(),
+                self.tree_cache.evictable_size(),
+                self.tree_cache.protected_size(),
+                required_alloc_tokens,
+                delta_len,
+                fill_len,
+                prefix_len,
+                total_prefix_len,
+                self.token_to_kv_pool_allocator.page_size,
+                req.rid,
+            )
+            return None
 
         self.req_to_token_pool.write(
             (
