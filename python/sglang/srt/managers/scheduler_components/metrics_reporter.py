@@ -15,6 +15,7 @@ import msgspec
 from sglang.srt.disaggregation.utils import DisaggregationMode
 from sglang.srt.environ import envs
 from sglang.srt.eplb.expert_distribution import EPLB_BALANCEDNESS_WINDOW_SIZES
+from sglang.srt.managers.pair_scheduler import batch_context_engineering_stats
 from sglang.srt.managers.schedule_batch import ScheduleBatch
 from sglang.srt.managers.utils import GenerationBatchResult
 from sglang.srt.observability.metrics_collector import (
@@ -714,6 +715,9 @@ class SchedulerMetricsReporter:
             else self.scheduler.forward_ct
         )
         iter_msg = f" [{batch_iter}]" if LOG_FORWARD_ITERS else ""
+        queue_context_stats = batch_context_engineering_stats(
+            self.scheduler.waiting_queue
+        )
 
         msg = (
             f"Prefill batch{iter_msg}, "
@@ -723,6 +727,9 @@ class SchedulerMetricsReporter:
             f"{token_usage_msg}"
             f"#running-req: {prefill_stats.num_running_reqs.total}, "
             f"#queue-req: {len(self.scheduler.waiting_queue)}, "
+            f"#queue-main-req: {queue_context_stats['main']}, "
+            f"#queue-ce-req: {queue_context_stats['compact']}, "
+            f"#queue-other-req: {queue_context_stats['foreground']}, "
             f"#pending-token: {prefill_stats.num_pending_tokens}, "
         )
 
@@ -991,9 +998,22 @@ class SchedulerMetricsReporter:
 
         if self.scheduler.disaggregation_mode == DisaggregationMode.DECODE:
             self._update_decode_queue_stats(self.scheduler.enable_priority_scheduling)
+            prealloc_queue = self.scheduler.disagg_decode_prealloc_queue.queue
+            transfer_queue = self.scheduler.disagg_decode_transfer_queue.queue
+            prealloc_context_stats = batch_context_engineering_stats(
+                decode_req.req for decode_req in prealloc_queue
+            )
+            transfer_context_stats = batch_context_engineering_stats(
+                decode_req.req for decode_req in transfer_queue
+            )
             msg += f"pre-allocated usage: {self.scheduler.disagg_decode_prealloc_queue.num_tokens_pre_allocated / self.scheduler.max_total_num_tokens:.2f}, "
-            msg += f"#prealloc-req: {len(self.scheduler.disagg_decode_prealloc_queue.queue)}, "
-            msg += f"#transfer-req: {len(self.scheduler.disagg_decode_transfer_queue.queue)}, "
+            msg += f"#prealloc-req: {len(prealloc_queue)}, "
+            msg += f"#prealloc-main: {prealloc_context_stats['main']}, "
+            msg += f"#prealloc-compact: {prealloc_context_stats['compact']}, "
+            msg += f"#transfer-req: {len(transfer_queue)}, "
+            msg += f"#transfer-main: {transfer_context_stats['main']}, "
+            msg += f"#transfer-compact: {transfer_context_stats['compact']}, "
+            msg += f"#free-req-slots: {self.scheduler.req_to_token_pool.available_size()}, "
             if get_disagg().disaggregation_decode_host_receive_threshold > 0:
                 msg += f"#host-receive-req: {self.stats.num_decode_host_receive_queue_reqs.total}, "
             msg += f"#retracted-req: {len(self.scheduler.disagg_decode_prealloc_queue.retracted_queue)}, "
