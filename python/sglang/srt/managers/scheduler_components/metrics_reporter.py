@@ -690,6 +690,13 @@ class SchedulerMetricsReporter:
         now = time.perf_counter()
         gap_latency = now - self.last_prefill_stats_tic
         self.last_prefill_stats_tic = now
+        batch_start_end_latency = (
+            batch.finish_ts - batch.launch_ts
+            if batch is not None
+            and batch.launch_ts is not None
+            and batch.finish_ts is not None
+            else 0.0
+        )
         self.last_input_throughput = (
             (prefill_stats.log_input_tokens + prefill_stats.log_replay_tokens)
             / gap_latency
@@ -821,6 +828,8 @@ class SchedulerMetricsReporter:
             )
             self.stats.num_grammar_queue_reqs = len(self.scheduler.grammar_manager)
             self.stats.cache_hit_rate = cache_hit_rate
+            self.stats.prefill_input_throughput_window_s = gap_latency
+            self.stats.prefill_batch_start_end_s = batch_start_end_latency
             # Refresh here too: prefill-heavy stretches can run long between
             # decode-stats ticks, and the gauge must decay rather than hold.
             self.stats.gen_throughput = self._current_gen_throughput(now)

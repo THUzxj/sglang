@@ -2483,6 +2483,7 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
     prefill_stats: Optional[PrefillStats] = None
     forward_iter: Optional[int] = None
     launch_ts: Optional[float] = None
+    finish_ts: Optional[float] = None
     after_idle_gap: bool = False
 
     # === GPU tensors crossing to ForwardBatch (clone targets for stream isolation) ===
@@ -4012,6 +4013,7 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
             fpm_start_time=self.fpm_start_time,
             forward_iter=self.forward_iter,
             launch_ts=self.launch_ts,
+            finish_ts=self.finish_ts,
             after_idle_gap=self.after_idle_gap,
             split_prefill_start=self.split_prefill_start,
             extend_num_tokens=self.extend_num_tokens,

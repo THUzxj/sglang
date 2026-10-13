@@ -5112,6 +5112,7 @@ class Scheduler(
                     can_run_cuda_graph=can_run_cuda_graph,
                 )
 
+        batch.finish_ts = time.monotonic()
         self._maybe_report_active_ranks()
 
         return ret
