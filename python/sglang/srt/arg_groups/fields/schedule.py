@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from typing import (
     List,
+    Literal,
     Optional,
 )
 
@@ -79,6 +80,47 @@ class Schedule(msgspec.Struct):
         Optional[int],
         "The maximum number of requests in a prefill batch. If not specified, there is no limit.",
     ] = None
+    enable_pair_scheduler: A[
+        bool,
+        "Enable pair scheduling for context-engineering main and compact requests.",
+    ] = False
+    context_engineering_compact_starvation_threshold_seconds: A[
+        float,
+        "Waiting time before a higher-priority compact may pass a main in prefill.",
+    ] = 60.0
+    context_engineering_compact_pause_mode: A[
+        Literal["retract", "gpu_resident", "radix_evictable"],
+        Arg(
+            help="How to park compact decode requests when their paired main is absent.",
+            choices=["retract", "gpu_resident", "radix_evictable"],
+        ),
+    ] = "retract"
+    context_engineering_decode_attention_token_budget: A[
+        Optional[int],
+        Arg(
+            help="Maximum attention tokens in compact-aware decode admission.",
+            type_parser=human_readable_int,
+        ),
+    ] = None
+    context_engineering_prefill_attention_token_budget: A[
+        Optional[int],
+        Arg(
+            help="Attention-token budget for compact prefill admission.",
+            type_parser=human_readable_int,
+        ),
+    ] = None
+    context_engineering_compact_decode_max_batch_size: A[
+        int,
+        "Maximum compact requests in a decode batch.",
+    ] = 256
+    context_engineering_main_turn_decode_max_batch_size: A[
+        Optional[int],
+        "Optional separate limit on CE main requests in a decode batch.",
+    ] = None
+    context_engineering_compact_attention_cost_ratio: A[
+        float,
+        "Accounting multiplier for compact attention-token admission cost.",
+    ] = 1.0
     schedule_policy: A[
         str,
         Arg(

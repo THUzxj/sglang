@@ -222,6 +222,30 @@ def check_server_args(server_args: Any):
             "--retraction-policy priority requires --enable-priority-scheduling"
         )
 
+    if cfg.context_engineering_compact_starvation_threshold_seconds < 0:
+        raise ValueError(
+            "--context-engineering-compact-starvation-threshold-seconds must be non-negative"
+        )
+    if cfg.context_engineering_compact_pause_mode == "radix_evictable":
+        if not cfg.enable_pair_scheduler or not cfg.enable_hierarchical_cache:
+            raise ValueError(
+                "radix_evictable compact pause requires pair scheduling and HiCache"
+            )
+        if (
+            cfg.disaggregation_mode == "decode"
+            and not cfg.disaggregation_decode_enable_radix_cache
+        ):
+            raise ValueError(
+                "PD decode radix_evictable compact pause requires decode radix cache"
+            )
+    if (
+        cfg.context_engineering_main_turn_decode_max_batch_size is not None
+        and cfg.context_engineering_main_turn_decode_max_batch_size <= 0
+    ):
+        raise ValueError(
+            "--context-engineering-main-turn-decode-max-batch-size must be positive"
+        )
+
     # Check hisparse
     # Moved to the resolution pipeline (arg_groups/overrides.py:
     # _hisparse_validation), invoked here at its legacy slot.
