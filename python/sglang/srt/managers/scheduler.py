@@ -117,6 +117,10 @@ from sglang.srt.lora.lora_drainer import LoRADrainer
 from sglang.srt.lora.lora_overlap_loader import LoRAOverlapLoader
 from sglang.srt.managers.disagg_service import maybe_create_ascend_config_store
 from sglang.srt.managers.hisparse_coordinator import HiSparseCoordinator
+from sglang.srt.managers.pair_scheduler import (
+    order_prefill_waiting_queue,
+    should_try_prefill_request,
+)
 from sglang.srt.managers.io_struct import (
     AbortReq,
     ActiveRanksOutput,
@@ -3882,6 +3886,15 @@ class Scheduler(
             running_batch,
             processed_tokens=self.processed_tokens_counter,
         )
+        if get_schedule().enable_pair_scheduler:
+            self.waiting_queue[:] = order_prefill_waiting_queue(
+                self.waiting_queue,
+                compact_starvation_threshold_seconds=(
+                    get_schedule().context_engineering_compact_starvation_threshold_seconds
+                ),
+                enable_priority_scheduling=self.enable_priority_scheduling,
+                schedule_low_priority_values_first=self.schedule_low_priority_values_first,
+            )
 
         if TEST_RETRACT and running_bs > TEST_RETRACT_NO_PREFILL_BS:
             # If we are testing retraction and the running batch size exceeds
@@ -4005,6 +4018,24 @@ class Scheduler(
                     # Cache-mode host memory is a resident L2 tier. Buffer mode
                     # marks the staged span below once it is surfaced.
                     req.host_hit_is_storage = False
+
+            if (
+                get_schedule().enable_pair_scheduler
+                and req.is_context_engineering_compact()
+                and not should_try_prefill_request(
+                    req,
+                    can_run_reqs=adder.can_run_list,
+                    running_reqs=running_batch.reqs,
+                    waiting_queue=self.waiting_queue,
+                    attention_budget=(
+                        get_schedule().context_engineering_prefill_attention_token_budget
+                    ),
+                    compact_attention_cost_ratio=(
+                        get_schedule().context_engineering_compact_attention_cost_ratio
+                    ),
+                )
+            ):
+                continue
 
             req.init_next_round_input(self.tree_cache)
             if self.enable_hicache_storage and (
