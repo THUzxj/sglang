@@ -45,6 +45,20 @@ class TestLogUtils(unittest.TestCase):
             self.assertEqual(data["event"], "file.event")
             self.assertEqual(data["data"], 123)
 
+    def test_exact_file(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            log_path = Path(temp_dir) / "scheduler_status.log"
+            loggers = create_log_targets(
+                targets=[f"file:{log_path}"],
+                name_prefix=f"test_exact_file_{uuid.uuid4()}",
+            )
+            self.assertEqual(len(loggers), 1)
+            log_json(loggers, "scheduler.status", {"running_rids": ["rid-1"]})
+            _flush_all(loggers)
+            data = _parse_log_json(log_path.read_text().strip())
+            self.assertEqual(data["event"], "scheduler.status")
+            self.assertEqual(data["running_rids"], ["rid-1"])
+
     def test_multiple_targets(self):
         with tempfile.TemporaryDirectory() as temp_dir:
             buf = io.StringIO()
