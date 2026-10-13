@@ -218,7 +218,7 @@ class DecodeHiCacheTransferMixin:
                 return False
             self.tree_cache.pop_prefetch_loaded_tokens(dr.req.cache_request_handle)
 
-        # Re-match: req.last_node / prefix_indices updated to current device state.
+        # Re-match without changing the request's original prefix lock owner.
         rematch = match_prefix_for_req(
             self.tree_cache,
             dr.req,
@@ -226,34 +226,52 @@ class DecodeHiCacheTransferMixin:
             cow_mamba=False,
             include_req=True,
             match_full_kv_only=pm.match_full_kv_only,
+            update_req=False,
         )
-        load_result = self.tree_cache.init_load_back(
-            InitLoadBackParams(
-                best_match_node=rematch.best_match_node,
-                host_hit_length=rematch.host_hit_length,
-                req=dr.req,
-                full_kv_only=pm.match_full_kv_only,
-                force=pm.restore_token_count > 0,
+        # v0.5.21 init_load_back uses req.last_node as its device boundary.
+        # Temporarily provide the fresh boundary without transferring the
+        # request's existing lock receipt to that node.
+        old_last_node = dr.req.last_node
+        old_swa_host_hit_length = dr.req.swa_host_hit_length
+        old_mamba_host_hit_length = dr.req.mamba_host_hit_length
+        try:
+            dr.req.last_node = rematch.last_device_node
+            dr.req.swa_host_hit_length = rematch.swa_host_hit_length
+            dr.req.mamba_host_hit_length = rematch.mamba_host_hit_length
+            load_result = self.tree_cache.init_load_back(
+                InitLoadBackParams(
+                    best_match_node=rematch.best_match_node,
+                    host_hit_length=rematch.host_hit_length,
+                    req=dr.req,
+                    full_kv_only=pm.match_full_kv_only,
+                    force=pm.restore_token_count > 0,
+                )
             )
-        )
-        # The rematch repointed req.last_node to feed init_load_back's device
-        # boundary, but the prealloc lock and the receipt on the req still
-        # belong to pm.last_device_node; restore the pairing so any release
-        # before the commit hands over the restored lock hits the right node
-        # (the receipt's anchor makes a mispaired release assert).
-        dr.req.last_node = pm.last_device_node
+        finally:
+            dr.req.last_node = old_last_node
+            dr.req.swa_host_hit_length = old_swa_host_hit_length
+            dr.req.mamba_host_hit_length = old_mamba_host_hit_length
         if load_result is None:
             dr.hicache_restore_status = HiCacheRestoreResult.FAILED
             return False
-        new_indices, restored_node = load_result
-        # Failback: total coverage < required prefix means device alloc likely failed.
-        if len(rematch.device_indices) + len(new_indices) < pm.decode_prefix_len:
+        loaded_indices, _ = load_result
+        restored_match = match_prefix_for_req(
+            self.tree_cache,
+            dr.req,
+            dr.req.origin_input_ids,
+            cow_mamba=False,
+            include_req=True,
+            match_full_kv_only=pm.match_full_kv_only,
+            update_req=False,
+        )
+        if len(restored_match.device_indices) < pm.decode_prefix_len:
             logger.warning(
-                "HiCache load_back failed for rid=%s: device_indices=%d, "
-                "new_indices=%d, expected decode_prefix_len=%d (l1=%d, l2=%d, l3=%d)",
+                "HiCache load_back failed for rid=%s: restored_device_indices=%d, "
+                "loaded_path_indices=%d, expected decode_prefix_len=%d "
+                "(l1=%d, l2=%d, l3=%d)",
                 dr.req.rid,
-                len(rematch.device_indices),
-                len(new_indices),
+                len(restored_match.device_indices),
+                len(loaded_indices),
                 pm.decode_prefix_len,
                 pm.l1_prefix_len,
                 pm.l2_host_hit_length,
@@ -262,15 +280,19 @@ class DecodeHiCacheTransferMixin:
             dr.hicache_restore_status = HiCacheRestoreResult.FAILED
             return False
 
-        dr.hicache_restored_kv_indices = torch.cat(
-            [rematch.device_indices[pm.l1_prefix_len :], new_indices]
-        )
-        dr.hicache_restored_node = restored_node
+        dr.hicache_restored_kv_indices = restored_match.device_indices[
+            pm.l1_prefix_len : pm.decode_prefix_len
+        ].clone()
+        if len(dr.hicache_restored_kv_indices) != pm.restore_token_count:
+            dr.hicache_restore_status = HiCacheRestoreResult.FAILED
+            return False
+        dr.hicache_restored_node = restored_match.last_device_node
         dr.hicache_restore_lock_receipt = self.tree_cache.inc_lock_ref(
-            restored_node
+            dr.hicache_restored_node
         ).to_dec_params()
 
-        if len(new_indices) == 0:
+        ongoing_load_back = getattr(self.tree_cache, "ongoing_load_back", {})
+        if len(loaded_indices) == 0 and rematch.best_match_node not in ongoing_load_back:
             # Whole prefix already on device; no DMA needed.
             dr.hicache_restore_status = HiCacheRestoreResult.READY
             return False
@@ -335,22 +357,27 @@ class DecodeHiCacheTransferMixin:
         restored_lock_receipt = decode_req.hicache_restore_lock_receipt
         assert restored_node is not None
         assert restored_lock_receipt is not None
-        # Release preallocation before installing the restored lock receipt.
-        self.tree_cache.dec_lock_ref(
-            prefix_match.last_device_node,
-            req.lock_receipt,
-            skip_swa=req.swa_prefix_lock_released,
-        )
+        restored_kv_indices = decode_req.hicache_restored_kv_indices
+        if (
+            restored_kv_indices is None
+            or len(restored_kv_indices) != prefix_match.restore_token_count
+        ):
+            raise RuntimeError(f"Incomplete HiCache restore interval for {req.rid}")
 
         self.tree_cache.req_to_token_pool.write(
             (
                 decode_req.req.kv.req_pool_idx,
                 slice(prefix_match.l1_prefix_len, prefix_match.decode_prefix_len),
             ),
-            decode_req.hicache_restored_kv_indices,
+            restored_kv_indices,
         )
         req.prefix_indices = torch.cat(
-            [prefix_match.prefix_indices, decode_req.hicache_restored_kv_indices]
+            [prefix_match.prefix_indices, restored_kv_indices]
+        )
+        self.tree_cache.dec_lock_ref(
+            prefix_match.last_device_node,
+            req.lock_receipt,
+            skip_swa=req.swa_prefix_lock_released,
         )
         req.last_node = restored_node
         req.lock_receipt = restored_lock_receipt
