@@ -95,6 +95,7 @@ class TestDecodeQueueCleanup(CustomTestCase):
             nonlocal physical_available
             self.assertGreaterEqual(physical_available, physical_tokens_per_req)
             physical_available -= physical_tokens_per_req
+            return object()
 
         queue._pre_alloc = MagicMock(side_effect=pre_alloc)
 
@@ -104,6 +105,25 @@ class TestDecodeQueueCleanup(CustomTestCase):
         self.assertEqual(queue.retracted_queue, reqs[3:])
         self.assertEqual(physical_available, 3 * page_size)
         self.assertEqual(queue._pre_alloc.call_count, 3)
+
+    def test_failed_prealloc_releases_request_and_mamba_slots(self):
+        req = SimpleNamespace(
+            kv=SimpleNamespace(
+                holds_mamba=True,
+                holds_kv=True,
+                kv_committed_len=8,
+                mark_kv_released=MagicMock(),
+            )
+        )
+        queue = DecodePreallocQueue.__new__(DecodePreallocQueue)
+        queue.req_to_token_pool = MagicMock()
+
+        queue._rollback_failed_prealloc(req)
+
+        queue.req_to_token_pool.free_mamba_cache.assert_called_once_with(req)
+        queue.req_to_token_pool.free.assert_called_once_with(req)
+        self.assertEqual(req.kv.kv_committed_len, 0)
+        req.kv.mark_kv_released.assert_called_once_with()
 
     def test_prealloc_abort_clears_receiver_before_removing_request(self):
         receiver = FakeReceiver()
