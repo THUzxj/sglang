@@ -73,6 +73,8 @@ from sglang.srt.managers.io_struct import (
     SlowDownReqOutput,
     UnloadLoRAAdapterReqInput,
     UnloadLoRAAdapterReqOutput,
+    UpdateRequestReqInput,
+    UpdateRequestReqOutput,
     UpdateWeightsFromDistributedReqInput,
     UpdateWeightsFromDistributedReqOutput,
     UpdateWeightsFromIPCReqInput,
@@ -140,6 +142,7 @@ _COMMUNICATOR_SPECS = [
     ("update_lora_adapter", LoRAUpdateOutput),
     ("dumper_control", DumperControlReqOutput),
     ("scale_elastic_ep", ScaleElasticEPReqOutput),
+    ("update_request", UpdateRequestReqOutput),
 ]
 
 
@@ -328,6 +331,34 @@ class TokenizerControlMixin:
         if result.success and self.mm_processor is not None:
             self.mm_processor.clear_preprocess_cache()
         return result
+
+    async def update_request(
+        self: TokenizerManager, obj: UpdateRequestReqInput
+    ) -> UpdateRequestReqOutput:
+        self.auto_create_handle_loop()
+        results = await self.update_request_communicator(obj)
+        matched_results = [result for result in results if result.matched]
+        updated = [result for result in matched_results if result.success]
+        if updated:
+            return UpdateRequestReqOutput(
+                rid=obj.rid,
+                success=True,
+                matched=True,
+                location=", ".join(
+                    sorted({str(result.location) for result in updated})
+                ),
+                updated_fields=sorted(
+                    {field for result in updated for field in result.updated_fields}
+                ),
+                message=" | ".join(result.message for result in matched_results),
+            )
+        return UpdateRequestReqOutput(
+            rid=obj.rid,
+            success=False,
+            matched=bool(matched_results),
+            message=" | ".join(result.message for result in (matched_results or results))
+            or f"Request {obj.rid!r} was not found.",
+        )
 
     async def clear_hicache_storage(self: TokenizerManager) -> ClearHiCacheReqOutput:
         """Clear the hierarchical cache storage."""

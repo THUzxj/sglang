@@ -149,6 +149,7 @@ from sglang.srt.managers.io_struct import (
     SetInternalStateReq,
     SlowDownReqInput,
     UnloadLoRAAdapterReqInput,
+    UpdateRequestReqInput,
     UpdateWeightFromDiskReqInput,
     UpdateWeightsFromDistributedReqInput,
     UpdateWeightsFromIPCReqInput,
@@ -1668,6 +1669,20 @@ async def abort_request(obj: Annotated[AbortReq, Body()], request: Request):
             rid=obj.rid, abort_all=obj.abort_all
         )
         return Response(status_code=200)
+    except Exception as e:
+        return _create_error_response(e)
+
+
+@app.post("/update_request")
+@auth_level(AuthLevel.ADMIN_OPTIONAL)
+async def update_request(obj: Annotated[UpdateRequestReqInput, Body()], request: Request):
+    """Update priority or context-engineering labels for an in-flight request."""
+    try:
+        result = await _global_state.tokenizer_manager.update_request(obj)
+        status_code = 200 if result.success else 409 if result.matched else 404
+        return ORJSONResponse(
+            content=msgspec_to_builtins(result), status_code=status_code
+        )
     except Exception as e:
         return _create_error_response(e)
 

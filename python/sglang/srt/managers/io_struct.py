@@ -2198,6 +2198,28 @@ class AbortReq(BaseReq, kw_only=True):
             self.rid = ""
 
 
+class UpdateRequestReqInput(BaseReq, kw_only=True):
+    priority: Optional[int] = None
+    context_engineering_kind: Optional[str] = None
+    context_engineering_pair_key: Optional[str] = None
+    custom_labels: Optional[Dict[str, Any]] = None
+    metadata: Optional[Dict[str, Any]] = None
+    replace_custom_labels: bool = False
+    allow_running_kind_update: bool = False
+
+    def __post_init__(self):
+        if self.rid is None:
+            self.rid = ""
+
+
+class UpdateRequestReqOutput(BaseReq, kw_only=True):
+    success: bool
+    message: str
+    matched: bool = False
+    location: Optional[str] = None
+    updated_fields: List[str] = msgspec.field(default_factory=list)
+
+
 class EncoderDispatchErrorReq(BaseReq, kw_only=True):
     """Tokenizer-to-scheduler failure for one EPD encoder dispatch."""
 
