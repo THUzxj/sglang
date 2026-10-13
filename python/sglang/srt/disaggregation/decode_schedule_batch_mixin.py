@@ -120,7 +120,14 @@ class ScheduleBatchDisaggregationDecodeMixin:
             # PREBUILT does not materialize a local SWA branching window.
             if req.swa_branching_seqlen is not None:
                 req.swa_branching_seqlen = None
-            maybe_cache_unfinished_req(req, self.tree_cache)
+            maybe_cache_unfinished_req(
+                req,
+                self.tree_cache,
+                full_kv_only=(
+                    self.tree_cache.supports_mamba()
+                    and not self.tree_cache.supports_swa()
+                ),
+            )
             if req.grammar is not None:
                 # FIXME: this try-except block is for handling unexpected xgrammar issue.
                 try:

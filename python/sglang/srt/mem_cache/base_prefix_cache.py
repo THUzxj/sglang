@@ -96,6 +96,7 @@ class InsertParams:
     )
     chunked: bool = False
     priority: int = 0
+    full_kv_only: bool = False
     session_id: Optional[str] = None
     track_adopted_ranges: bool = False
 

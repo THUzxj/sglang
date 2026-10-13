@@ -1568,6 +1568,45 @@ class UnifiedRadixCacheSuite:
 
         cache.sanity_check()
 
+    def test_cache_unfinished_req_full_kv_only_without_mamba_checkpoint(self):
+        if not (self.cfg.has_mamba and self.cfg.enable_mamba_extra_buffer):
+            self.skipTest("requires Mamba extra buffer")
+
+        cache, allocator, req_to_token_pool = build_fixture(self.cfg)
+        req = self._make_req(req_to_token_pool)
+        tokens = self._make_seq(1, 3)
+        req.origin_input_ids = array("q", tokens)
+        req.output_ids = array("q")
+        req.full_untruncated_fill_ids = array("q", tokens)
+        req.set_extend_range(0, len(tokens))
+        req.kv.kv_committed_len = len(tokens)
+        req.kv.kv_allocated_len = len(tokens)
+        req.last_node = cache.root_node_handle()
+        req.kv.mamba_last_track_seqlen = None
+        kv_indices = self._alloc(allocator, len(tokens))
+        self.assertIsNotNone(kv_indices)
+        req_to_token_pool.write(
+            (req.kv.req_pool_idx, slice(0, len(tokens))), kv_indices
+        )
+
+        cache.cache_unfinished_req(req, full_kv_only=True)
+
+        key = RadixKey(array("q", tokens))
+        full_match = cache.match_prefix(
+            MatchPrefixParams(key=key, match_full_kv_only=True)
+        )
+        all_components_match = cache.match_prefix(MatchPrefixParams(key=key))
+        self.assertEqual(len(full_match.device_indices), len(tokens))
+        self.assertEqual(len(all_components_match.device_indices), 0)
+        self.assertIsNotNone(
+            _device_value(cache, full_match.last_device_node, ComponentType.FULL)
+        )
+        self.assertIsNone(
+            _device_value(cache, full_match.last_device_node, ComponentType.MAMBA)
+        )
+        cache.dec_lock_ref(req.last_node, req.lock_receipt)
+        cache.sanity_check()
+
     def test_cache_salt_and_extra_key_form_independent_namespaces(self):
         cache, allocator, req_to_token_pool = build_fixture(self.cfg)
         seq = self._make_seq(1, 2)

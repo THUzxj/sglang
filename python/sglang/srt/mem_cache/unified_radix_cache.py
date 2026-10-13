@@ -1175,9 +1175,13 @@ class UnifiedRadixCache(BasePrefixCache):
                 req, is_finished=False, insert_params=insert_params
             )
 
-    @rank_consensus(same_params=["req.rid", "chunked"])
-    def cache_unfinished_req(self, req: Req, chunked: bool = False, **kwargs) -> None:
-        if self.session.try_cache_unfinished_req(req, chunked=chunked, **kwargs):
+    @rank_consensus(same_params=["req.rid", "chunked", "full_kv_only"])
+    def cache_unfinished_req(
+        self, req: Req, chunked: bool = False, full_kv_only: bool = False, **kwargs
+    ) -> None:
+        if not full_kv_only and self.session.try_cache_unfinished_req(
+            req, chunked=chunked, **kwargs
+        ):
             return
 
         token_ids = req.get_fill_ids()
@@ -1198,11 +1202,14 @@ class UnifiedRadixCache(BasePrefixCache):
             prev_prefix_len=req.kv.cache_protected_len,
             chunked=chunked,
             priority=req.priority or 0,
+            full_kv_only=full_kv_only,
             session_id=req.session_id,
             rotation_base=req.kv_rotation_base,
         )
         effective_cache_len = len(token_ids)
         for comp in self._components_tuple:
+            if full_kv_only and comp.component_type == ComponentType.MAMBA:
+                continue
             cl = comp.prepare_for_caching_req(
                 req=req,
                 insert_params=insert_params,
@@ -1213,6 +1220,8 @@ class UnifiedRadixCache(BasePrefixCache):
                 effective_cache_len = min(effective_cache_len, cl)
 
         for comp in self._components_tuple:
+            if full_kv_only and comp.component_type == ComponentType.MAMBA:
+                continue
             effective_cache_len = comp.floor_cache_len(effective_cache_len)
 
         radix_key = RadixKey(
@@ -1229,11 +1238,15 @@ class UnifiedRadixCache(BasePrefixCache):
             # The insert stops at page_floor(len(radix_key)), and a bigram key is
             # one shorter than the tokens it spans, so measure the key.
             for comp in self._components_tuple:
+                if full_kv_only and comp.component_type == ComponentType.MAMBA:
+                    continue
                 comp.free_out_of_window_slots(req, len(radix_key) - 1, insert_params)
 
         if effective_cache_len <= 0:
             req.prefix_indices = kv_indices_orig.to(dtype=torch.int64, copy=True)
             for comp in self._components_tuple:
+                if full_kv_only and comp.component_type == ComponentType.MAMBA:
+                    continue
                 comp.cleanup_after_caching_req(
                     req, is_finished=False, insert_params=insert_params
                 )
@@ -1261,6 +1274,8 @@ class UnifiedRadixCache(BasePrefixCache):
             # prefix.
             req.prefix_indices = kv_indices_orig.to(dtype=torch.int64, copy=True)
             for comp in self._components_tuple:
+                if full_kv_only and comp.component_type == ComponentType.MAMBA:
+                    continue
                 comp.cleanup_after_caching_req(
                     req, is_finished=False, insert_params=insert_params
                 )
@@ -1268,7 +1283,11 @@ class UnifiedRadixCache(BasePrefixCache):
 
         # Match prefix. SWA insertion retains one extra window before the
         # page-aligned boundary, so the normal match remains safe to repoint.
-        match_result = self.match_prefix(MatchPrefixParams(key=radix_key, req=req))
+        match_result = self.match_prefix(
+            MatchPrefixParams(
+                key=radix_key, req=req, match_full_kv_only=full_kv_only
+            )
+        )
         new_indices = match_result.device_indices
         new_last_node = match_result.last_device_node
         new_prefix_len = result.prefix_len
@@ -1294,7 +1313,7 @@ class UnifiedRadixCache(BasePrefixCache):
             new_last_node,
             skip_lock_components=(
                 (ComponentType.MAMBA,)
-                if envs.SGLANG_OPT_MAMBA_SKIP_DECODE_LOCK.get()
+                if full_kv_only or envs.SGLANG_OPT_MAMBA_SKIP_DECODE_LOCK.get()
                 else ()
             ),
         )
@@ -1315,6 +1334,8 @@ class UnifiedRadixCache(BasePrefixCache):
 
         # cleanup
         for comp in self._components_tuple:
+            if full_kv_only and comp.component_type == ComponentType.MAMBA:
+                continue
             comp.cleanup_after_caching_req(
                 req,
                 is_finished=False,
