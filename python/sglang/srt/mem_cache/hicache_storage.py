@@ -479,8 +479,20 @@ class HiCacheFile(HiCacheStorage):
         except FileNotFoundError:
             if self.metadata_cache is not None:
                 self.metadata_cache.remove(suffixed)
-            logger.warning(f"Failed to fetch {key} from HiCacheFile storage.")
+            logger.warning(
+                "[HICACHE_DIAG] file_read_missing key=%s path=%s",
+                key,
+                tensor_path,
+            )
             return None
+        except IOError as exc:
+            logger.error(
+                "[HICACHE_DIAG] file_read_error key=%s path=%s error=%s",
+                key,
+                tensor_path,
+                exc,
+            )
+            raise
 
     def batch_get(
         self,
@@ -645,6 +657,15 @@ class HiCacheFile(HiCacheStorage):
                 hit_count[name] = boundary
             final_pages = min(final_pages, boundary)
 
+        if final_pages:
+            logger.info(
+                "[HICACHE_DIAG] file_exists_query keys=%d kv_pages=%d "
+                "final_pages=%d components=%s",
+                len(keys),
+                kv_pages,
+                final_pages,
+                sorted(hit_count),
+            )
         return PoolTransferResult(final_pages, hit_count)
 
     def _log_key(self, pool_name: str, key: str) -> str:
@@ -698,7 +719,19 @@ class HiCacheFile(HiCacheStorage):
         transfers: List[PoolTransfer],
         extra_info: Optional[HiCacheStorageExtraInfo] = None,
     ) -> dict[str, List[bool]]:
-        return self._batch_io_v2(transfers, self._read_page)
+        results = self._batch_io_v2(transfers, self._read_page)
+        logger.info(
+            "[HICACHE_DIAG] file_batch_get transfers=%s result_counts=%s",
+            [(t.name, len(t.keys or [])) for t in transfers],
+            {
+                name: {
+                    "ok": sum(bool(v) for v in values),
+                    "failed": sum(not bool(v) for v in values),
+                }
+                for name, values in results.items()
+            },
+        )
+        return results
 
     def batch_set_v2(
         self,

@@ -1387,6 +1387,15 @@ class HiRadixCache(RadixCache):
             node_id=last_hit_node.id,
             **self._get_extra_pools(),
         )
+        logger.info(
+            "[HICACHE_DIAG] gpu_load_back node_id=%s host_tokens=%d force=%s "
+            "mem_quota=%s load_result_tokens=%s",
+            last_hit_node.id,
+            len(host_indices),
+            force,
+            mem_quota,
+            len(device_indices) if device_indices is not None else None,
+        )
         if device_indices is None:
             self.evict(EvictParams(num_tokens=len(host_indices)))
             device_indices = self.cache_controller.load(
@@ -1636,7 +1645,16 @@ class HiRadixCache(RadixCache):
         completed_tokens, hash_value = self.cache_controller.terminate_prefetch(
             operation
         )
-        logger.debug(f"Prefetch {req_id} completed with {completed_tokens} tokens")
+        logger.info(
+            "[HICACHE_DIAG] prefetch_complete rid=%s requested_tokens=%d "
+            "completed_tokens=%d storage_hit=%s host_indices=%s hash_pages=%d",
+            req_id,
+            len(prefetch_key),
+            completed_tokens,
+            getattr(operation, "storage_hit_count", None),
+            len(operation.host_indices) if operation.host_indices is not None else None,
+            len(hash_value),
+        )
 
         min_completed_tokens = self._sync_and_clamp_prefetch_result(
             operation, completed_tokens
@@ -1664,6 +1682,18 @@ class HiRadixCache(RadixCache):
         # Track tokens actually loaded from storage for this request (L3 hits)
         loaded_from_storage = min_completed_tokens - matched_length
         self.prefetch_loaded_tokens_by_reqid[req_id] = loaded_from_storage
+        logger.info(
+            "[HICACHE_DIAG] prefetch_install rid=%s min_completed_tokens=%d "
+            "matched_host_tokens=%d loaded_from_storage=%d node_id=%s "
+            "node_evicted=%s node_backuped=%s",
+            req_id,
+            min_completed_tokens,
+            matched_length,
+            loaded_from_storage,
+            getattr(last_host_node, "id", None),
+            getattr(last_host_node, "evicted", None),
+            getattr(last_host_node, "backuped", None),
+        )
 
         if self.enable_storage_metrics:
             self.storage_metrics_collector.log_prefetched_tokens(loaded_from_storage)
@@ -1767,11 +1797,19 @@ class HiRadixCache(RadixCache):
         # align the number of fetching tokens to the page size
         prefetch_key = prefetch_key.page_aligned(self.page_size)
         prefetch_length = len(prefetch_key)
-        if (
-            not self.enable_storage
-            or prefetch_length < self.prefetch_threshold
-            or self.cache_controller.prefetch_rate_limited()
-        ):
+        rate_limited = self.cache_controller.prefetch_rate_limited()
+        if not self.enable_storage or prefetch_length < self.prefetch_threshold or rate_limited:
+            logger.info(
+                "[HICACHE_DIAG] prefetch_skip rid=%s requested_tokens=%d "
+                "prefetch_tokens=%d threshold=%d storage_enabled=%s "
+                "rate_limited=%s",
+                req_id,
+                len(new_input_tokens),
+                prefetch_length,
+                self.prefetch_threshold,
+                self.enable_storage,
+                rate_limited,
+            )
             return
 
         last_host_node.protect_host()

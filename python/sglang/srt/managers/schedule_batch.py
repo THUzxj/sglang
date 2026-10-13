@@ -1421,6 +1421,61 @@ class Req(ReqDllmMixin):
             else:
                 self.cache_protected_len = len(self.prefix_indices)
 
+            # Keep non-PD prefix matching observable with the same evidence as
+            # the PD decode path.  The regular unified cache has no separate
+            # L3 field in MatchResult, so l3_hit is explicitly zero here.
+            l1_hit = int(match_result.device_indices.numel())
+            l2_hit = int(match_result.host_hit_length)
+            full_kv_hit = int(match_result.full_kv_hit_length)
+            missing_kv = max(0, input_len - full_kv_hit)
+            if missing_kv == 0:
+                kv_match_status = "full"
+            elif l1_hit > 0:
+                kv_match_status = "partial_device_only"
+            elif l2_hit > 0:
+                kv_match_status = "partial_host_only"
+            else:
+                kv_match_status = "no_prefix"
+            kv_available = kv_evictable = mamba_available = mamba_size = None
+            try:
+                kv_available = int(tree_cache.token_to_kv_pool_allocator.available_size())
+                kv_evictable = int(tree_cache.evictable_size())
+            except (AttributeError, TypeError):
+                pass
+            try:
+                mamba_allocator = tree_cache.req_to_token_pool.mamba_allocator
+                mamba_available = int(mamba_allocator.available_size())
+                mamba_size = int(tree_cache.req_to_token_pool.mamba_pool.size)
+            except (AttributeError, TypeError):
+                pass
+            logger.info(
+                "Prefix match: rid=%s kind=%s pair_key=%s mode=non_pd "
+                "input_len=%d l1_hit=%d l2_hit=%d l3_hit=0 "
+                "decode_prefix_len=%d full_kv_hit=%d mamba_host_hit=%d "
+                "mamba_branching_seqlen=%s cache_protected_len=%s "
+                "kv_match_status=%s kv_missing_tokens=%d kv_fallback=%s "
+                "kv_pool_available=%s kv_pool_evictable=%s "
+                "mamba_pool_available=%s mamba_pool_size=%s",
+                self.rid,
+                "compact" if self.is_context_engineering_compact() else "main",
+                getattr(self, "context_engineering_pair_key", None),
+                input_len,
+                l1_hit,
+                l2_hit,
+                l1_hit + l2_hit,
+                full_kv_hit,
+                int(match_result.mamba_host_hit_length),
+                match_result.mamba_branching_seqlen,
+                self.cache_protected_len,
+                kv_match_status,
+                missing_kv,
+                "l2" if l2_hit else "none",
+                kv_available,
+                kv_evictable,
+                mamba_available,
+                mamba_size,
+            )
+
             if self.is_dllm():
                 self._update_block_offset_for_dllm()
 

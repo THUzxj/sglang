@@ -102,6 +102,19 @@ class DecodeHiCachePreallocMixin:
                     last_hash,
                     prefix_keys,
                 )
+                logger.info(
+                    "[HICACHE_DIAG] storage_query rid=%s node_id=%s node_evicted=%s "
+                    "node_backuped=%s l1=%d l2=%d query_tokens=%d l3=%d last_hash=%s",
+                    req.rid,
+                    getattr(last_host_node, "id", None),
+                    getattr(last_host_node, "evicted", None),
+                    getattr(last_host_node, "backuped", None),
+                    l1_prefix_len,
+                    l2_host_hit_length,
+                    len(suffix_tokens),
+                    l3_storage_hit_length,
+                    last_hash,
+                )
 
         return DecodePrefixMatch(
             prefix_indices=prefix_indices,
@@ -151,9 +164,34 @@ class DecodeHiCachePreallocMixin:
             prefix_match.prefetch_registered = (
                 req.rid in self.tree_cache.ongoing_prefetch
             )
+            operation = self.tree_cache.ongoing_prefetch.get(req.rid, (None, None, None))[2]
+            logger.info(
+                "[HICACHE_DIAG] prefetch_start rid=%s node_id=%s node_evicted=%s "
+                "node_backuped=%s requested_tokens=%d registered=%s hash_pages=%s "
+                "storage_hit=%s",
+                req.rid,
+                getattr(node, "id", None),
+                getattr(node, "evicted", None),
+                getattr(node, "backuped", None),
+                len(suffix),
+                prefix_match.prefetch_registered,
+                len(getattr(operation, "hash_value", []) or []) if operation else None,
+                getattr(operation, "storage_hit_count", None) if operation else None,
+            )
+            if not prefix_match.prefetch_registered:
+                logger.info(
+                    "[HICACHE_DIAG] prefetch_not_registered rid=%s "
+                    "requested_tokens=%d prefetch_threshold=%s "
+                    "storage_enabled=%s rate_limited=%s",
+                    req.rid,
+                    len(suffix),
+                    getattr(self.tree_cache, "prefetch_threshold", None),
+                    getattr(self.tree_cache, "enable_storage", None),
+                    self.tree_cache.cache_controller.prefetch_rate_limited(),
+                )
         except Exception as e:
             logger.warning(
-                "HiCache L3 prefetch failed for rid=%s: %s; falling back to L2-only LoadingBack",
+                "HiCache L3 prefetch failed for rid=%s: %s; falling back to prefill/L2-only restore",
                 req.rid,
                 e,
             )
@@ -224,7 +262,17 @@ class DecodeHiCacheTransferMixin:
 
         # Wait for L3 -> L2 prefetch to drain (skip when no L3 hit).
         if pm.l3_storage_hit_length > 0:
-            if not self.tree_cache.check_prefetch_progress(dr.req.rid):
+            prefetch_progress = self.tree_cache.check_prefetch_progress(dr.req.rid)
+            logger.info(
+                "[HICACHE_DIAG] prefetch_gate rid=%s l3_tokens=%d "
+                "registered=%s ongoing=%s progress=%s",
+                dr.req.rid,
+                pm.l3_storage_hit_length,
+                pm.prefetch_registered,
+                dr.req.rid in self.tree_cache.ongoing_prefetch,
+                prefetch_progress,
+            )
+            if not prefetch_progress:
                 return False
             self.tree_cache.pop_prefetch_loaded_tokens(dr.req.rid)
 
@@ -252,6 +300,20 @@ class DecodeHiCacheTransferMixin:
                 full_kv_only=pm.match_full_kv_only,
                 force=pm.restore_token_count > 0,
             )
+        )
+        logger.info(
+            "[HICACHE_DIAG] load_back_call rid=%s rematch_node_id=%s "
+            "rematch_evicted=%s rematch_backuped=%s rematch_l1=%d rematch_l2=%d "
+            "expected_l3=%d restore_tokens=%d loaded_indices=%d",
+            dr.req.rid,
+            getattr(rematch.best_match_node, "id", None),
+            getattr(rematch.best_match_node, "evicted", None),
+            getattr(rematch.best_match_node, "backuped", None),
+            len(rematch.device_indices),
+            rematch.host_hit_length,
+            pm.l3_storage_hit_length,
+            pm.restore_token_count,
+            len(loaded_indices),
         )
 
         # init_load_back() returns the full radix path materialized by the load
