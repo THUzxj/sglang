@@ -306,6 +306,7 @@ from sglang.srt.mem_cache.common import (
     maybe_cache_unfinished_req,
     release_kv_cache,
 )
+from sglang.srt.mem_cache.unified_cache.component_type import ComponentType
 from sglang.srt.model_executor.forward_batch_info import PPProxyTensors
 from sglang.srt.model_executor.runner_utils.pool import prewarm_graph_pool_borrow
 from sglang.srt.model_loader.utils import get_resolved_model_impl
@@ -1296,6 +1297,7 @@ class Scheduler(
         self.gracefully_exit = False
         self.waiting_queue: List[Req] = []
         self.paused_compact_queue: List[Req] = []
+        self.pending_compact_pause_queue: List[Req] = []
         # The running decoding batch for continuous batching
         self.running_batch: ScheduleBatch = ScheduleBatch(reqs=[], batch_is_full=False)
         # The current forward batch
@@ -3683,10 +3685,110 @@ class Scheduler(
         )
         return batch
 
+    def _radix_evictable_compact_pause_enabled(self) -> bool:
+        return bool(
+            get_schedule().enable_pair_scheduler
+            and get_schedule().context_engineering_compact_pause_mode
+            == "radix_evictable"
+        )
+
+    def _park_compact_in_radix_cache(self, req: Req) -> bool:
+        """Transfer committed compact KV to radix and detach its request row."""
+        committed_len = req.kv.kv_committed_len
+        local_mamba_resume = (
+            self.disaggregation_mode == DisaggregationMode.DECODE
+            and self.tree_cache.supports_mamba()
+            and hasattr(self.tree_cache, "protect_cache_paused_node")
+        )
+        if local_mamba_resume:
+            # The pending output token has no committed KV yet. A decode
+            # result still in flight must finish before this check can pass.
+            resumable_len = len(req.origin_input_ids) + len(req.output_ids) - 1
+            if (
+                committed_len != resumable_len
+                or req.owned_kv_len() != committed_len
+                or committed_len <= 0
+                or committed_len % self.token_to_kv_pool_allocator.page_size
+                or req.skip_radix_cache_insert
+            ):
+                return False
+            if get_exec().mamba.enable_linear_replayssm:
+                raise RuntimeError(
+                    "radix_evictable local Mamba resume does not support ReplaySSM"
+                )
+            if (
+                self.tree_cache.cache_controller is None
+                or self.tree_cache.host_memory_mode == "buffer_only"
+            ):
+                return False
+            host_pool = self.tree_cache.cache_controller.mem_pool_host
+            shortfall = committed_len - host_pool.available_size()
+            if shortfall > 0:
+                self.tree_cache.evict_host(shortfall)
+            mamba_host = self.tree_cache.components[ComponentType.MAMBA]._mamba_pool_host
+            if mamba_host.available_size() < 1:
+                self.tree_cache.evict_host(1, ComponentType.MAMBA)
+            if (
+                host_pool.available_size() < committed_len
+                or mamba_host.available_size() < 1
+            ):
+                return False
+
+            req.context_engineering_pause_node = None
+            req.is_context_engineering_cache_parking = True
+            try:
+                release_kv_cache(req, self.tree_cache, is_insert=True)
+            finally:
+                req.is_context_engineering_cache_parking = False
+            node_id = req.context_engineering_pause_node
+            if node_id is None:
+                raise RuntimeError(f"Compact KV was not inserted into radix: {req.rid}")
+            host_lock = self.tree_cache.protect_cache_paused_node(node_id)
+            if host_lock is None:
+                raise RuntimeError(
+                    f"Compact host checkpoint was not protected: {req.rid}"
+                )
+            pending_token_id = (req.origin_input_ids + req.output_ids)[committed_len]
+            req.context_engineering_pause_pending_token_id = pending_token_id
+            req.context_engineering_pause_host_lock = host_lock
+            req.detach_gpu_state_for_cache_pause(committed_len)
+        else:
+            if self.disaggregation_mode == DisaggregationMode.DECODE:
+                if req.output_ids:
+                    req.pd_rebootstrap_forced_output_id = req.output_ids.pop()
+                req.pd_rebootstrap_in_progress = True
+            release_kv_cache(req, self.tree_cache, is_insert=True)
+            req.detach_gpu_state_for_cache_pause(committed_len)
+
+        req.is_context_engineering_paused = True
+        req.is_context_engineering_cache_paused = True
+        return True
+
+    def _finalize_pending_compact_pauses(self, completed_batch: ScheduleBatch) -> None:
+        if not self.pending_compact_pause_queue:
+            return
+        completed_ids = {id(req) for req in completed_batch.reqs}
+        remaining = []
+        newly_paused = 0
+        for req in self.pending_compact_pause_queue:
+            if id(req) not in completed_ids:
+                remaining.append(req)
+                continue
+            req.is_context_engineering_pause_pending = False
+            if req.finished() or not req.kv.holds_kv:
+                continue
+            if not self._park_compact_in_radix_cache(req):
+                req.is_context_engineering_paused = True
+            self.paused_compact_queue.append(req)
+            newly_paused += 1
+        self.pending_compact_pause_queue = remaining
+        self.metrics_reporter.num_paused_reqs += newly_paused
+
     def _resume_paused_compacts(self, running_batch: ScheduleBatch) -> ScheduleBatch:
         if (
             not get_schedule().enable_pair_scheduler
-            or get_schedule().context_engineering_compact_pause_mode != "gpu_resident"
+            or get_schedule().context_engineering_compact_pause_mode
+            not in {"gpu_resident", "radix_evictable"}
             or not self.paused_compact_queue
         ):
             return running_batch
@@ -3694,7 +3796,7 @@ class Scheduler(
         runnable = [
             req
             for req in self.paused_compact_queue
-            if req.kv.holds_kv
+            if (req.kv.holds_kv or req.is_context_engineering_cache_paused)
             and can_resume_compact_req(req, running_batch.reqs)
         ]
         available_slots = max(0, self.max_running_requests - len(running_batch.reqs))
@@ -3727,17 +3829,41 @@ class Scheduler(
         if not resumed:
             return running_batch
 
-        resumed_ids = {id(req) for req in resumed}
+        cache_resumed = []
+        resident_resumed = []
+        for req in resumed:
+            if not req.is_context_engineering_cache_paused:
+                resident_resumed.append(req)
+            elif (
+                self.disaggregation_mode == DisaggregationMode.DECODE
+                and req.context_engineering_pause_node is not None
+            ):
+                if self.disagg_decode_prealloc_queue.restore_cache_paused_req(req):
+                    resident_resumed.append(req)
+            else:
+                cache_resumed.append(req)
+
+        admitted = resident_resumed + cache_resumed
+        resumed_ids = {id(req) for req in admitted}
         self.paused_compact_queue = [
             req for req in self.paused_compact_queue if id(req) not in resumed_ids
         ]
-        for req in resumed:
+        for req in admitted:
             req.is_context_engineering_paused = False
-        resumed_batch = self._build_gpu_resident_decode_batch(resumed)
-        if running_batch.is_empty():
-            running_batch = resumed_batch
-        else:
-            running_batch.merge_batch(resumed_batch)
+        for req in cache_resumed:
+            req.is_context_engineering_cache_paused = False
+            req.context_engineering_pause_committed_len = 0
+            if self.disaggregation_mode == DisaggregationMode.DECODE:
+                self.disagg_decode_prealloc_queue.add(req, is_rebootstrap=True)
+                req.time_stats.set_decode_prealloc_queue_entry_time()
+            else:
+                self._add_request_to_queue(req, is_retracted=True)
+        if resident_resumed:
+            resumed_batch = self._build_gpu_resident_decode_batch(resident_resumed)
+            if running_batch.is_empty():
+                running_batch = resumed_batch
+            else:
+                running_batch.merge_batch(resumed_batch)
         running_batch.batch_is_full = False
         return running_batch
 
@@ -4392,7 +4518,7 @@ class Scheduler(
         if (
             get_schedule().enable_pair_scheduler
             and get_schedule().context_engineering_compact_pause_mode
-            in {"retract", "gpu_resident"}
+            in {"retract", "gpu_resident", "radix_evictable"}
         ):
             self._apply_pair_decode_retract_limits(batch)
             if batch.is_empty():
@@ -4535,6 +4661,39 @@ class Scheduler(
                 batch.filter_batch(keep_indices=keep_indices)
                 batch.batch_is_full = False
                 self.metrics_reporter.num_paused_reqs += len(excluded)
+                return
+            if pause_compacts and self._radix_evictable_compact_pause_enabled():
+                paused_ids = {id(req) for req in self.paused_compact_queue}
+                if (
+                    self.enable_overlap
+                    and self.disaggregation_mode == DisaggregationMode.DECODE
+                ):
+                    pending_ids = {id(req) for req in self.pending_compact_pause_queue}
+                    for _, req in excluded:
+                        assert req.is_context_engineering_compact()
+                        assert id(req) not in paused_ids and id(req) not in pending_ids
+                        req.is_context_engineering_pause_pending = True
+                        self.pending_compact_pause_queue.append(req)
+                    batch.filter_batch(keep_indices=keep_indices)
+                    batch.batch_is_full = False
+                    return
+                parked_ids = set()
+                for _, req in excluded:
+                    assert req.is_context_engineering_compact()
+                    assert id(req) not in paused_ids
+                    if self._park_compact_in_radix_cache(req):
+                        self.paused_compact_queue.append(req)
+                        parked_ids.add(id(req))
+                if parked_ids:
+                    batch.filter_batch(
+                        keep_indices=[
+                            idx
+                            for idx, req in enumerate(batch.reqs)
+                            if id(req) not in parked_ids
+                        ]
+                    )
+                    batch.batch_is_full = False
+                    self.metrics_reporter.num_paused_reqs += len(parked_ids)
                 return
             resumable = []
             failed = []
@@ -5103,6 +5262,8 @@ class Scheduler(
         elif batch.forward_mode.is_idle():
             self.batch_result_processor.process_batch_result_idle(batch, result)
 
+        self._finalize_pending_compact_pauses(batch)
+
         # Submit this batch's queued host backups before the next scheduler step.
         self.tree_cache.flush_pending_backups()
 
@@ -5334,6 +5495,7 @@ class Scheduler(
             and self._pp_microbatches_drained()
         )
         idle &= len(self.paused_compact_queue) == 0
+        idle &= len(self.pending_compact_pause_queue) == 0
 
         # Waiting queues: waiting + bootstrapping + preallocation + kv transfer (decode)
         if not ignore_waiting:
@@ -5773,6 +5935,8 @@ class Scheduler(
         add_req("chunked_req", self.chunked_req, running=True)
         for req in getattr(self, "paused_compact_queue", ()):
             add_req("paused_compact_queue", req)
+        for req in self.pending_compact_pause_queue:
+            add_req("pending_compact_pause_queue", req, running=True)
         for req in self.waiting_queue:
             add_req("waiting_queue", req)
 
@@ -5967,7 +6131,15 @@ class Scheduler(
             if recv_req.abort_all or req.rid.startswith(recv_req.rid):
                 req.is_context_engineering_paused = False
                 self._release_aborted_request(req)
-                release_kv_cache(req, self.tree_cache, is_insert=False)
+                if req.context_engineering_pause_host_lock is not None:
+                    self.tree_cache.dec_host_lock_ref(
+                        req.context_engineering_pause_node,
+                        req.context_engineering_pause_host_lock,
+                    )
+                    req.context_engineering_pause_host_lock = None
+                    req.context_engineering_pause_node = None
+                if req.kv.holds_kv or req.kv.holds_mamba:
+                    release_kv_cache(req, self.tree_cache, is_insert=False)
                 self.ipc_channels.send_to_tokenizer.send_output(
                     _make_abort_req(req, finished_reason=recv_req.finished_reason),
                     req,
@@ -5975,6 +6147,16 @@ class Scheduler(
             else:
                 remaining_paused.append(req)
         self.paused_compact_queue = remaining_paused
+
+        for req in self.pending_compact_pause_queue:
+            if recv_req.abort_all or req.rid.startswith(recv_req.rid):
+                req.to_finish = (
+                    FINISH_ABORT(
+                        recv_req.abort_message, HTTPStatus.SERVICE_UNAVAILABLE
+                    )
+                    if recv_req.abort_message
+                    else FINISH_ABORT()
+                )
 
         # todo hisparse, release resources for abort requests in hisparse coordinator
         # Abort requests still waiting for encoder embeddings (EPD language-only)
@@ -6157,6 +6339,30 @@ class Scheduler(
             if req not in retract_reqs:
                 retract_reqs.append(req)
         self.paused_compact_queue = []
+        for req in self.pending_compact_pause_queue:
+            req.is_context_engineering_pause_pending = False
+            if not req.finished() and req not in retract_reqs:
+                retract_reqs.append(req)
+        self.pending_compact_pause_queue = []
+
+        cache_paused_reqs = [
+            req for req in retract_reqs if req.is_context_engineering_cache_paused
+        ]
+        retract_reqs = [
+            req for req in retract_reqs if not req.is_context_engineering_cache_paused
+        ]
+        for req in cache_paused_reqs:
+            if req.context_engineering_pause_host_lock is not None:
+                self.tree_cache.dec_host_lock_ref(
+                    req.context_engineering_pause_node,
+                    req.context_engineering_pause_host_lock,
+                )
+                req.context_engineering_pause_host_lock = None
+                req.context_engineering_pause_node = None
+            req.is_context_engineering_cache_paused = False
+            req.context_engineering_pause_committed_len = 0
+            req.context_engineering_pause_pending_token_id = None
+            req.reset_for_retract()
 
         self.last_batch = None
         self.cur_batch_for_debug = None
@@ -6179,7 +6385,7 @@ class Scheduler(
                 offload_kv=False,
             )
         self.running_batch.reqs = []
-        for req in retract_reqs:
+        for req in retract_reqs + cache_paused_reqs:
             if self.disaggregation_mode == DisaggregationMode.DECODE:
                 if req.output_ids:
                     req.pd_rebootstrap_forced_output_id = req.output_ids.pop()

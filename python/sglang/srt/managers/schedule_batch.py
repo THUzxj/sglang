@@ -2069,7 +2069,13 @@ class Req(ReqDllmMixin):
 
     def detach_gpu_state_for_cache_pause(self, committed_len: int) -> None:
         """Clear released GPU bindings without discarding decode progress."""
-        assert not self.kv.holds_kv and not self.kv.holds_mamba
+        assert not self.kv.holds_kv
+        # Unified Mamba insert may donate its slot to radix while leaving the
+        # stale slot id on the released Req. The node is now its owner.
+        assert (
+            self.context_engineering_pause_node is not None
+            or not self.kv.holds_mamba
+        )
         self.context_engineering_pause_committed_len = committed_len
         self.kv = ReqKvInfo()
         self.prefix_indices = torch.empty((0,), dtype=torch.int64)

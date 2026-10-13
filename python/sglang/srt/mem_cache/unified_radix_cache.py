@@ -1623,7 +1623,10 @@ class UnifiedRadixCache(BasePrefixCache):
         written = self._execute_and_commit_kv_backup(
             BackupKV(node_ids=[node_id]), write_back=True
         )
-        if written == 0:
+        # An auxiliary-only backup (for example, a Mamba checkpoint whose
+        # Full KV is already on host) has zero Full tokens but still needs its
+        # host-copy ack before a paused request may rely on it.
+        if written == 0 and node_id not in self.ongoing_write_through:
             return False
         self.writing_check(write_back=True)
         return True

@@ -883,6 +883,154 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
         """
         self.held_rebootstrap_reqs.append(req)
 
+    def restore_cache_paused_req(self, req: Req) -> bool:
+        """Resume a parked Mamba compact from radix without a PD prefill."""
+        length = req.context_engineering_pause_committed_len
+        node_id = req.context_engineering_pause_node
+        if (
+            length <= 0
+            or node_id is None
+            or self.req_to_token_pool.available_size() < 1
+        ):
+            return False
+
+        token_ids = req.origin_input_ids + req.output_ids
+        pending_token_id = req.context_engineering_pause_pending_token_id
+        if len(token_ids) == length and pending_token_id is not None:
+            req.output_ids.append(pending_token_id)
+            token_ids = req.origin_input_ids + req.output_ids
+        if (
+            len(token_ids) != length + 1
+            or pending_token_id is None
+            or token_ids[length] != pending_token_id
+        ):
+            raise RuntimeError(f"Compact cache resume boundary mismatch: {req.rid}")
+
+        committed_ids = token_ids[:length]
+        mamba_match = match_prefix_for_req(
+            self.tree_cache, req, committed_ids, include_req=True
+        )
+        if mamba_match.best_match_node != node_id:
+            return False
+        tree = self.tree_cache.tree_core
+        mamba_on_host = tree.component_has_host_value_only(
+            node_id, ComponentType.MAMBA
+        )
+        if (
+            tree.get_component_device_value(node_id, ComponentType.MAMBA) is None
+            and not mamba_on_host
+        ):
+            return False
+
+        full_match = match_prefix_for_req(
+            self.tree_cache,
+            req,
+            committed_ids,
+            include_req=True,
+            match_full_kv_only=True,
+        )
+        prefix_len = len(full_match.device_indices)
+        if (
+            prefix_len + full_match.host_hit_length != length
+            or self._pre_alloc_fill_len(req) != length
+        ):
+            return False
+
+        pool = self.req_to_token_pool
+        required_mamba_slots = 1
+        if pool.enable_mamba_extra_buffer:
+            required_mamba_slots += (
+                1
+                if pool.enable_mamba_extra_buffer_lazy
+                else pool.mamba_ping_pong_track_buffer_size
+            )
+        if (
+            pool.mamba_allocator.available_size()
+            + self.tree_cache.mamba_evictable_size()
+            < required_mamba_slots
+        ):
+            return False
+
+        old_node = full_match.last_device_node
+        req.lock_receipt = self.tree_cache.inc_lock_ref(old_node).to_dec_params()
+        allocated = False
+        try:
+            if (
+                self._pre_alloc(req, full_match.device_indices, prefix_len, length)
+                is None
+            ):
+                self._rollback_failed_prealloc(req)
+                return False
+            allocated = True
+            # No private Full KV was allocated for the L2 gap. The tree owns
+            # every committed page after load-back fills the request row.
+            req.kv.cache_protected_len = length
+
+            mamba_on_host = tree.component_has_host_value_only(
+                node_id, ComponentType.MAMBA
+            )
+            if full_match.host_hit_length or mamba_on_host:
+                if not self.tree_cache.load_back(node_id, req=req, force=True):
+                    return False
+                consumer = self.tree_cache.ready_to_load_host_cache()
+                deadline = time.monotonic() + 30
+                while consumer >= 0 and not self.tree_cache.is_load_back_event_done(
+                    consumer
+                ):
+                    if time.monotonic() >= deadline:
+                        raise TimeoutError(f"Compact cache resume timed out: {req.rid}")
+                    time.sleep(0.001)
+
+            restored = match_prefix_for_req(
+                self.tree_cache,
+                req,
+                committed_ids,
+                include_req=True,
+                match_full_kv_only=True,
+            )
+            if len(restored.device_indices) != length:
+                raise RuntimeError(f"Compact cache resume lost KV: {req.rid}")
+            new_receipt = self.tree_cache.inc_lock_ref(
+                restored.last_device_node
+            ).to_dec_params()
+            self.tree_cache.dec_lock_ref(old_node, req.lock_receipt)
+            req.lock_receipt = new_receipt
+            req.last_node = restored.last_device_node
+            self.req_to_token_pool.write(
+                (req.kv.req_pool_idx, slice(0, length)), restored.device_indices
+            )
+            req.prefix_indices = restored.device_indices
+
+            source = tree.get_component_device_value(node_id, ComponentType.MAMBA)
+            if source is None:
+                raise RuntimeError(f"Compact cache resume lost Mamba state: {req.rid}")
+            if pool.mamba_ckpt_pool is not None:
+                pool.mamba_ckpt_pool.load_to_active(
+                    pool.mamba_pool, source, req.kv.mamba_pool_idx.view(-1)
+                )
+            else:
+                translate = pool.translate_mamba_indices
+                pool.mamba_pool.copy_from(
+                    translate(source), translate(req.kv.mamba_pool_idx.view(-1))
+                )
+            req.kv.mamba_needs_clear = False
+            req.is_retracted = False
+            req.is_context_engineering_cache_paused = False
+            req.context_engineering_pause_committed_len = 0
+            req.context_engineering_pause_pending_token_id = None
+            self.tree_cache.dec_host_lock_ref(
+                node_id, req.context_engineering_pause_host_lock
+            )
+            req.context_engineering_pause_host_lock = None
+            req.context_engineering_pause_node = None
+            return True
+        finally:
+            if allocated and req.is_context_engineering_cache_paused:
+                release_kv_cache(req, self.tree_cache, is_insert=False)
+                req.detach_gpu_state_for_cache_pause(length)
+            elif not allocated:
+                self.tree_cache.dec_lock_ref(old_node, req.lock_receipt)
+
     def enqueue_held_rebootstrap(self) -> None:
         """Enqueue all staged rebootstrap requests when generation resumes."""
         held = self.held_rebootstrap_reqs
