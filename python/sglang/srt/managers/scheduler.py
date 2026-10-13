@@ -119,6 +119,8 @@ from sglang.srt.managers.disagg_service import maybe_create_ascend_config_store
 from sglang.srt.managers.hisparse_coordinator import HiSparseCoordinator
 from sglang.srt.managers.pair_scheduler import (
     order_prefill_waiting_queue,
+    select_decode_keep_indices,
+    select_main_turn_decode_keep_indices,
     should_try_prefill_request,
 )
 from sglang.srt.managers.io_struct import (
@@ -4229,6 +4231,15 @@ class Scheduler(
             batch.batch_is_full = False
             return batch
 
+        if (
+            get_schedule().enable_pair_scheduler
+            and get_schedule().context_engineering_compact_pause_mode == "retract"
+        ):
+            self._apply_pair_decode_retract_limits(batch)
+            if batch.is_empty():
+                batch.batch_is_full = False
+                return batch
+
         # Check if decode out of memory
         if (kv_full_retract_flag := not batch.check_decode_mem()) or (
             TEST_RETRACT and self.forward_ct % TEST_RETRACT_INTERVAL == 0
@@ -4306,6 +4317,66 @@ class Scheduler(
         # Update batch tensors
         batch.prepare_for_decode()
         return batch
+
+    def _apply_pair_decode_retract_limits(self, batch: ScheduleBatch) -> None:
+        """Retract CE requests excluded by the main and compact decode budgets."""
+
+        def retract_excluded(keep_indices: List[int]) -> None:
+            if len(keep_indices) == len(batch.reqs):
+                return
+            keep_set = set(keep_indices)
+            excluded = [
+                (idx, req)
+                for idx, req in enumerate(batch.reqs)
+                if idx not in keep_set
+            ]
+            resumable = []
+            failed = []
+            for idx, req in reversed(excluded):
+                if batch.release_req(idx, len(keep_indices)):
+                    resumable.append(req)
+                else:
+                    failed.append(req)
+            batch.filter_batch(keep_indices=keep_indices)
+            for req in resumable:
+                self._add_request_to_queue(req, is_retracted=True)
+            for req in failed:
+                    req.to_finish = FINISH_ABORT(
+                        "Pair scheduling retraction could not preserve KV backup.",
+                        status_code=HTTPStatus.INTERNAL_SERVER_ERROR,
+                    )
+                    self.ipc_channels.send_to_tokenizer.send_output(
+                        _make_abort_req(req, finished_reason=req.to_finish.to_json()),
+                        req,
+                    )
+            batch.batch_is_full = False
+            self.metrics_reporter.num_retracted_reqs += len(resumable)
+
+        retract_excluded(
+            select_main_turn_decode_keep_indices(
+                batch.reqs,
+                max_batch_size=(
+                    get_schedule().context_engineering_main_turn_decode_max_batch_size
+                ),
+            )
+        )
+        if batch.is_empty():
+            return
+        retract_excluded(
+            select_decode_keep_indices(
+                batch.reqs,
+                self.waiting_queue,
+                max_compact_batch_size=(
+                    get_schedule().context_engineering_compact_decode_max_batch_size
+                ),
+                attention_budget=(
+                    get_schedule().context_engineering_decode_attention_token_budget
+                ),
+                compact_attention_cost_ratio=(
+                    get_schedule().context_engineering_compact_attention_cost_ratio
+                ),
+            )
+        )
 
     def record_batch_in_overlap(self, batch: ScheduleBatch):
         # FIXME(lsyin): hacky way to keep a reference to avoid GPU tensors being freed by torch GC
