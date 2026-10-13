@@ -1550,18 +1550,10 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
             if self.req_to_token_pool.available_size() <= 0:
                 break
 
-            # Hybrid models (e.g. K3 with KDA): guard against prealloc
-            # draining the mamba pool before the KV pool (would assert "Not
-            # enough space for mamba cache"). Evict a cached mamba slot from
-            # the radix tree first (only if it manages mamba states;
-            # ChunkCache.evict is a no-op), else stop.
-            mamba_allocator = getattr(self.req_to_token_pool, "mamba_allocator", None)
-            if mamba_allocator is not None and mamba_allocator.available_size() <= 0:
-                supports_mamba = self.tree_cache.supports_mamba()
-                if supports_mamba and hasattr(self.tree_cache, "evict"):
-                    self.tree_cache.evict(EvictParams(num_tokens=0, mamba_num=1))
-                if mamba_allocator.available_size() <= 0:
-                    break
+            # Hybrid row allocation reserves its main state and extra buffers
+            # together, so admission must reclaim the whole request footprint.
+            if not self._ensure_mamba_request_slots(decode_req.req):
+                break
 
             if hisparse_req_budget <= 0:
                 break
@@ -2251,6 +2243,33 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
         # int32 for ZMQ serialization -- from_zmq reads np.int32.
         return kv_to_page_indices(kv_indices, page_size).astype(np.int32)
 
+    def _ensure_mamba_request_slots(self, req: Req) -> bool:
+        pool = self.req_to_token_pool
+        if not isinstance(pool, HybridReqToTokenPool):
+            return True
+        required = 1
+        if pool.enable_mamba_extra_buffer:
+            required += (
+                1
+                if pool.enable_mamba_extra_buffer_lazy
+                else pool.mamba_ping_pong_track_buffer_size
+            )
+        available = pool.mamba_allocator.available_size()
+        if available < required and self.tree_cache.supports_mamba():
+            self.tree_cache.evict_for_alloc(
+                EvictParams(num_tokens=0, mamba_num=required - available)
+            )
+            available = pool.mamba_allocator.available_size()
+        if available < required:
+            logger.warning(
+                "Decode Mamba preallocation deferred: rid=%s required=%d available=%d",
+                req.rid,
+                required,
+                available,
+            )
+            return False
+        return True
+
     def _pre_alloc(
         self,
         req: Req,
@@ -2271,6 +2290,8 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
         if total_prefix_len is None:
             total_prefix_len = prefix_len
 
+        if not self._ensure_mamba_request_slots(req):
+            return None
         req_pool_indices = self.req_to_token_pool.alloc([req])
 
         assert req_pool_indices is not None, (

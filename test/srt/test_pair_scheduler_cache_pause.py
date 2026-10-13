@@ -128,3 +128,34 @@ def test_local_cache_resume_uses_restored_kv_and_releases_host_lock(monkeypatch)
     assert req.lock_receipt == ("lock", 7)
     assert req.kv.cache_protected_len == 2
     assert not req.is_context_engineering_cache_paused
+
+
+def test_decode_mamba_prealloc_reclaims_all_extra_slots(monkeypatch):
+    class HybridPool:
+        enable_mamba_extra_buffer = True
+        enable_mamba_extra_buffer_lazy = False
+        mamba_ping_pong_track_buffer_size = 2
+
+        def __init__(self):
+            self.available = 1
+            self.mamba_allocator = SimpleNamespace(
+                available_size=lambda: self.available
+            )
+
+    monkeypatch.setattr(decode_module, "HybridReqToTokenPool", HybridPool)
+    pool = HybridPool()
+    cache = MagicMock()
+    cache.supports_mamba.return_value = True
+
+    def evict(params):
+        assert params.num_tokens == 0
+        assert params.mamba_num == 2
+        pool.available = 3
+
+    cache.evict_for_alloc.side_effect = evict
+    queue = SimpleNamespace(req_to_token_pool=pool, tree_cache=cache)
+
+    assert decode_module.DecodePreallocQueue._ensure_mamba_request_slots(
+        queue, SimpleNamespace(rid="hybrid")
+    )
+    cache.evict_for_alloc.assert_called_once()
