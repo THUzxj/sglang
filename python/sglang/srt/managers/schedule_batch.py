@@ -3353,16 +3353,75 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
         retracted_reqs = []
         reqs_to_abort: List[Req] = []
         first_iter = True
+        continue_pair_key = None
         while first_iter or (
             not self.check_decode_mem(selected_indices=sorted_indices)
         ):
-            if len(sorted_indices) == 1:
-                # Always keep at least one request
+            if not sorted_indices:
                 break
 
             first_iter = False
-            idx = sorted_indices.pop()
+            idx = None
+            if continue_pair_key is not None:
+                idx = next(
+                    (
+                        candidate
+                        for candidate in reversed(sorted_indices)
+                        if self.reqs[candidate].context_engineering_pair_key
+                        == continue_pair_key
+                        and self.reqs[candidate].is_context_engineering_request()
+                    ),
+                    None,
+                )
+            if idx is None:
+                idx = sorted_indices[-1]
+                candidate_req = self.reqs[idx]
+                if (
+                    get_schedule().enable_pair_scheduler
+                    and candidate_req.beam_group is None
+                    and candidate_req.is_context_engineering_request()
+                    and candidate_req.context_engineering_pair_key
+                ):
+                    pair_key = candidate_req.context_engineering_pair_key
+                    idx = next(
+                        (
+                            candidate
+                            for candidate in reversed(sorted_indices)
+                            if self.reqs[candidate].context_engineering_pair_key
+                            == pair_key
+                            and self.reqs[candidate].is_context_engineering_compact()
+                            and self.reqs[candidate].beam_group is None
+                        ),
+                        idx,
+                    )
             req = self.reqs[idx]
+            if (
+                len(sorted_indices) == 1
+                and continue_pair_key is None
+                and not (
+                    get_schedule().enable_pair_scheduler
+                    and req.is_context_engineering_compact()
+                )
+            ):
+                break
+            sorted_indices.remove(idx)
+            pair_key = (
+                req.context_engineering_pair_key
+                if get_schedule().enable_pair_scheduler
+                and req.beam_group is None
+                and req.is_context_engineering_request()
+                else None
+            )
+            continue_pair_key = (
+                pair_key
+                if pair_key is not None
+                and any(
+                    self.reqs[candidate].context_engineering_pair_key == pair_key
+                    and self.reqs[candidate].is_context_engineering_request()
+                    for candidate in sorted_indices
+                )
+                else None
+            )
             if req.beam_group is not None:
                 # Free member rows before release_req: they need the leader's kv
                 # info, which still carries the lockstep allocated length.
@@ -3402,7 +3461,7 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
                     "retract_decode: aborted request %s: %s", req.rid, message
                 )
 
-        if len(sorted_indices) <= 1 and not self.check_decode_mem(
+        if sorted_indices and len(sorted_indices) <= 1 and not self.check_decode_mem(
             selected_indices=sorted_indices
         ):
             # Even the last remaining request cannot fit in memory.
