@@ -1285,6 +1285,14 @@ class SchedulerMetricsReporter:
 
     def _maybe_log_idle_metrics(self):
         """Reset forward timing and publish idle metrics when needed."""
+        # Keep idle wall time out of the next decode report. This hook runs on
+        # every idle scheduler iteration, including when metrics are disabled,
+        # so the first decode interval after an idle period starts from the
+        # most recent idle iteration instead of the previous decode log.
+        now = time.perf_counter()
+        self.last_decode_stats_tic = now
+        self.last_decode_log_time = now
+
         # Preserve the transition so the rate limit cannot leave a finite idle gauge.
         is_fwd_occupancy_stale = ENABLE_METRICS_DEVICE_TIMER and not math.isnan(
             self.stats.fwd_occupancy
@@ -1302,7 +1310,7 @@ class SchedulerMetricsReporter:
         if (
             not gauge_stale
             and not is_fwd_occupancy_stale
-            and time.perf_counter() <= self.metrics_collector.last_log_time + 30
+            and now <= self.metrics_collector.last_log_time + 30
         ):
             return
 

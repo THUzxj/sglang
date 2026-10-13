@@ -386,13 +386,24 @@ class TestIdleMetrics(unittest.TestCase):
         self.reporter.fwd_occupancy = 72.0
         self.reporter.stats.fwd_occupancy = 72.0
         self.reporter._device_timer_window_batch_count = 7
+        self.reporter.last_decode_stats_tic = 10.0
+        self.reporter.last_decode_log_time = 20.0
 
-        with patch(
-            "sglang.srt.managers.scheduler_components.metrics_reporter.ENABLE_METRICS_DEVICE_TIMER",
-            True,
+        with (
+            patch(
+                "sglang.srt.managers.scheduler_components.metrics_reporter.ENABLE_METRICS_DEVICE_TIMER",
+                True,
+            ),
+            patch(
+                "sglang.srt.managers.scheduler_components.metrics_reporter.time.perf_counter",
+                side_effect=[101.0, 102.0],
+            ),
         ):
             self.reporter._maybe_log_idle_metrics()
+            self.reporter._maybe_log_idle_metrics()
 
+        self.assertEqual(self.reporter.last_decode_stats_tic, 102.0)
+        self.assertEqual(self.reporter.last_decode_log_time, 102.0)
         self.assertTrue(math.isnan(self.reporter.fwd_occupancy))
         self.assertTrue(math.isnan(self.reporter.stats.fwd_occupancy))
         self.assertEqual(self.reporter._device_timer_window_batch_count, 0)
