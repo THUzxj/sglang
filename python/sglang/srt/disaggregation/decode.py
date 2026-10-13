@@ -79,6 +79,10 @@ from sglang.srt.managers.schedule_batch import (
     ScheduleBatch,
 )
 from sglang.srt.managers.schedule_policy import match_prefix_for_req
+from sglang.srt.managers.pair_scheduler import (
+    context_engineering_pair_key,
+    select_prebuilt_admission_indices,
+)
 from sglang.srt.managers.utils import GenerationBatchResult
 from sglang.srt.mem_cache.allocator import BaseTokenToKVPoolAllocator
 from sglang.srt.mem_cache.allocator.swa import is_swa_req_ring
@@ -3107,35 +3111,61 @@ class SchedulerDisaggregationDecodeMixin:
 
         num_not_used_batch = batch_size - curr_batch_size
 
-        # pop req from waiting queue
-        can_run_list: List[Req] = []
-        waiting_queue: List[Req] = []
+        pair_scheduler_active = self.server_args.enable_pair_scheduler
+        if pair_scheduler_active:
+            waiting_compact_pair_keys = {
+                context_engineering_pair_key(req)
+                for req in self.waiting_queue
+                if req.is_context_engineering_compact()
+                and context_engineering_pair_key(req)
+            }
+            admitted_main_pair_keys = getattr(
+                self, "_context_engineering_admitted_main_pair_keys", set()
+            )
+            admitted_main_pair_keys.intersection_update(waiting_compact_pair_keys)
+            can_run_indices = select_prebuilt_admission_indices(
+                self.waiting_queue,
+                running_batch.reqs,
+                available_batch_slots=num_not_used_batch,
+                main_turn_limit=(
+                    self.server_args.context_engineering_main_turn_decode_max_batch_size
+                ),
+                admitted_main_pair_keys=admitted_main_pair_keys,
+            )
+        else:
+            can_run_indices = list(
+                range(min(num_not_used_batch, len(self.waiting_queue)))
+            )
 
-        for i in range(len(self.waiting_queue)):
-            req = self.waiting_queue[i]
-            # we can only add at least `num_not_used_batch` new batch to the running queue
-            if i < num_not_used_batch:
-                can_run_list.append(req)
-                # `pop_preallocated` matched and locked new requests; a retracted or
-                # rebootstrapped one owns its row, and a re-match here takes no lock.
-                if get_disagg().disaggregation_decode_enable_radix_cache:
-                    if req.last_node is None:
-                        _bind_root_prefix(req, self.tree_cache)
-                    tree_cache = None
-                else:
-                    tree_cache = self.tree_cache
-                req.init_next_round_input(tree_cache)
-                # Truncate fill_len to kv_committed_len so cache_unfinished_req
-                # only sees committed KV (full array includes one uncommitted
-                # token because init_next_round_input rebuilt it as full).
-                if req.kv.kv_committed_len is not None:
-                    req.set_extend_range(
-                        len(req.prefix_indices), req.kv.kv_committed_len
-                    )
+        can_run_list = [self.waiting_queue[idx] for idx in can_run_indices]
+        if pair_scheduler_active:
+            admitted_main_pair_keys.update(
+                pair_key
+                for req in can_run_list
+                if req.is_context_engineering_main()
+                and (pair_key := context_engineering_pair_key(req))
+                in waiting_compact_pair_keys
+            )
+            self._context_engineering_admitted_main_pair_keys = (
+                admitted_main_pair_keys
+            )
+        can_run_index_set = set(can_run_indices)
+        self.waiting_queue = [
+            req
+            for idx, req in enumerate(self.waiting_queue)
+            if idx not in can_run_index_set
+        ]
+        for req in can_run_list:
+            # `pop_preallocated` locked new requests; retracted ones own their row.
+            if get_disagg().disaggregation_decode_enable_radix_cache:
+                if req.last_node is None:
+                    _bind_root_prefix(req, self.tree_cache)
+                tree_cache = None
             else:
-                waiting_queue.append(req)
-
-        self.waiting_queue = waiting_queue
+                tree_cache = self.tree_cache
+            req.init_next_round_input(tree_cache)
+            if req.kv.kv_committed_len is not None:
+                req.set_extend_range(len(req.prefix_indices), req.kv.kv_committed_len)
         if len(can_run_list) == 0:
             return None
 
