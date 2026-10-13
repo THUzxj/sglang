@@ -97,6 +97,19 @@ class DecodeHiCachePreallocMixin:
                     extra_key=req.extra_key,
                     cache_salt=req.cache_salt,
                 )
+                logger.info(
+                    "[HICACHE_DIAG] storage_query rid=%s node_id=%s node_evicted=%s "
+                    "node_backuped=%s l1=%d l2=%d query_tokens=%d l3=%d last_hash=%s",
+                    req.rid,
+                    getattr(last_host_node, "id", None),
+                    getattr(last_host_node, "evicted", None),
+                    getattr(last_host_node, "backuped", None),
+                    l1_prefix_len,
+                    l2_host_hit_length,
+                    len(suffix_tokens),
+                    l3_storage_hit_length,
+                    last_hash,
+                )
 
         return DecodePrefixMatch(
             prefix_indices=prefix_indices,
@@ -145,9 +158,35 @@ class DecodeHiCachePreallocMixin:
             prefix_match.prefetch_registered = self.tree_cache.has_ongoing_prefetch(
                 req.cache_request_handle
             )
+            ongoing = self.tree_cache.ongoing_prefetch.get(req.cache_request_handle)
+            operation = ongoing.operation if ongoing is not None else None
+            logger.info(
+                "[HICACHE_DIAG] prefetch_start rid=%s node_id=%s node_evicted=%s "
+                "node_backuped=%s requested_tokens=%d registered=%s hash_pages=%s "
+                "storage_hit=%s",
+                req.rid,
+                getattr(prefix_match.last_host_node, "id", None),
+                getattr(prefix_match.last_host_node, "evicted", None),
+                getattr(prefix_match.last_host_node, "backuped", None),
+                len(suffix),
+                prefix_match.prefetch_registered,
+                len(getattr(operation, "hash_value", []) or []) if operation else None,
+                getattr(operation, "storage_hit_count", None) if operation else None,
+            )
+            if not prefix_match.prefetch_registered:
+                logger.info(
+                    "[HICACHE_DIAG] prefetch_not_registered rid=%s "
+                    "requested_tokens=%d prefetch_threshold=%s "
+                    "storage_enabled=%s rate_limited=%s",
+                    req.rid,
+                    len(suffix),
+                    getattr(self.tree_cache, "prefetch_threshold", None),
+                    getattr(self.tree_cache, "enable_storage", None),
+                    self.tree_cache.cache_controller.prefetch_rate_limited(),
+                )
         except Exception as e:
             logger.warning(
-                "HiCache L3 prefetch failed for rid=%s: %s; falling back to L2-only LoadingBack",
+                "HiCache L3 prefetch failed for rid=%s: %s; falling back to prefill/L2-only restore",
                 req.rid,
                 e,
             )
@@ -165,7 +204,6 @@ class DecodeHiCachePreallocMixin:
             and dr.hicache_restore_status == HiCacheRestoreResult.PENDING
             and dr.hicache_restored_node is None
         )
-
 
 class HiCacheRestoreGatedKVReceiver:
     """Wraps a kv_receiver so KVPoll.Success is gated on HiCache restore READY."""
@@ -255,6 +293,20 @@ class DecodeHiCacheTransferMixin:
             dr.hicache_restore_status = HiCacheRestoreResult.FAILED
             return False
         loaded_indices, _ = load_result
+        logger.info(
+            "[HICACHE_DIAG] load_back_call rid=%s rematch_node_id=%s "
+            "rematch_evicted=%s rematch_backuped=%s rematch_l1=%d rematch_l2=%d "
+            "expected_l3=%d restore_tokens=%d loaded_indices=%d",
+            dr.req.rid,
+            getattr(rematch.best_match_node, "id", None),
+            getattr(rematch.best_match_node, "evicted", None),
+            getattr(rematch.best_match_node, "backuped", None),
+            len(rematch.device_indices),
+            rematch.host_hit_length,
+            pm.l3_storage_hit_length,
+            pm.restore_token_count,
+            len(loaded_indices),
+        )
         restored_match = match_prefix_for_req(
             self.tree_cache,
             dr.req,

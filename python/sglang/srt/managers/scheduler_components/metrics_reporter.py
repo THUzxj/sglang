@@ -971,6 +971,12 @@ class SchedulerMetricsReporter:
 
         pool_stats = self.scheduler.pool_stats_observer.get_pool_stats()
         token_usage_msg = ", ".join(pool_stats.get_decode_usage_msg_parts()) + ", "
+        decode_kv_read_tokens = _decode_total_seq_lens(batch)
+        decode_kv_read_tokens_per_req = (
+            batch.seq_lens_cpu.tolist()
+            if batch.seq_lens_cpu is not None
+            else [req.seqlen for req in batch.reqs]
+        )
 
         if RECORD_STEP_TIME:
             self.step_time_dict[num_running_reqs].append(
@@ -983,7 +989,12 @@ class SchedulerMetricsReporter:
             else self.scheduler.forward_ct
         )
         iter_msg = f" [{batch_iter}]" if LOG_FORWARD_ITERS else ""
-        msg = f"Decode batch{iter_msg}, #running-req: {num_running_reqs}, {token_usage_msg}"
+        msg = (
+            f"Decode batch{iter_msg}, #running-req: {num_running_reqs}, "
+            f"#decode-kv-read-token: {decode_kv_read_tokens}, "
+            f"decode-kv-read-token-per-req: {decode_kv_read_tokens_per_req}, "
+            f"{token_usage_msg}"
+        )
 
         spec_num_steps = 0
         spec_num_draft_tokens = 0

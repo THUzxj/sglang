@@ -559,8 +559,12 @@ class UnifiedRadixCache(BasePrefixCache):
             None if params.match_full_kv_only else self.session.try_match_prefix(params)
         )
         if result is not None:
+            self._log_match_result(params, result, source="session")
             return result
         if self.disable:
+            self._log_match_result(
+                params, self.tree_core.empty_match_result, source="disabled"
+            )
             return self.tree_core.empty_match_result
         result = self.tree_core.match_prefix(params)
         # Apply the walk's actions (e.g. a pending write-through relocation on
@@ -575,9 +579,27 @@ class UnifiedRadixCache(BasePrefixCache):
             result = component.finalize_match_result_in_cache(params, result)
         # Finalizers must not emit actions; the walk's were applied above.
         assert not result.cache_actions
+        self._log_match_result(params, result, source="tree")
         if self.linker is not None and params.req is not None:
             result = self.linker.match(params.key, params.req, result)
         return result
+
+    def _log_match_result(
+        self, params: MatchPrefixParams, result: MatchResult, *, source: str
+    ) -> None:
+        req = params.req
+        logger.debug(
+            "Unified radix match: rid=%s source=%s key_len=%d device_hit=%d "
+            "full_kv_hit=%d mamba_branching_seqlen=%s best_node=%s full_only=%s",
+            getattr(req, "rid", None) if req is not None else None,
+            source,
+            len(params.key),
+            len(result.device_indices),
+            result.full_kv_hit_length,
+            result.mamba_branching_seqlen,
+            result.best_match_node,
+            params.match_full_kv_only,
+        )
 
     def supports_fast_match_prefix(self) -> bool:
         return self.tree_core.supports_fast_match_prefix()
@@ -806,10 +828,27 @@ class UnifiedRadixCache(BasePrefixCache):
         return result.node_id, result.made_progress
 
     def _evict_device_leaf(
-        self, node_id: NodeId, tracker: dict[ComponentType, int]
+        self,
+        node_id: NodeId,
+        component_type: ComponentType,
+        tracker: dict[ComponentType, int],
     ) -> Optional[BackupKV]:
         """Evict one device leaf, consuming its step result; returns the
         deferred write-back BackupKV when one must run before the demote."""
+        node = self.tree_core.node_by_id(node_id)
+        component_data = node.component_data[component_type]
+        device_value = component_data.value
+        device_tokens = len(device_value) if device_value is not None else 0
+        action = "demote" if node.backuped else "delete"
+        logger.info(
+            "Unified radix eviction: node_id=%s component=%s layer=device "
+            "action=%s device_tokens=%d backuped=%s",
+            node_id,
+            component_type.name,
+            action,
+            device_tokens,
+            node.backuped,
+        )
         result = self.tree_core.evict_device_leaf(node_id, self.is_write_back)
         self._free_values(result.device_frees, result.host_frees)
         if self._tracks_write_through_unbacked_evictions():
@@ -897,7 +936,7 @@ class UnifiedRadixCache(BasePrefixCache):
                         if not made_progress:
                             break
                     else:
-                        backup_kv = self._evict_device_leaf(node_id, tracker)
+                        backup_kv = self._evict_device_leaf(node_id, ct, tracker)
                     if node_id is not None and backup_kv is not None:
                         # Deferred demote: run the D->H backup, demote only on success.
                         written = self._execute_and_commit_kv_backup(
