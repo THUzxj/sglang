@@ -17,15 +17,17 @@ in v0.5.21.
 | Decode HiCache, Full-KV-only restore, Mamba and ownership | `b0350bfc73`, `f65ce7374f`, `64de14e6aa`, `86452ef5c7`, `8c754d7bbe`, `f8ffd6da67`, `fbd5556e16`, `3e34976738`, `fddc511146`, `ff2e533699`, `30b78f64d4`, `722b512ca1`, `c62558f756` | `e0f8d5f039`, `14e3097c19`, `abb475c19b`, `d3ccc15ea1`, `8887a021d9`, `6a62e0ea57` | Partial: PD Mamba prefix reuse, complete preallocation, L3 checkpoint check, exact restore interval, TP load completion, local checkpoint restore and Full-KV-only prebuilt caching ported; remaining ownership cases and GPU tests pending |
 | PD transport and allocation | `dc1cb64e04`, `6afc37846b`, `9a0b7a62a5` | `13371a85e9`, `1ad29d8331`, `d8701e41f4` | Ported at code level; end-to-end transfer and KV pressure tests pending |
 | Request control and lifecycle | `0c3905ea40`, `8a8c8cbb46` | `d2e2eb1819`, `b88eea470f` | Ported at code level; full runtime tests pending |
-| Timing, scheduler status and diagnostic logs | `c63f1fdda4`, `228e669d40`, `1ad8cbb498`, `36e4cfda48`, `f8f1b21204`, `5c0119e8ba`, `affac55eeb`, `ab98cd7b47`, `04385a8577`, `7f27543fec`, `03ba01019b`, `43fc2ff420`, `ba52cfe8d0`, `284587df52`, `3b09a07078` | `ae07db12e8`, `00e5a26249`, `751585c4cd`, `52fa178024` | Partial: timing and status ports landed; prefill attribution, queue composition and detailed cache diagnostics pending |
+| Timing, scheduler status and diagnostic logs | `c63f1fdda4`, `228e669d40`, `1ad8cbb498`, `36e4cfda48`, `f8f1b21204`, `5c0119e8ba`, `affac55eeb`, `ab98cd7b47`, `04385a8577`, `7f27543fec`, `03ba01019b`, `43fc2ff420`, `ba52cfe8d0`, `284587df52`, `3b09a07078` | `ae07db12e8`, `00e5a26249`, `751585c4cd`, `52fa178024`, `a81050ac72` | Partial: prefill timing and status ports landed; prefill attribution, queue composition and detailed cache diagnostics pending |
 | Design and API notes | `023f190c76` | — | Pending review against the v0.5.21 implementation; source notes describe v0.5.17 internals |
 
 Current lightweight checks: Python syntax and `git diff --check` for each
 ported change; standalone pair-scheduler helper tests and focused AST smoke
 checks for request update, status logging, pair retraction, radix checkpoint
 parking, local Mamba restore and its host-load failure path, complete Mamba
-preallocation, and HiCache's exact restore interval. The workspace
-Python lacks `orjson` and `pytest`; the project venv has runtime imports but
-its `transformers`/`kernels` combination fails while importing SGLang, so
-package-level tests have not run.
+preallocation, and HiCache's exact restore interval. The workspace Python
+lacks `orjson` and `pytest`. The project venv has runtime imports, but its
+`transformers`/`kernels` combination fails on a direct SGLang import. With the
+incompatible `kernels` package blocked in the test process and FlashInfer's
+cache redirected to `/tmp`, the focused decode HiCache restore interval test
+and three cache-pause tests pass against imported modules.
 GPU-backed PD, HiCache and pause/resume behavior remains unverified.
