@@ -146,6 +146,71 @@ class TestPrefillAdder(CustomTestCase):
         defaults["token_to_kv_pool_allocator"].page_size = defaults["page_size"]
         return PrefillAdder(**defaults)
 
+    def test_prefill_token_attribution_tracks_kind_and_reason(self):
+        adder = self.create_adder(self.create_running_batch())
+
+        fresh_main = self.create_mock_req("fresh-main", 0, 1)
+        fresh_main.context_engineering_kind = "main"
+        fresh_main.reprocess_reason = ""
+        adder._update_prefill_budget(7, 11, 0, fresh_main)
+
+        reprocessed_compact = self.create_mock_req("reprocessed-compact", 0, 1)
+        reprocessed_compact.context_engineering_kind = "compact"
+        reprocessed_compact.retracted_stain = True
+        reprocessed_compact.reprocess_reason = "kv_pressure"
+        adder._update_prefill_budget(13, 17, 0, reprocessed_compact)
+
+        self.assertEqual(adder.log_input_tokens, 28)
+        self.assertEqual(adder.log_hit_tokens, 20)
+        self.assertEqual(adder.reprocessed_log_input_tokens, 17)
+        self.assertEqual(adder.reprocessed_log_hit_tokens, 13)
+        self.assertEqual(adder.fresh_log_input_tokens_by_kind, {"main": 11})
+        self.assertEqual(
+            adder.reprocessed_log_input_tokens_by_kind, {"compact": 17}
+        )
+        self.assertEqual(
+            adder.reprocessed_log_input_tokens_by_reason, {"kv_pressure": 17}
+        )
+
+    def test_rebootstrap_payload_propagates_reprocess_reason(self):
+        sampling_params = SimpleNamespace(
+            temperature=0.0,
+            top_p=1.0,
+            top_k=-1,
+            min_p=0.0,
+            frequency_penalty=0.0,
+            presence_penalty=0.0,
+            repetition_penalty=1.0,
+            ignore_eos=False,
+            skip_special_tokens=True,
+            spaces_between_special_tokens=True,
+            no_stop_trim=False,
+        )
+        req = SimpleNamespace(
+            sampling_params=sampling_params,
+            origin_input_ids=[1, 2],
+            output_ids=[3],
+            rid="req-1",
+            bootstrap_host="127.0.0.1",
+            bootstrap_port=1234,
+            bootstrap_room=7,
+            priority=0,
+            extra_key=None,
+            cache_salt=None,
+            routing_key=None,
+            disagg_prefill_dp_rank=0,
+            custom_labels={"request_class": "compact"},
+            reprocess_reason="radix_evictable_rebootstrap",
+        )
+
+        payload = Req.build_rebootstrap_payload(req)
+
+        self.assertEqual(payload["custom_labels"]["request_class"], "compact")
+        self.assertEqual(
+            payload["custom_labels"]["_sglang_reprocess_reason"],
+            "radix_evictable_rebootstrap",
+        )
+
     def create_shared_adder(self, *, num_mixed_decode_tokens=0):
         self.mock_tree_cache.supports_mamba.return_value = False
         self.mock_tree_cache.sliding_window_size = 8

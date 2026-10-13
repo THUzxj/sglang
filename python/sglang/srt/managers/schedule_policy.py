@@ -32,7 +32,7 @@ logger = logging.getLogger(__name__)
 
 import os
 import random
-from collections import Counter
+from collections import Counter, defaultdict
 from contextlib import contextmanager
 from dataclasses import dataclass
 from enum import Enum, auto
@@ -676,6 +676,9 @@ class PrefillAdder:
         self.log_input_tokens = 0
         self.log_replay_tokens = 0
         self.reprocessed_log_input_tokens = 0
+        self.fresh_log_input_tokens_by_kind = defaultdict(int)
+        self.reprocessed_log_input_tokens_by_kind = defaultdict(int)
+        self.reprocessed_log_input_tokens_by_reason = defaultdict(int)
 
         if running_batch is not None:
             # Estimate the offset in the remaining token space
@@ -878,7 +881,7 @@ class PrefillAdder:
         prefix_len: int,
         extend_input_len: int,
         max_new_tokens: int,
-        retracted_stain: bool,
+        req: Req,
         mamba_gap_reserve: int = 0,
         is_chunked_continuation: bool = False,
         compute_charge: Optional[int] = None,
@@ -925,9 +928,21 @@ class PrefillAdder:
         # when computing the first-attempt prefix cache hit rate.
         self.log_hit_tokens += prefix_len
         self.log_input_tokens += raw_extend_input_len
-        if retracted_stain:
+        kind = getattr(req, "context_engineering_kind", "")
+        if kind not in {"main", "compact"}:
+            kind = "other"
+        reason = getattr(req, "reprocess_reason", "")
+        if not isinstance(reason, str):
+            reason = ""
+        if req.retracted_stain or reason:
             self.reprocessed_log_hit_tokens += prefix_len
             self.reprocessed_log_input_tokens += raw_extend_input_len
+            self.reprocessed_log_input_tokens_by_kind[kind] += raw_extend_input_len
+            self.reprocessed_log_input_tokens_by_reason[
+                reason or "retracted"
+            ] += raw_extend_input_len
+        else:
+            self.fresh_log_input_tokens_by_kind[kind] += raw_extend_input_len
 
     def _account_prefill_cache_admission(self, req: Req, prefix_len: int) -> None:
         if get_exec().features.enable_encoder_swa_bounded_replay and (
@@ -1022,7 +1037,7 @@ class PrefillAdder:
             prefix_len,
             trunc_len,
             0,
-            req.retracted_stain,
+            req,
             mamba_gap_reserve=self._mamba_gap_budget_for_req(req),
         )
         self._account_prefill_cache_admission(req, prefix_len)
@@ -1105,7 +1120,7 @@ class PrefillAdder:
             0,
             req.extend_range.length,
             max_new_tokens,
-            req.retracted_stain,
+            req,
             mamba_gap_reserve=self._mamba_gap_budget_for_req(req),
         )
 
@@ -1177,7 +1192,7 @@ class PrefillAdder:
                 if not truncated
                 else 0
             ),
-            req.retracted_stain,
+            req,
             mamba_gap_reserve=self._mamba_gap_budget_for_req(req),
             is_chunked_continuation=True,
             compute_charge=req.extend_range.length if self.exact_chunk_fill else None,
@@ -1312,7 +1327,7 @@ class PrefillAdder:
                 0,
                 req.extend_range.length,
                 min(req.sampling_params.max_new_tokens, CLIP_MAX_NEW_TOKENS),
-                req.retracted_stain,
+                req,
                 mamba_gap_reserve=self._mamba_gap_budget_for_req(req),
                 compute_charge=(
                     req.extend_range.length if self.exact_chunk_fill else None
@@ -1342,7 +1357,7 @@ class PrefillAdder:
                 0,
                 trunc_len,
                 0,
-                req.retracted_stain,
+                req,
                 mamba_gap_reserve=self._mamba_gap_budget_for_req(req),
                 compute_charge=trunc_len if self.exact_chunk_fill else None,
             )
@@ -1565,7 +1580,7 @@ class PrefillAdder:
             admission.prefix_len,
             admission.extend_len,
             admission.max_new_tokens,
-            req.retracted_stain,
+            req,
             mamba_gap_reserve=mamba_gap_reserve,
             # Compute budgets are billed forward-pass tokens under exact-chunk-fill.
             compute_charge=admission.extend_len if self.exact_chunk_fill else None,
@@ -1631,6 +1646,7 @@ class PrefillAdder:
         release_counter = 0
         for i, running_req in enumerate(self.running_batch.reqs):
             if running_req in preemptible_reqs:
+                running_req.reprocess_reason = "priority_preemption"
                 self.memory_budget.total_offset -= (
                     self._get_running_request_total_token_offset(running_req)
                 )

@@ -3853,6 +3853,7 @@ class Scheduler(
         for req in cache_resumed:
             req.is_context_engineering_cache_paused = False
             req.context_engineering_pause_committed_len = 0
+            req.reprocess_reason = "radix_evictable_rebootstrap"
             if self.disaggregation_mode == DisaggregationMode.DECODE:
                 self.disagg_decode_prealloc_queue.add(req, is_rebootstrap=True)
                 req.time_stats.set_decode_prealloc_queue_entry_time()
@@ -4483,6 +4484,7 @@ class Scheduler(
 
         self.paused_compact_queue.remove(victim)
         victim.is_context_engineering_paused = False
+        victim.reprocess_reason = "kv_pressure_paused_compact"
         pair_key = victim.context_engineering_pair_key
         insert_into_radix_cache = should_cache_paused_compact_for_kv_pressure(
             enable_hierarchical_cache=self.enable_hierarchical_cache,
@@ -4637,7 +4639,8 @@ class Scheduler(
         """Retract CE requests excluded by the main and compact decode budgets."""
 
         def retract_excluded(
-            keep_indices: List[int], *, pause_compacts: bool = False
+            keep_indices: List[int], *, pause_compacts: bool = False,
+            reason: str,
         ) -> None:
             if len(keep_indices) == len(batch.reqs):
                 return
@@ -4698,6 +4701,7 @@ class Scheduler(
             resumable = []
             failed = []
             for idx, req in reversed(excluded):
+                req.reprocess_reason = reason
                 if batch.release_req(idx, len(keep_indices)):
                     resumable.append(req)
                 else:
@@ -4723,7 +4727,8 @@ class Scheduler(
                 max_batch_size=(
                     get_schedule().context_engineering_main_turn_decode_max_batch_size
                 ),
-            )
+            ),
+            reason="main_turn_decode_batch_size",
         )
         if batch.is_empty():
             return
@@ -4742,6 +4747,7 @@ class Scheduler(
                 ),
             ),
             pause_compacts=True,
+            reason="pair_decode_limit",
         )
 
     def record_batch_in_overlap(self, batch: ScheduleBatch):
@@ -6368,6 +6374,8 @@ class Scheduler(
         self.last_batch = None
         self.cur_batch_for_debug = None
 
+        for req in retract_reqs + cache_paused_reqs:
+            req.reprocess_reason = "engine_pause_rebootstrap"
         if self.decode_offload_manager is not None:
             # Pending offload copies may still read the device KV that retraction frees,
             # and the paused decode loop never drains them.

@@ -1241,6 +1241,9 @@ class Req(ReqDllmMixin):
         self.is_retracted = False
         # Indicates if the req has ever been retracted.
         self.retracted_stain = False
+        self.reprocess_reason = str(
+            self.custom_labels.get("_sglang_reprocess_reason") or ""
+        )
 
         self.weight_version_events: List[WeightVersionEvent] = []
 
@@ -2021,6 +2024,8 @@ class Req(ReqDllmMixin):
         # Increment retraction count before resetting other state. We should not reset this
         # since we are tracking the total number of retractions for each request.
         self.retraction_count += 1
+        if not self.reprocess_reason:
+            self.reprocess_reason = "retracted"
 
         self.prefix_indices = torch.empty((0,), dtype=torch.int64)
         self.routed_experts = None
@@ -2165,6 +2170,10 @@ class Req(ReqDllmMixin):
         # the rebootstrap recompute would not reproduce the original prefix KV
         # for multi-modal requests. Add multi-modal support before enabling it.
         sp = self.sampling_params
+        custom_labels = dict(self.custom_labels)
+        custom_labels["_sglang_reprocess_reason"] = (
+            self.reprocess_reason or "pd_rebootstrap"
+        )
         return {
             "input_ids": [int(x) for x in self.origin_input_ids]
             + [int(x) for x in self.output_ids],
@@ -2194,6 +2203,7 @@ class Req(ReqDllmMixin):
             "routing_key": self.routing_key,
             "routed_dp_rank": self.disagg_prefill_dp_rank,
             "disagg_prefill_dp_rank": self.disagg_prefill_dp_rank,
+            "custom_labels": custom_labels,
         }
 
     def log_time_stats(self):
@@ -3485,6 +3495,7 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
                 self.release_req(idx, len(sorted_indices), offload_kv=False)
                 continue
             # release memory and don't insert into the tree because we need the space instantly
+            req.reprocess_reason = "kv_pressure"
             if self.release_req(idx, len(sorted_indices)):
                 retracted_reqs.append(req)
             else:
@@ -3517,6 +3528,7 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
                 "in the decode batch. Aborting the last request.",
                 status_code=HTTPStatus.INTERNAL_SERVER_ERROR,
             )
+            last_req.reprocess_reason = "kv_pressure_abort"
             reqs_to_abort.append(last_req)
             if last_req.beam_group is not None:
                 free_member_rows(
