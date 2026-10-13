@@ -122,6 +122,7 @@ from sglang.srt.managers.pair_scheduler import (
     order_prefill_waiting_queue,
     select_decode_keep_indices,
     select_main_turn_decode_keep_indices,
+    should_cache_paused_compact_for_kv_pressure,
     should_try_prefill_request,
 )
 from sglang.srt.managers.io_struct import (
@@ -4357,6 +4358,10 @@ class Scheduler(
         self.paused_compact_queue.remove(victim)
         victim.is_context_engineering_paused = False
         pair_key = victim.context_engineering_pair_key
+        insert_into_radix_cache = should_cache_paused_compact_for_kv_pressure(
+            enable_hierarchical_cache=self.enable_hierarchical_cache,
+            disaggregation_mode=get_disagg().disaggregation_mode,
+        )
         backup_saved = release_req(
             req=victim,
             remaing_req_count=len(batch.reqs),
@@ -4364,6 +4369,8 @@ class Scheduler(
             token_to_kv_pool_allocator=self.token_to_kv_pool_allocator,
             tree_cache=self.tree_cache,
             hisparse_coordinator=self.hisparse_coordinator,
+            offload_kv=not insert_into_radix_cache,
+            insert_into_radix_cache=insert_into_radix_cache,
         )
         if backup_saved:
             return [victim], [], pair_key

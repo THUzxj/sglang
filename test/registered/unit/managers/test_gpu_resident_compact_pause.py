@@ -76,12 +76,16 @@ class TestGpuResidentCompactPause(unittest.TestCase):
         scheduler.token_to_kv_pool_allocator = object()
         scheduler.tree_cache = object()
         scheduler.hisparse_coordinator = None
+        scheduler.enable_hierarchical_cache = False
         batch = SimpleNamespace(
             reqs=[active_main],
             _get_decode_retraction_order=lambda reqs: [0],
         )
 
-        with patch("sglang.srt.managers.scheduler.release_req", return_value=True) as release:
+        with patch("sglang.srt.managers.scheduler.release_req", return_value=True) as release, patch(
+            "sglang.srt.managers.scheduler.get_disagg",
+            return_value=SimpleNamespace(disaggregation_mode="decode"),
+        ):
             retracted, aborted, pair_key = (
                 scheduler._retract_paused_compact_for_kv_pressure(batch)
             )

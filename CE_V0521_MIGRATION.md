@@ -13,7 +13,7 @@ in v0.5.21.
 | Feature group | Source commits | Destination commits | State |
 | --- | --- | --- | --- |
 | Pair scheduler admission, labels, configuration, compact starvation and decode limits | `0507fbcaa1`, `216b6cbb1b`, `fd73729f5d`, `2f21295bf4`, `e36de13ef2`, `1845639b4e`, `e01955a6e0` | `63eb35ae7e`, `56ada06080`, `c80a2242aa`, `1086af0824`, `c539a77738`, `4f7217d955` | Partial: admission and retract-mode limits ported; scheduler lifecycle still needs integration |
-| Pair-aware KV pressure and compact pause/resume | `d5fd528f6b`, `89290ed0f4`, `2300eb3284`, `1221770f30`, `6c212d742a` | `72d612596d` | Partial: compact-first OOM recovery ported; GPU-resident and radix-evictable pause modes pending |
+| Pair-aware KV pressure and compact pause/resume | `d5fd528f6b`, `89290ed0f4`, `2300eb3284`, `1221770f30`, `6c212d742a` | `72d612596d`, `7e27559d14` | Partial: compact-first OOM recovery and GPU-resident pause/resume ported; radix-evictable mode pending |
 | Decode HiCache, Full-KV-only restore, Mamba and ownership | `b0350bfc73`, `f65ce7374f`, `64de14e6aa`, `86452ef5c7`, `8c754d7bbe`, `f8ffd6da67`, `fbd5556e16`, `3e34976738`, `fddc511146`, `ff2e533699`, `30b78f64d4`, `722b512ca1`, `c62558f756` | — | Pending architectural port to v0.5.21 unified cache; individual fixes must be compared with upstream behavior |
 | PD transport and allocation | `dc1cb64e04`, `6afc37846b`, `9a0b7a62a5` | `13371a85e9`, `1ad29d8331`, `d8701e41f4` | Ported at code level; end-to-end transfer and KV pressure tests pending |
 | Request control and lifecycle | `0c3905ea40`, `8a8c8cbb46` | `d2e2eb1819`, `b88eea470f` | Ported at code level; full runtime tests pending |
