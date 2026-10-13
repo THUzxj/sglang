@@ -702,6 +702,8 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
             raise ValueError(
                 "Transfer backend does not support decode host KV destinations"
             )
+        if hasattr(kv_manager, "set_metadata_buffers"):
+            kv_manager.set_metadata_buffers(self.metadata_buffers)
         # Staging buffer setup (only when heterogeneous TP staging is enabled)
         if self.enable_staging and not self.is_mla_backend:
             kv_pool_for_heads = self.token_to_kv_pool

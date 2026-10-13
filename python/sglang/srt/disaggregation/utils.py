@@ -568,6 +568,7 @@ class TransferBackend(Enum):
     NIXL = "nixl"
     ASCEND = "ascend"
     FAKE = "fake"
+    METADATA_ONLY = "metadata_only"
 
 
 class KVClassType(Enum):
@@ -677,6 +678,20 @@ def get_kv_class(
             KVClassType.MANAGER: FakeKVManager,
             KVClassType.SENDER: FakeKVSender,
             KVClassType.RECEIVER: FakeKVReceiver,
+        }
+    elif transfer_backend == TransferBackend.METADATA_ONLY:
+        from sglang.srt.disaggregation.metadata_only import (
+            MetadataOnlyKVBootstrapServer,
+            MetadataOnlyKVManager,
+            MetadataOnlyKVReceiver,
+            MetadataOnlyKVSender,
+        )
+
+        class_mapping = {
+            KVClassType.MANAGER: MetadataOnlyKVManager,
+            KVClassType.SENDER: MetadataOnlyKVSender,
+            KVClassType.RECEIVER: MetadataOnlyKVReceiver,
+            KVClassType.BOOTSTRAP_SERVER: MetadataOnlyKVBootstrapServer,
         }
     else:
         raise ValueError(f"Unsupported transfer backend: {transfer_backend}")
