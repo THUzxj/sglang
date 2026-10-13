@@ -1484,6 +1484,13 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
             session_params = (
                 SessionParams(**obj.session_params) if obj.session_params else None
             )
+            custom_labels = obj.custom_labels
+            if custom_labels is None and isinstance(obj.metadata, dict):
+                custom_labels = {
+                    str(key): str(value)
+                    for key, value in obj.metadata.items()
+                    if value is not None
+                }
 
             bootstrap_room = obj.bootstrap_room
             if (
@@ -1527,6 +1534,7 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
                 priority=obj.priority,
                 kv_hints=obj.kv_hints,
                 extra_key=obj.extra_key,
+                custom_labels=custom_labels,
                 cache_salt=obj.cache_salt,
                 routing_key=obj.routing_key,
                 token_type_ids=token_type_ids,
@@ -3038,7 +3046,13 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
         custom_labels = getattr(state.obj, "custom_labels", None)
         labels = dict(self.metrics_collector.labels)
         if custom_labels:
-            labels.update(custom_labels)
+            labels.update(
+                {
+                    key: value
+                    for key, value in custom_labels.items()
+                    if key in self.metrics_collector.labels
+                }
+            )
         if self.enable_priority_scheduling:
             priority = getattr(state.obj, "priority", None)
             if priority is not None:

@@ -1038,6 +1038,7 @@ class Req(ReqDllmMixin):
         metrics_collector: Optional[SchedulerMetricsCollector] = None,
         extra_key: Optional[str] = None,
         routing_key: Optional[str] = None,
+        custom_labels: Optional[Dict[str, str]] = None,
         dimensions: Optional[int] = None,
         http_worker_ipc: Optional[str] = None,
         time_stats: Optional[
@@ -1128,6 +1129,10 @@ class Req(ReqDllmMixin):
         self.cache_salt = cache_salt or None
         self.lora_id = lora_id
         self.routing_key = routing_key
+        self.custom_labels = custom_labels or {}
+        self.context_engineering_kind = self._derive_context_engineering_kind()
+        self.context_engineering_pair_key = self._derive_context_engineering_pair_key()
+        self.allow_compact_drain = self._derive_allow_compact_drain()
 
         # Lazy extra buffer: skip radix cache insert when prealloc failed at
         # boundary — the forward overwrites the only slot, corrupting the state.
@@ -1408,6 +1413,52 @@ class Req(ReqDllmMixin):
 
         # Snapshot of the scheduler prefill-token counter taken at waiting_queue entry; used by HRRN aging.
         self.arrival_processed_tokens: int = 0
+
+    def _derive_context_engineering_kind(self) -> str:
+        labels = self.custom_labels if isinstance(self.custom_labels, dict) else {}
+        request_class = str(labels.get("request_class") or "").lower()
+        call_kind = str(labels.get("call_kind") or "").lower()
+        if request_class in {"compact", "compaction", "context_engineering"}:
+            return "compact"
+        if request_class in {"main", "agent", "agent_run"}:
+            return "main"
+        if call_kind == "context_engineering":
+            return "compact"
+        if call_kind == "agent_run":
+            return "main"
+        return ""
+
+    def _derive_context_engineering_pair_key(self) -> Optional[str]:
+        labels = self.custom_labels if isinstance(self.custom_labels, dict) else {}
+        for key in (
+            "pair_key",
+            "run_id",
+            "context_engineering_pair_key",
+            "compact_pair_key",
+            "session_id",
+        ):
+            value = labels.get(key)
+            if value is not None and str(value):
+                return str(value)
+        if self.session_id:
+            return str(self.session_id)
+        return None
+
+    def _derive_allow_compact_drain(self) -> bool:
+        labels = self.custom_labels if isinstance(self.custom_labels, dict) else {}
+        value = labels.get("allow_compact_drain")
+        if isinstance(value, str):
+            return value.lower() in {"1", "true", "yes"}
+        return bool(value)
+
+    def is_context_engineering_main(self) -> bool:
+        return self.context_engineering_kind == "main"
+
+    def is_context_engineering_compact(self) -> bool:
+        return self.context_engineering_kind == "compact"
+
+    def is_context_engineering_request(self) -> bool:
+        return self.context_engineering_kind in {"main", "compact"}
 
     def advance_cache_request_handle(self) -> None:
         self.cache_request_handle = dataclasses.replace(

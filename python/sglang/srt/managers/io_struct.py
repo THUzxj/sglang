@@ -325,6 +325,8 @@ class GenerateReqInput:
     no_logs: bool = False
     # For custom metric labels
     custom_labels: Optional[Dict[str, str]] = None
+    # Trace replay metadata is used as request labels when custom_labels is absent.
+    metadata: Optional[Dict[str, Any]] = None
 
     # (Internal) Whether to return bytes for image generation
     return_bytes: bool = False
@@ -1018,6 +1020,7 @@ class GenerateReqInput:
             kv_hints=(self.kv_hints[i] if self.kv_hints is not None else None),
             no_logs=self.no_logs,
             custom_labels=self.custom_labels,
+            metadata=self.metadata,
             return_bytes=self.return_bytes,
             return_entropy=self.return_entropy,
             return_prompt_token_ids=self.return_prompt_token_ids,
@@ -1151,6 +1154,8 @@ class TokenizedGenerateReqInput(BaseReq, kw_only=True):
     # Shape of output_token_sampling_logprobs for each output token. This is a
     # defaulted tail field so older IPC senders decode as selected mode.
     sampling_logprobs_mode: SamplingLogprobsMode = "selected"
+    # Keep new IPC fields at the tail for compatibility with shorter Rust messages.
+    custom_labels: Optional[Dict[str, str]] = None
 
     def wrap_pickle_fields(self):
         self.time_stats = wrap_as_pickle(self.time_stats)
