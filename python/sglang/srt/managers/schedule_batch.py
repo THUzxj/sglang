@@ -1788,7 +1788,7 @@ class Req(ReqDllmMixin):
                 full_kv_hit,
                 int(match_result.mamba_host_hit_length),
                 match_result.mamba_branching_seqlen,
-                self.cache_protected_len,
+                self.kv.cache_protected_len,
                 kv_match_status,
                 missing_kv,
                 "l2" if l2_hit else "none",
