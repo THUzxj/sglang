@@ -1061,6 +1061,12 @@ class UnifiedRadixCache(BasePrefixCache):
         insert_params.key = radix_key
         insert_params.value = values
         result = self.insert(insert_params)
+        if req.is_context_engineering_cache_parking:
+            req.context_engineering_pause_node = (
+                result.last_device_node
+                if len(radix_key) == up_to and not result.rotation_tail_declined
+                else None
+            )
 
         # Split the leaf at the prompt boundary so eviction can drop the output
         # KV without the prompt. prev_prefix_len keeps the overlapping indices

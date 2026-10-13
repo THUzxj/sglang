@@ -1134,6 +1134,13 @@ class Req(ReqDllmMixin):
         self.context_engineering_pair_key = self._derive_context_engineering_pair_key()
         self.allow_compact_drain = self._derive_allow_compact_drain()
         self.is_context_engineering_paused = False
+        self.is_context_engineering_cache_paused = False
+        self.is_context_engineering_cache_parking = False
+        self.is_context_engineering_pause_pending = False
+        self.context_engineering_pause_committed_len = 0
+        self.context_engineering_pause_pending_token_id = None
+        self.context_engineering_pause_node = None
+        self.context_engineering_pause_host_lock = None
 
         # Lazy extra buffer: skip radix cache insert when prealloc failed at
         # boundary — the forward overwrites the only slot, corrupting the state.
@@ -2059,6 +2066,32 @@ class Req(ReqDllmMixin):
             self.weight_version_events = truncate_weight_version_events(
                 self.weight_version_events, num_kept_tokens=self.send_token_offset
             )
+
+    def detach_gpu_state_for_cache_pause(self, committed_len: int) -> None:
+        """Clear released GPU bindings without discarding decode progress."""
+        assert not self.kv.holds_kv and not self.kv.holds_mamba
+        self.context_engineering_pause_committed_len = committed_len
+        self.kv = ReqKvInfo()
+        self.prefix_indices = torch.empty((0,), dtype=torch.int64)
+        self.last_node = None
+        self.last_host_node = None
+        self.best_match_node = None
+        self.host_hit_length = 0
+        self.swa_host_hit_length = 0
+        self.mamba_host_hit_length = 0
+        self.num_matched_prefix_tokens = 0
+        self.lock_receipt = DecLockRefParams()
+        self.swa_prefix_lock_released = False
+        self.swa_branching_seqlen = None
+        self.mamba_branching_seqlen = None
+        self.kv_rotation_base = None
+        self.extend_range = None
+        self.dllm_initialized = False
+        self.is_retracted = True
+        self.retracted_stain = True
+        self.inflight_middle_chunks = 0
+        self.extend_batch_idx = 0
+        self.decode_batch_idx = 0
 
     def _mamba_pool_needing_backup(self, req_to_token_pool, allocator):
         if allocator.get_kvcache().cpu_copy_carries_mamba:
