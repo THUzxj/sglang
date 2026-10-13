@@ -23,6 +23,10 @@ def create_log_targets(
 def _create_log_target(target: str, name_prefix: str) -> logging.Logger:
     if target.lower() == "stdout":
         return _create_log_target_stdout(name_prefix)
+    if target.startswith("file:"):
+        return _create_log_target_exact_file(
+            target.removeprefix("file:"), name_prefix
+        )
     return _create_log_target_file(target, name_prefix)
 
 
@@ -42,6 +46,17 @@ def _create_log_target_file(directory: str, name_prefix: str) -> logging.Logger:
     )
     return _create_logger_with_handler(
         f"{name_prefix}.file.{directory}.{hostname}_{rank}", handler
+    )
+
+
+def _create_log_target_exact_file(file_path: str, name_prefix: str) -> logging.Logger:
+    if not file_path:
+        raise ValueError("The path after the 'file:' log target prefix cannot be empty")
+    parent = os.path.dirname(os.path.abspath(file_path))
+    os.makedirs(parent, exist_ok=True)
+    return _create_logger_with_handler(
+        f"{name_prefix}.exact_file.{os.path.abspath(file_path)}",
+        logging.FileHandler(file_path, encoding="utf-8"),
     )
 
 
