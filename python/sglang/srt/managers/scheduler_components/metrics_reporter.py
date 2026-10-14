@@ -1088,6 +1088,13 @@ class SchedulerMetricsReporter:
             f"gen throughput (token/s): {self.last_gen_throughput:.2f}, "
             f"#queue-req: {len(self.scheduler.waiting_queue)}"
         )
+        context_stats = batch_context_engineering_stats(batch.reqs)
+        if context_stats["main"] or context_stats["compact"]:
+            msg += (
+                f", #ce-main: {context_stats['main']}, "
+                f"#ce-compact: {context_stats['compact']}, "
+                f"#ce-paired-compact: {context_stats['paired_compact']}"
+            )
 
         if self.enable_mfu_metrics and gap_latency > 0:
             flops_per_s = self._mfu_log_flops / gap_latency
