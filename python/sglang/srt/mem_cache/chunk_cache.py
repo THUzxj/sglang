@@ -86,7 +86,7 @@ class ChunkCache(BasePrefixCache):
         ]
         self.token_to_kv_pool_allocator.free(kv_indices)
 
-    def cache_unfinished_req(self, req: Req, chunked=False):
+    def cache_unfinished_req(self, req: Req, chunked=False, **kwargs):
         kv_indices = self.req_to_token_pool.req_to_token[
             req.req_pool_idx, : req.extend_range.end
         ]
