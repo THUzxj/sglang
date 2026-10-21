@@ -3002,13 +3002,26 @@ class Scheduler(
     def _resume_paused_compacts(
         self, running_batch: ScheduleBatch
     ) -> ScheduleBatch:
+        check_start = time.perf_counter()
         if not (
             self._gpu_resident_compact_pause_enabled()
             or self._radix_evictable_compact_pause_enabled()
         ):
+            self.metrics_reporter.record_context_engineering_check_timing(
+                "pair_resume_check",
+                (time.perf_counter() - check_start) * 1000,
+            )
             return running_batch
         if not self.paused_compact_queue:
+            self.metrics_reporter.record_context_engineering_check_timing(
+                "pair_resume_check",
+                (time.perf_counter() - check_start) * 1000,
+            )
             return running_batch
+        self.metrics_reporter.record_context_engineering_check_timing(
+            "pair_resume_check",
+            (time.perf_counter() - check_start) * 1000,
+        )
 
         available_batch_slots = max(
             0, self.max_running_requests - len(running_batch.reqs)
@@ -3072,8 +3085,15 @@ class Scheduler(
                 self.disaggregation_mode == DisaggregationMode.DECODE
                 and req.context_engineering_pause_node is not None
             ):
+                resume_start = time.perf_counter()
                 if self.disagg_decode_prealloc_queue.restore_cache_paused_req(req):
                     local_resumed_reqs.append(req)
+                    self.metrics_reporter.record_context_engineering_timing(
+                        "radix_resume_local",
+                        (time.perf_counter() - resume_start) * 1000,
+                        req=req,
+                        detail=f"committed_len={req.context_engineering_pause_committed_len}",
+                    )
             else:
                 pd_rebootstrap_reqs.append(req)
 
@@ -3089,9 +3109,16 @@ class Scheduler(
             for req in pd_rebootstrap_reqs:
                 req.reprocess_reason = "radix_evictable_rebootstrap"
                 if self.disaggregation_mode == DisaggregationMode.DECODE:
+                    req.context_engineering_rebootstrap_start_time = time.perf_counter()
+                    enqueue_start = time.perf_counter()
                     req.time_stats.reset_for_decode_cache_resume()
                     self.disagg_decode_prealloc_queue.add_cache_resume(req)
                     req.time_stats.set_decode_prealloc_queue_entry_time()
+                    self.metrics_reporter.record_context_engineering_timing(
+                        "radix_rebootstrap_enqueue",
+                        (time.perf_counter() - enqueue_start) * 1000,
+                        req=req,
+                    )
                 else:
                     self._add_request_to_queue(req, is_retracted=True)
             self._log_context_engineering_resume(
@@ -3627,23 +3654,55 @@ class Scheduler(
                 self.tree_cache.evict_host(1, ComponentType.MAMBA)
             if host_pool.available_size() < committed_len or mamba_host.available_size() < 1:
                 logger.warning(
-                    "Compact cache pause deferred: insufficient host capacity rid=%s committed=%d",
+                    "Compact cache pause deferred: insufficient host capacity "
+                    "rid=%s committed=%d full_host_available=%d "
+                    "mamba_host_available=%d",
                     req.rid,
                     committed_len,
+                    host_pool.available_size(),
+                    mamba_host.available_size(),
                 )
                 return False
 
+            park_start = time.perf_counter()
+            logger.debug(
+                "Compact cache pause release begin: rid=%s committed=%d "
+                "last_node=%s full_host_available=%d mamba_host_available=%d",
+                req.rid,
+                committed_len,
+                req.last_node,
+                host_pool.available_size(),
+                mamba_host.available_size(),
+            )
             req.is_context_engineering_cache_parking = True
             try:
                 release_kv_cache(req, self.tree_cache, is_insert=True)
             finally:
                 req.is_context_engineering_cache_parking = False
             node_id = req.last_node
+            logger.debug(
+                "Compact cache pause release complete: rid=%s committed=%d "
+                "node=%s full_host_available=%d mamba_host_available=%d",
+                req.rid,
+                committed_len,
+                node_id,
+                host_pool.available_size(),
+                mamba_host.available_size(),
+            )
             host_lock = self.tree_cache.protect_cache_paused_node(node_id)
             if host_lock is None:
                 # release_kv_cache has already transferred ownership to radix.
                 # Re-prefilling here would violate radix_evictable's strict
                 # local-resume contract and conceal a lost host guarantee.
+                logger.error(
+                    "Compact cache pause protection failed: rid=%s committed=%d "
+                    "node=%s full_host_available=%d mamba_host_available=%d",
+                    req.rid,
+                    committed_len,
+                    node_id,
+                    host_pool.available_size(),
+                    mamba_host.available_size(),
+                )
                 raise RuntimeError(
                     "Failed to establish the protected host backup required for "
                     f"radix_evictable local resume: rid={req.rid} "
@@ -3655,6 +3714,12 @@ class Scheduler(
             req.context_engineering_pause_host_lock = host_lock
             req.is_context_engineering_paused = True
             req.is_context_engineering_cache_paused = True
+            self.metrics_reporter.record_context_engineering_timing(
+                "radix_pause_local",
+                (time.perf_counter() - park_start) * 1000,
+                req=req,
+                detail=f"committed_len={committed_len}",
+            )
             logger.info(
                 "Compact local cache pause rid=%s committed=%d node=%s allow_drain=%s",
                 req.rid,
@@ -3672,10 +3737,17 @@ class Scheduler(
                 req.pd_rebootstrap_forced_output_id = req.output_ids.pop()
             req.pd_rebootstrap_in_progress = True
 
+        park_start = time.perf_counter()
         release_kv_cache(req, self.tree_cache, is_insert=True)
         req.detach_gpu_state_for_cache_pause(committed_len)
         req.is_context_engineering_paused = True
         req.is_context_engineering_cache_paused = True
+        self.metrics_reporter.record_context_engineering_timing(
+            "radix_pause_rebootstrap",
+            (time.perf_counter() - park_start) * 1000,
+            req=req,
+            detail=f"committed_len={committed_len}",
+        )
         return True
 
     @scheduler_nvtx_method("scheduler.finalize_pending_compact_pauses")
@@ -3981,7 +4053,12 @@ class Scheduler(
         return retracted_reqs
 
     def _retract_compact_decode_over_budget(self, batch: ScheduleBatch) -> List[Req]:
+        check_start = time.perf_counter()
         if not self._pair_scheduler_active(batch.reqs):
+            self.metrics_reporter.record_context_engineering_check_timing(
+                "pair_retract_check",
+                (time.perf_counter() - check_start) * 1000,
+            )
             return []
 
         compact_only = bool(batch.reqs) and all(
@@ -4001,6 +4078,10 @@ class Scheduler(
             ),
         )
         if len(keep_indices) == len(batch.reqs):
+            self.metrics_reporter.record_context_engineering_check_timing(
+                "pair_retract_check",
+                (time.perf_counter() - check_start) * 1000,
+            )
             return []
 
         keep_set = set(keep_indices)
@@ -4010,6 +4091,10 @@ class Scheduler(
             if idx not in keep_set and req.is_context_engineering_compact()
         ]
         if not retracted_reqs:
+            self.metrics_reporter.record_context_engineering_check_timing(
+                "pair_retract_check",
+                (time.perf_counter() - check_start) * 1000,
+            )
             return []
 
         reason = "no_main" if compact_only else "decode_budget"
@@ -4463,6 +4548,20 @@ class Scheduler(
             self.batch_result_processor.process_batch_result_prebuilt(batch)
         elif batch.forward_mode.is_idle():
             self.batch_result_processor.process_batch_result_idle(batch, result)
+
+        if batch.forward_mode.is_extend():
+            now = time.perf_counter()
+            for req in batch.reqs:
+                start = getattr(req, "context_engineering_rebootstrap_start_time", None)
+                if start is None:
+                    continue
+                self.metrics_reporter.record_context_engineering_timing(
+                    "radix_rebootstrap_e2e",
+                    (now - start) * 1000,
+                    req=req,
+                    detail=f"reprocess_reason={req.reprocess_reason}",
+                )
+                req.context_engineering_rebootstrap_start_time = None
 
         self._record_step_counters(batch, result)
 

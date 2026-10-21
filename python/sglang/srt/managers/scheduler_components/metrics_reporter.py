@@ -122,6 +122,13 @@ class SchedulerMetricsReporter:
     num_retracted_reqs: int = 0
     num_paused_reqs: int = 0
 
+    def _reset_context_engineering_timing(self) -> None:
+        self._context_engineering_timing: dict[str, list[float]] = defaultdict(list)
+        self._context_engineering_check_timing: dict[str, list[float]] = defaultdict(
+            list
+        )
+        self._overlap_disagg_decode_timing: dict[str, list[float]] = {}
+
     def __post_init__(self) -> None:
         self.enable_metrics = self.metrics_collector_context.enable_metrics
         self.is_stats_logging_rank = (
@@ -133,8 +140,99 @@ class SchedulerMetricsReporter:
         self.enable_kv_cache_events = (
             self.metrics_collector_context.enable_kv_cache_events
         )
+        self._reset_context_engineering_timing()
         self._init_metrics(self.tp_rank, self.pp_rank, self.dp_rank)
         self._install_device_timer_on_runners()
+
+    def record_context_engineering_timing(
+        self,
+        event: str,
+        duration_ms: float,
+        *,
+        req: Optional[Req] = None,
+        detail: str = "",
+    ) -> None:
+        """Record one context-engineering scheduler/cache operation."""
+        if not self.is_stats_logging_rank:
+            return
+        self._context_engineering_timing[event].append(duration_ms)
+        rid = getattr(req, "rid", "") if req is not None else ""
+        logger.info(
+            "Context-engineering timing event=%s rid=%s duration_ms=%.3f%s",
+            event,
+            rid,
+            duration_ms,
+            f" {detail}" if detail else "",
+        )
+
+    def _context_engineering_timing_suffix(self) -> str:
+        parts = []
+        for event, samples in sorted(self._context_engineering_timing.items()):
+            if not samples:
+                continue
+            ordered = sorted(samples)
+            p95_index = min(
+                len(ordered) - 1, max(0, math.ceil(len(ordered) * 0.95) - 1)
+            )
+            p95 = ordered[p95_index]
+            parts.append(
+                f"{event}: count={len(samples)}, avg_ms={sum(samples) / len(samples):.3f}, "
+                f"p95_ms={p95:.3f}, max_ms={max(samples):.3f}"
+            )
+        self._context_engineering_timing.clear()
+        return ", ce timing: " + "; ".join(parts) if parts else ""
+
+    def _context_engineering_check_timing_suffix(self) -> str:
+        parts = []
+        for event, samples in sorted(
+            self._context_engineering_check_timing.items()
+        ):
+            if not samples:
+                continue
+            ordered = sorted(samples)
+            p95_index = min(
+                len(ordered) - 1, max(0, math.ceil(len(ordered) * 0.95) - 1)
+            )
+            p95 = ordered[p95_index]
+            parts.append(
+                f"{event}: count={len(samples)}, avg_ms={sum(samples) / len(samples):.3f}, "
+                f"p95_ms={p95:.3f}, max_ms={max(samples):.3f}"
+            )
+        self._context_engineering_check_timing.clear()
+        return ", ce check timing: " + "; ".join(parts) if parts else ""
+
+    def record_overlap_disagg_decode_timing(
+        self, event: str, duration_ms: float
+    ) -> None:
+        """Accumulate completed CPU calls without retaining per-step samples."""
+        if not self.is_stats_logging_rank:
+            return
+        stats = self._overlap_disagg_decode_timing.setdefault(event, [0, 0.0, 0.0])
+        stats[0] += 1
+        stats[1] += duration_ms
+        stats[2] = max(stats[2], duration_ms)
+
+    def _overlap_disagg_decode_timing_suffix(self) -> str:
+        parts = []
+        for event, (count, total_ms, max_ms) in sorted(
+            self._overlap_disagg_decode_timing.items()
+        ):
+            parts.append(
+                f"{event}: count={count}, total_ms={total_ms:.3f}, "
+                f"avg_ms={total_ms / count:.3f}, max_ms={max_ms:.3f}"
+            )
+        self._overlap_disagg_decode_timing.clear()
+        return ", overlap disagg decode timing: " + "; ".join(parts) if parts else ""
+
+    def record_context_engineering_check_timing(
+        self,
+        event: str,
+        duration_ms: float,
+    ) -> None:
+        """Record a scheduler gate that also runs without compact requests."""
+        if not self.is_stats_logging_rank:
+            return
+        self._context_engineering_check_timing[event].append(duration_ms)
 
     def _log_context_engineering_batch(
         self,
@@ -1037,6 +1135,22 @@ class SchedulerMetricsReporter:
             msg += f", fwd occupancy: {self.fwd_occupancy:.2f}%"
 
         if self.is_stats_logging_rank:
+            timing_suffix = getattr(self, "_context_engineering_timing_suffix", None)
+            if timing_suffix is not None:
+                msg += timing_suffix()
+            check_timing_suffix = getattr(
+                self, "_context_engineering_check_timing_suffix", None
+            )
+            if check_timing_suffix is not None:
+                msg += check_timing_suffix()
+            overlap_timing_suffix = getattr(
+                self, "_overlap_disagg_decode_timing_suffix", None
+            )
+            if overlap_timing_suffix is not None:
+                msg += overlap_timing_suffix()
+            graph_timer = self._get_graph_replay_timer()
+            if graph_timer is not None:
+                msg += graph_timer.take_log_suffix()
             server_time = datetime.now().isoformat(timespec="milliseconds")
             logger.info(
                 f"{msg}, server time: {server_time}, "
@@ -1283,12 +1397,21 @@ class SchedulerMetricsReporter:
             self.fwd_occupancy = float("nan")
             self.stats.fwd_occupancy = float("nan")
 
+    def _get_graph_replay_timer(self):
+        worker = getattr(self.scheduler, "tp_worker", None)
+        runner = getattr(worker, "model_runner", None)
+        return getattr(runner, "graph_replay_timer", None)
+
     def _maybe_log_idle_metrics(self):
         """Reset forward timing and publish idle metrics when needed."""
         # Keep idle wall time out of the next decode report. This hook runs on
         # every idle scheduler iteration, including when metrics are disabled,
         # so the first decode interval after an idle period starts from the
         # most recent idle iteration instead of the previous decode log.
+        getattr(self, "_overlap_disagg_decode_timing", {}).clear()
+        graph_timer = self._get_graph_replay_timer()
+        if graph_timer is not None:
+            graph_timer.break_sequence()
         now = time.perf_counter()
         self.last_decode_stats_tic = now
         self.last_decode_log_time = now

@@ -899,6 +899,7 @@ class Req(ReqDllmMixin):
         self.context_engineering_kind = self._derive_context_engineering_kind()
         self.context_engineering_pair_key = self._derive_context_engineering_pair_key()
         self.allow_compact_drain = self._derive_allow_compact_drain()
+        self.context_engineering_rebootstrap_start_time: Optional[float] = None
         labels = self.custom_labels if isinstance(self.custom_labels, dict) else {}
         self.reprocess_reason = str(
             labels.get("_sglang_reprocess_reason") or ""
