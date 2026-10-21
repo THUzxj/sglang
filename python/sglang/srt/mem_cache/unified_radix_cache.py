@@ -1064,17 +1064,89 @@ class UnifiedRadixCache(BasePrefixCache):
         and Mamba checkpoint remain evictable while the compact is parked.
         """
         if self.cache_controller is None:
+            logger.error(
+                "Paused-node protection failed: no cache_controller node=%s",
+                node_id,
+            )
             return None
         node = self.tree_core.node_by_id(node_id)
+        full = node.component_data[ComponentType.FULL]
+        mamba = (
+            node.component_data[ComponentType.MAMBA]
+            if self.supports_mamba()
+            else None
+        )
+        logger.debug(
+            "Paused-node protection begin: node=%s parent=%s backuped=%s "
+            "full_device=%s full_host=%s mamba_device=%s mamba_host=%s "
+            "pending_write=%s ongoing_write_ids=%s",
+            node_id,
+            node.parent.id if node.parent is not None else None,
+            node.backuped,
+            full.value is not None,
+            full.host_value is not None,
+            mamba is not None and mamba.value is not None,
+            mamba is not None and mamba.host_value is not None,
+            node.write_through_pending_id,
+            list(self.ongoing_write_through),
+        )
         if not node.backuped:
             action = self.tree_core._build_backup_kv_action(node, write_back=True)
+            logger.debug(
+                "Paused-node backup requested: node=%s action_nodes=%s",
+                node_id,
+                action.node_ids,
+            )
             self._execute_and_commit_kv_backup(action, write_back=True)
             self.writing_check(write_back=True)
+            logger.debug(
+                "Paused-node backup drained: node=%s backuped=%s full_host=%s "
+                "mamba_host=%s pending_write=%s ongoing_write_ids=%s",
+                node_id,
+                node.backuped,
+                node.component_data[ComponentType.FULL].host_value is not None,
+                self.supports_mamba()
+                and node.component_data[ComponentType.MAMBA].host_value is not None,
+                node.write_through_pending_id,
+                list(self.ongoing_write_through),
+            )
         if not node.backuped:
+            logger.error(
+                "Paused-node protection failed: Full KV backup missing "
+                "node=%s full_device=%s full_host=%s pending_write=%s",
+                node_id,
+                node.component_data[ComponentType.FULL].value is not None,
+                node.component_data[ComponentType.FULL].host_value is not None,
+                node.write_through_pending_id,
+            )
             return None
         if self.supports_mamba() and node.component_data[ComponentType.MAMBA].host_value is None:
+            mamba = node.component_data[ComponentType.MAMBA]
+            host_pool = self.components[ComponentType.MAMBA]._mamba_pool_host
+            logger.error(
+                "Paused-node protection failed: Mamba backup missing "
+                "node=%s full_host=%s mamba_device=%s mamba_host=%s "
+                "mamba_host_available=%s pending_write=%s ongoing_write_ids=%s",
+                node_id,
+                node.component_data[ComponentType.FULL].host_value is not None,
+                mamba.value is not None,
+                mamba.host_value is not None,
+                host_pool.available_size() if host_pool is not None else None,
+                node.write_through_pending_id,
+                list(self.ongoing_write_through),
+            )
             return None
-        return self.inc_host_lock_ref(node_id).to_dec_params()
+        host_lock = self.inc_host_lock_ref(node_id).to_dec_params()
+        logger.debug(
+            "Paused-node protection established: node=%s full_host=%s "
+            "mamba_host=%s pending_write=%s",
+            node_id,
+            node.component_data[ComponentType.FULL].host_value is not None,
+            self.supports_mamba()
+            and node.component_data[ComponentType.MAMBA].host_value is not None,
+            node.write_through_pending_id,
+        )
+        return host_lock
 
     # ---- HiCache: Backup / LoadBack ----
 
@@ -1086,6 +1158,7 @@ class UnifiedRadixCache(BasePrefixCache):
         for node_id in action.node_ids:
             # Overlapping chain actions: skip already-backed nodes.
             if self.tree_core.is_backuped(node_id):
+                logger.debug("HiCache backup skipped: node=%s already backuped", node_id)
                 continue
             device_value, comp_xfers = self.tree_core.build_backup_spec(node_id)
             sidecar_xfers = self._build_backup_sidecar(device_value, comp_xfers)
@@ -1094,6 +1167,48 @@ class UnifiedRadixCache(BasePrefixCache):
             )
             started_at = time.perf_counter() if debug_write_through else 0.0
             num_tokens = len(device_value)
+            mamba_host_pool = (
+                self.components[ComponentType.MAMBA]._mamba_pool_host
+                if self.supports_mamba()
+                else None
+            )
+            component_transfer_sizes = {
+                str(component_type): [
+                    {
+                        "device_tokens": len(transfer.device_indices)
+                        if transfer.device_indices is not None
+                        else None,
+                        "host_tokens": len(transfer.host_indices)
+                        if transfer.host_indices is not None
+                        else None,
+                    }
+                    for transfer in transfers
+                ]
+                for component_type, transfers in comp_xfers.items()
+            }
+            logger.debug(
+                "HiCache backup submit: node=%s write_back=%s kv_tokens=%s "
+                "full_host_available=%s mamba_host_available=%s "
+                "component_transfers=%s sidecar_transfers=%s",
+                node_id,
+                write_back,
+                num_tokens,
+                self.cache_controller.mem_pool_host.available_size(),
+                mamba_host_pool.available_size() if mamba_host_pool is not None else None,
+                component_transfer_sizes,
+                [
+                    {
+                        "pool": transfer.name,
+                        "device_tokens": len(transfer.device_indices)
+                        if transfer.device_indices is not None
+                        else None,
+                        "host_tokens": len(transfer.host_indices)
+                        if transfer.host_indices is not None
+                        else None,
+                    }
+                    for transfer in sidecar_xfers
+                ],
+            )
             estimated_bytes = (
                 estimate_primary_kv_bytes(
                     self.cache_controller.mem_pool_device, num_tokens
@@ -1114,6 +1229,15 @@ class UnifiedRadixCache(BasePrefixCache):
                 node_id, device_value, comp_xfers, sidecar_xfers
             )
             if host_indices is None:
+                logger.error(
+                    "HiCache backup failed: node=%s write_back=%s kv_tokens=%s "
+                    "full_host_available=%s mamba_host_available=%s",
+                    node_id,
+                    write_back,
+                    num_tokens,
+                    self.cache_controller.mem_pool_host.available_size(),
+                    mamba_host_pool.available_size() if mamba_host_pool is not None else None,
+                )
                 if debug_write_through:
                     logger.debug(
                         "HiCache L1->L2 write-through finish: "
@@ -1124,6 +1248,20 @@ class UnifiedRadixCache(BasePrefixCache):
                     )
                 return 0
             self.tree_core.commit_backup(node_id, host_indices, comp_xfers)
+            committed_node = self.tree_core.node_by_id(node_id)
+            logger.debug(
+                "HiCache backup committed: node=%s write_back=%s kv_host_tokens=%s "
+                "full_host=%s mamba_host=%s mamba_device=%s pending_before_track=%s",
+                node_id,
+                write_back,
+                len(host_indices),
+                committed_node.component_data[ComponentType.FULL].host_value is not None,
+                self.supports_mamba()
+                and committed_node.component_data[ComponentType.MAMBA].host_value is not None,
+                self.supports_mamba()
+                and committed_node.component_data[ComponentType.MAMBA].value is not None,
+                committed_node.write_through_pending_id,
+            )
             lock_params = None
             if not write_back:
                 lock_params = self.inc_lock_ref(node_id).to_dec_params()
@@ -1149,9 +1287,31 @@ class UnifiedRadixCache(BasePrefixCache):
         """Execute Backup action."""
         kv_tokens = len(device_value)
         host_avail = self.cache_controller.mem_pool_host.available_size()
+        mamba_host_pool = (
+            self.components[ComponentType.MAMBA]._mamba_pool_host
+            if self.supports_mamba()
+            else None
+        )
+        logger.debug(
+            "HiCache backup capacity check: node=%s kv_tokens=%s "
+            "full_host_available=%s mamba_host_available=%s",
+            node_id,
+            kv_tokens,
+            host_avail,
+            mamba_host_pool.available_size() if mamba_host_pool is not None else None,
+        )
         if host_avail < kv_tokens:
             needed = kv_tokens - host_avail
-            if self.evict_host(needed) < needed:
+            evicted = self.evict_host(needed)
+            logger.debug(
+                "HiCache backup capacity eviction: node=%s component=FULL "
+                "requested=%s evicted=%s available_after=%s",
+                node_id,
+                needed,
+                evicted,
+                self.cache_controller.mem_pool_host.available_size(),
+            )
+            if evicted < needed:
                 return None
         aux_xfers = [x for xfers in comp_xfers.values() for x in xfers]
         aux_xfers.extend(sidecar_xfers)
@@ -1209,7 +1369,27 @@ class UnifiedRadixCache(BasePrefixCache):
         lock_node_id = pending.node_id
         lock_params = pending.lock_params
         publish_node_ids = pending.publish_node_ids
+        logger.debug(
+            "HiCache backup ACK begin: ack_id=%s node=%s publish_nodes=%s "
+            "write_back=%s ongoing_write_ids=%s",
+            ack_id,
+            lock_node_id,
+            publish_node_ids,
+            pending.write_back,
+            list(self.ongoing_write_through),
+        )
         self.tree_core.finish_write_through(publish_node_ids, ack_id)
+        node = self.tree_core.node_by_id(lock_node_id)
+        logger.debug(
+            "HiCache backup ACK committed: ack_id=%s node=%s full_host=%s "
+            "mamba_host=%s pending_write=%s",
+            ack_id,
+            lock_node_id,
+            node.component_data[ComponentType.FULL].host_value is not None,
+            self.supports_mamba()
+            and node.component_data[ComponentType.MAMBA].host_value is not None,
+            node.write_through_pending_id,
+        )
         if (
             not pending.write_back
             and pending.started_at > 0

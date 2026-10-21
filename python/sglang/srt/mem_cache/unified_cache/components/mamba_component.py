@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import logging
 from collections import defaultdict
 from typing import TYPE_CHECKING, Callable, Optional, Sequence
 
@@ -49,6 +50,8 @@ if TYPE_CHECKING:
         UnifiedRadixCache,
         UnifiedTreeNode,
     )
+
+logger = logging.getLogger(__name__)
 
 
 class MambaComponent(TreeComponent):
@@ -795,10 +798,31 @@ class MambaComponent(TreeComponent):
         ct = self.component_type
 
         if phase == CacheTransferPhase.BACKUP_HOST:
-            if transfers and transfers[0].host_indices is not None:
+            transfer = transfers[0] if transfers else None
+            logger.debug(
+                "Mamba HiCache backup transfer: node=%s host_indices=%s "
+                "device_indices=%s existing_host=%s",
+                node.id,
+                transfer is not None and transfer.host_indices is not None,
+                transfer is not None and transfer.device_indices is not None,
+                node.component_data[ct].host_value is not None,
+            )
+            if transfer is not None and transfer.host_indices is not None:
                 cd = node.component_data[ct]
                 if cd.host_value is None:
-                    cd.host_value = transfers[0].host_indices.clone()
+                    cd.host_value = transfer.host_indices.clone()
+                    logger.debug(
+                        "Mamba HiCache backup committed: node=%s host_tokens=%s",
+                        node.id,
+                        len(cd.host_value),
+                    )
+            elif transfer is None or transfer.host_indices is None:
+                logger.error(
+                    "Mamba HiCache backup missing host indices: node=%s "
+                    "transfer_count=%s",
+                    node.id,
+                    len(transfers),
+                )
 
         elif phase == CacheTransferPhase.LOAD_BACK:
             if not transfers:
