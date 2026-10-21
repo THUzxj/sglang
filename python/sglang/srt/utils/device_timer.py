@@ -82,6 +82,105 @@ class GapTimer(DeviceTimer):
         self._pending = None
 
 
+class GraphReplayTimer:
+    """Async full-graph replay timing, independent of torch.profiler.
+
+    The gap includes any intervening stream work, not just GPU idle. Samples
+    are reported when ready, so a log window need not match its current batch.
+    Event pairs are bounded; a slow consumer drops measurements, never waits.
+    """
+
+    def __init__(self, max_pending: int = 256):
+        self._pending = deque()
+        self._previous_end = None
+        self._previous_stream = None
+        self._max_pending = max_pending
+        self._sequence = 0
+        self._clear_window()
+
+    def _clear_window(self):
+        self._count = self._gap_count = self._dropped = 0
+        self._total_ms = self._gap_total_ms = 0.0
+        self._max_ms = self._gap_max_ms = 0.0
+        self._last_id = self._last_bs = None
+
+    def break_sequence(self):
+        """Do not count server idle / eager / prefill time as a replay gap."""
+        self._previous_end = self._previous_stream = None
+
+    @contextmanager
+    def wrap(self, batch_size: int):
+        self._drain()
+        self._sequence += 1
+        if len(self._pending) >= self._max_pending:
+            self._dropped += 1
+            self.break_sequence()
+            yield
+            return
+        stream = torch.cuda.current_stream()
+        stream_key = (stream.device, stream.cuda_stream)
+        previous = (
+            self._previous_end if stream_key == self._previous_stream else None
+        )
+        start = torch.cuda.Event(enable_timing=True)
+        end = torch.cuda.Event(enable_timing=True)
+        start.record(stream)
+        try:
+            yield
+        except BaseException:
+            self.break_sequence()
+            raise
+        else:
+            end.record(stream)
+            self._pending.append(
+                (start, end, previous, self._sequence, batch_size)
+            )
+            self._previous_end = end
+            self._previous_stream = stream_key
+
+    def _drain(self):
+        while self._pending:
+            start, end, previous, sample_id, batch_size = self._pending[0]
+            if not end.query():
+                break
+            self._pending.popleft()
+            elapsed = start.elapsed_time(end)
+            self._count += 1
+            self._total_ms += elapsed
+            self._max_ms = max(self._max_ms, elapsed)
+            self._last_id, self._last_bs = sample_id, batch_size
+            if previous is not None:
+                gap = previous.elapsed_time(start)
+                self._gap_count += 1
+                self._gap_total_ms += gap
+                self._gap_max_ms = max(self._gap_max_ms, gap)
+
+    def take_log_suffix(self) -> str:
+        """Consume completed samples since the last log, without synchronizing."""
+        self._drain()
+        mean = self._total_ms / self._count if self._count else float("nan")
+        gap_mean = (
+            self._gap_total_ms / self._gap_count
+            if self._gap_count else float("nan")
+        )
+        maximum = self._max_ms if self._count else float("nan")
+        gap_maximum = self._gap_max_ms if self._gap_count else float("nan")
+        suffix = (
+            f", cuda graph samples: {self._count}"
+            f", cuda graph ms avg: {mean:.3f}"
+            f", cuda graph ms max: {maximum:.3f}"
+            f", cuda graph gap samples: {self._gap_count}"
+            f", cuda graph gap ms avg: {gap_mean:.3f}"
+            f", cuda graph gap ms max: {gap_maximum:.3f}"
+            f", cuda graph last sample: {self._last_id}"
+            f", cuda graph last bs: {self._last_bs}"
+            f", cuda graph pending: {len(self._pending)}"
+            f", cuda graph dropped: {self._dropped}"
+        )
+        self._clear_window()
+        return suffix
+
+
 @dataclass
 class _TimingInterval:
     start_event: torch.cuda.Event

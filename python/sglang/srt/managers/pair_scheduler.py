@@ -144,6 +144,11 @@ def order_prefill_waiting_queue(
     """
 
     queue = list(waiting_queue)
+    # Keep the normal priority/FCFS order without partitioning the queue when
+    # there is no compact request to prioritize.
+    if not any(is_context_engineering_compact(req) for req in queue):
+        return queue
+
     non_compacts = [req for req in queue if not is_context_engineering_compact(req)]
     compacts = [req for req in queue if is_context_engineering_compact(req)]
     if not enable_priority_scheduling:
@@ -194,14 +199,17 @@ def should_try_prefill_request(
     rather than the decode compact cost ratio.
     """
 
-    can_run_req_list = list(can_run_reqs)
-    running_req_list = list(running_reqs)
-
     if is_context_engineering_main(req):
         return True
 
     if not is_context_engineering_compact(req):
         return True
+
+    # Main/foreground requests are admitted by the normal scheduler.  Keep
+    # this check before materializing the scheduler iterables: on a no-compact
+    # workload this helper is called for every queued request on every tick.
+    can_run_req_list = list(can_run_reqs)
+    running_req_list = list(running_reqs)
 
     # A compact that was genuinely retracted for KV pressure must wait for its
     # paired main (or explicit compact drain).  Fresh compact requests may still
@@ -330,6 +338,12 @@ def select_decode_keep_indices(
 
     if not batch_reqs:
         return []
+
+    # Pair scheduling must remain enabled for mixed batches, but a no-compact
+    # batch has no pair to match or budget.  Avoid constructing pair maps and
+    # repeatedly accounting main attention tokens in that common case.
+    if not any(is_context_engineering_compact(req) for req in batch_reqs):
+        return list(range(len(batch_reqs)))
 
     if all(is_context_engineering_compact(req) for req in batch_reqs):
         if not any(allow_compact_drain(req) for req in batch_reqs):

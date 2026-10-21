@@ -2554,55 +2554,92 @@ class SchedulerDisaggregationDecodeMixin:
         self.result_queue = deque()
         self.last_batch: Optional[ScheduleBatch] = None
 
+        def timed_call(name: str, fn: Callable, *args, **kwargs):
+            if not self.metrics_reporter.is_stats_logging_rank:
+                return fn(*args, **kwargs)
+            start = time.perf_counter()
+            result = fn(*args, **kwargs)
+            self.metrics_reporter.record_overlap_disagg_decode_timing(
+                name, (time.perf_counter() - start) * 1000
+            )
+            return result
+
         def pop_and_process():
             tmp_batch, tmp_result = self.result_queue.popleft()
-            self.process_batch_result(tmp_batch, tmp_result)
-            self._finalize_pending_compact_pauses(tmp_batch)
+            timed_call(
+                "process_batch_result", self.process_batch_result, tmp_batch, tmp_result
+            )
+            timed_call(
+                "_finalize_pending_compact_pauses",
+                self._finalize_pending_compact_pauses,
+                tmp_batch,
+            )
 
         while True:
             # Receive requests
-            recv_reqs = self.request_receiver.recv_requests()
-            self.process_input_requests(recv_reqs)
+            recv_reqs = timed_call(
+                "recv_requests", self.request_receiver.recv_requests
+            )
+            timed_call(
+                "process_input_requests",
+                self.process_input_requests,
+                recv_reqs,
+            )
             if self._engine_paused:
                 continue
-            self.process_decode_queue()
+            timed_call("process_decode_queue", self.process_decode_queue)
 
             # Get the next batch to run
-            plan = self.get_next_disagg_decode_batch_to_run(
-                running_batch=self.running_batch
+            plan = timed_call(
+                "get_next_disagg_decode_batch_to_run",
+                self.get_next_disagg_decode_batch_to_run,
+                running_batch=self.running_batch,
             )
             self.running_batch = plan.running_batch
             batch = plan.batch_to_run
-            batch = self.ngram_embedding_manager.prepare_for_forward(
-                batch, chunked_req=self.chunked_req
+            batch = timed_call(
+                "prepare_for_forward",
+                self.ngram_embedding_manager.prepare_for_forward,
+                batch,
+                chunked_req=self.chunked_req,
             )
             self.cur_batch_for_debug = batch
             # overlap + spec + grammar is unsupported (would desync DP ranks).
-            disable_overlap_for_batch = self.is_disable_overlap_for_batch(
-                batch, last_batch=self.last_batch
+            disable_overlap_for_batch = timed_call(
+                "is_disable_overlap_for_batch",
+                self.is_disable_overlap_for_batch,
+                batch,
+                last_batch=self.last_batch,
             )
 
             if disable_overlap_for_batch and self.last_batch:
-                pop_and_process()
+                timed_call("pop_and_process", pop_and_process)
 
             # Launch the current batch
             if batch:
-                batch_result = self.run_batch(batch)
-                self._apply_war_barrier()
-                self.result_queue.append((batch.copy(), batch_result))
+                batch_result = timed_call("run_batch", self.run_batch, batch)
+                timed_call("_apply_war_barrier", self._apply_war_barrier)
+                self.result_queue.append(
+                    (timed_call("batch.copy", batch.copy), batch_result)
+                )
             else:
                 batch_result = None
 
             # Process the last batch
             if self.last_batch:
                 if not disable_overlap_for_batch:
-                    pop_and_process()
+                    timed_call("pop_and_process", pop_and_process)
             elif batch is None:
-                self.on_idle()
+                timed_call("on_idle", self.on_idle)
 
             # Run sample of the current batch
             # It depends on the result of the last batch (e.g., grammar), so we run it after the last batch is processed.
-            self.launch_batch_sample_if_needed(batch_result, batch)
+            timed_call(
+                "launch_batch_sample_if_needed",
+                self.launch_batch_sample_if_needed,
+                batch_result,
+                batch,
+            )
 
             # Update last_batch
             self.last_batch = batch

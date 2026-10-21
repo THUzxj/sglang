@@ -59,6 +59,7 @@ class FullCudaGraphBackend(BaseCudaGraphBackend):
         self._outputs: Dict[Any, Any] = {}
         self._pool = None
         self._device_module = cuda_graph_runner.device_module
+        self._model_runner = cuda_graph_runner.model_runner
         self._tp_group = cuda_graph_runner.model_runner.tp_group
         self._capture_stream: Optional[torch.cuda.Stream] = None
         self._memory_saver_adapter: Optional[Any] = TorchMemorySaverAdapter.create(
@@ -126,7 +127,12 @@ class FullCudaGraphBackend(BaseCudaGraphBackend):
         static_forward_batch: ForwardBatch,
         **kwargs,
     ) -> Any:
-        self._graphs[shape_key].replay()
+        timer = getattr(self._model_runner, "graph_replay_timer", None)
+        if timer is not None and static_forward_batch.forward_mode.is_decode():
+            with timer.wrap(batch_size=static_forward_batch.batch_size):
+                self._graphs[shape_key].replay()
+        else:
+            self._graphs[shape_key].replay()
         return self._outputs[shape_key]
 
     def cleanup(self) -> None:

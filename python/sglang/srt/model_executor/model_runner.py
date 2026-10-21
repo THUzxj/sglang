@@ -211,7 +211,7 @@ from sglang.srt.utils import (
     set_cuda_arch,
     slow_rank_detector,
 )
-from sglang.srt.utils.device_timer import device_timer_ctx
+from sglang.srt.utils.device_timer import GraphReplayTimer, device_timer_ctx
 from sglang.srt.utils.nvtx_pytorch_hooks import PytHooks
 from sglang.srt.utils.nvtx_utils import profile_range
 from sglang.srt.utils.offloader import (
@@ -293,6 +293,13 @@ class ModelRunner:
         self.is_draft_worker = is_draft_worker
         self.is_generation = model_config.is_generation
         self.device_timer = None
+        self.graph_replay_timer = (
+            GraphReplayTimer()
+            if self.device == "cuda"
+            and not is_draft_worker
+            and envs.SGLANG_LOG_DECODE_CUDA_GRAPH_TIMING.get()
+            else None
+        )
         self.is_multimodal = model_config.is_multimodal
         self.is_multimodal_chunked_prefill_supported = (
             model_config.is_multimodal_chunked_prefill_supported
@@ -1555,6 +1562,10 @@ class ModelRunner:
                 self.hisparse_coordinator.num_real_reqs.fill_(forward_batch.batch_size)
 
             # Replay cuda graph if applicable
+            if self.graph_replay_timer is not None and (
+                not can_run_graph or not forward_batch.forward_mode.is_decode()
+            ):
+                self.graph_replay_timer.break_sequence()
             if can_run_graph:
                 ret = self.decode_cuda_graph_runner.execute(
                     forward_batch,
