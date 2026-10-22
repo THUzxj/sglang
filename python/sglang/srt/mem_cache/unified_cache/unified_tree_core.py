@@ -427,6 +427,10 @@ class UnifiedTreeCore(UnifiedTreeCoreInterface):
         match result."""
         # Maintains the NodeId -> active tree node mapping.
         self._node_arena: dict[NodeId, UnifiedTreeNode] = {}
+        self._paused_host_lock_leases: dict[
+            int, list[tuple[NodeId, DecLockRefParams]]
+        ] = {}
+        self._paused_host_lock_lease_nodes: dict[NodeId, set[int]] = {}
 
         # The single in-flight resumable insert, if suspended at a barrier.
         self._ongoing_insert_walk_state: Optional[_InsertWalkState] = None
@@ -593,6 +597,29 @@ class UnifiedTreeCore(UnifiedTreeCoreInterface):
             component.release_component_lock(node=node, params=params, lock_host=True)
         self._update_evictable_leaf_sets(node)
         return DecLockRefResult()
+
+    def register_paused_host_lock_lease(
+        self, lease: list[tuple[NodeId, DecLockRefParams]]
+    ) -> None:
+        self._paused_host_lock_leases[id(lease)] = lease
+        for node_id, _ in lease:
+            self._paused_host_lock_lease_nodes.setdefault(node_id, set()).add(id(lease))
+
+    def release_paused_host_lock_lease(
+        self, lease: list[tuple[NodeId, DecLockRefParams]]
+    ) -> bool:
+        lease_id = id(lease)
+        if self._paused_host_lock_leases.pop(lease_id, None) is None:
+            return False
+        for node_id, _ in lease:
+            lease_ids = self._paused_host_lock_lease_nodes.get(node_id)
+            if lease_ids is not None:
+                lease_ids.discard(lease_id)
+                if not lease_ids:
+                    del self._paused_host_lock_lease_nodes[node_id]
+        for node_id, params in reversed(lease):
+            self.dec_host_lock_ref(node_id, params)
+        return True
 
     def match_prefix(self, params: MatchPrefixParams) -> MatchResult:
         key = params.key
@@ -1036,6 +1063,13 @@ class UnifiedTreeCore(UnifiedTreeCoreInterface):
 
         for component in self.components:
             component.redistribute_on_node_split(new_parent=new_node, child=child)
+        for lease_id in tuple(self._paused_host_lock_lease_nodes.get(child.id, ())):
+            lease = self._paused_host_lock_leases[lease_id]
+            lock_params = self.inc_host_lock_ref(new_node.id).to_dec_params()
+            lease.append((new_node.id, lock_params))
+            self._paused_host_lock_lease_nodes.setdefault(new_node.id, set()).add(
+                lease_id
+            )
         new_node.parent.children[key.child_key(self.page_size)] = new_node
 
         # A split of a backuped node tells the cache to fix its publish list.

@@ -254,6 +254,144 @@ class TestUnifiedTreeNodeGetPrefixHashValues(CustomTestCase):
         self.assertEqual(n4.get_prefix_hash_values(n3), ["h1", "h2", "h3"])
 
 
+class TestPausedCacheProtection(CustomTestCase):
+    def test_mamba_only_backup_preserves_full_slot_and_commits_after_ack(self):
+        from types import SimpleNamespace
+
+        node = UnifiedTreeNode((ComponentType.FULL, ComponentType.MAMBA))
+        full_host = torch.tensor([17])
+        node.component_data[ComponentType.FULL].host_value = full_host
+        node.component_data[ComponentType.MAMBA].value = torch.tensor([3])
+        transfer = PoolTransfer(
+            name=PoolName.MAMBA,
+            device_indices=node.component_data[ComponentType.MAMBA].value,
+        )
+        events = []
+        cache = UnifiedRadixCache.__new__(UnifiedRadixCache)
+        cache.tree_core = SimpleNamespace(node_by_id=lambda _: node)
+        cache.components = {
+            ComponentType.MAMBA: SimpleNamespace(
+                build_hicache_transfers=lambda *_: [transfer],
+                commit_hicache_transfer=lambda _node, _phase, transfers, **_kwargs: (
+                    events.append("commit"),
+                    setattr(
+                        node.component_data[ComponentType.MAMBA],
+                        "host_value",
+                        transfers[0].host_indices,
+                    ),
+                ),
+            )
+        }
+        cache._build_backup_sidecar = lambda *_: []
+        cache.inc_lock_ref = lambda *_: SimpleNamespace(to_dec_params=lambda: None)
+        cache.dec_lock_ref = lambda *_: None
+        cache.cache_controller = SimpleNamespace(
+            write=lambda indices, **kwargs: (
+                events.append("write"),
+                setattr(transfer, "host_indices", torch.tensor([9])),
+                torch.empty(0, dtype=indices.dtype, device=indices.device),
+            )[-1]
+        )
+        cache._track_write_through_node = lambda *_args, **_kwargs: None
+        cache.writing_check = lambda **_kwargs: (
+            events.append("ack"),
+            self.assertIsNone(node.component_data[ComponentType.MAMBA].host_value),
+        )
+
+        result = UnifiedRadixCache._execute_mamba_only_backup(
+            cache, node.id, node.component_data[ComponentType.MAMBA]
+        )
+
+        self.assertTrue(result)
+        self.assertEqual(events, ["write", "ack", "commit"])
+        self.assertIs(node.component_data[ComponentType.FULL].host_value, full_host)
+
+    def test_split_full_and_mamba_backups_are_locked_together(self):
+        from types import SimpleNamespace
+
+        cache = UnifiedRadixCache.__new__(UnifiedRadixCache)
+        full_parent = UnifiedTreeNode((ComponentType.FULL, ComponentType.MAMBA))
+        mamba_child = UnifiedTreeNode((ComponentType.FULL, ComponentType.MAMBA))
+        mamba_child.parent = full_parent
+        full_parent.children[1] = mamba_child
+        full_parent.component_data[ComponentType.FULL].host_value = torch.ones(4)
+        mamba_child.component_data[ComponentType.MAMBA].host_value = torch.ones(1)
+        cache.cache_controller = object()
+        cache.tree_core = SimpleNamespace(
+            node_by_id=lambda node_id: {
+                full_parent.id: full_parent,
+                mamba_child.id: mamba_child,
+            }[node_id]
+        )
+        cache.components = {}
+        cache.ongoing_write_through = {}
+        cache.supports_mamba = lambda: True
+        cache.tree_core.register_paused_host_lock_lease = lambda lease: None
+        locked = []
+
+        def inc_host_lock_ref(node_id):
+            locked.append(node_id)
+            return IncLockRefResult()
+
+        cache.inc_host_lock_ref = inc_host_lock_ref
+        cache.dec_host_lock_ref = lambda node_id, params: None
+
+        locks = UnifiedRadixCache.protect_cache_paused_node(cache, full_parent.id)
+
+        self.assertEqual(locked, [full_parent.id, mamba_child.id])
+        self.assertEqual([node_id for node_id, _ in locks], locked)
+
+    def test_paused_host_lock_lease_tracks_node_split(self):
+        from types import SimpleNamespace
+
+        from sglang.srt.mem_cache.unified_cache.unified_tree_core import UnifiedTreeCore
+
+        parent = UnifiedTreeNode((ComponentType.FULL, ComponentType.MAMBA))
+        child = UnifiedTreeNode((ComponentType.FULL, ComponentType.MAMBA))
+        new_parent = UnifiedTreeNode((ComponentType.FULL, ComponentType.MAMBA))
+        parent.key = RadixKey(array("q", [10]))
+        child.parent = parent
+        child.key = RadixKey(array("q", [1, 2, 3, 4]))
+        child.hash_value = []
+        parent.children[child.key.child_key()] = child
+        lease = [(child.id, DecLockRefParams())]
+        inc_locked = []
+        fake_core = SimpleNamespace(
+            page_size=1,
+            components=(),
+            _paused_host_lock_leases={id(lease): lease},
+            _paused_host_lock_lease_nodes={child.id: {id(lease)}},
+            _new_node=lambda priority=0: new_parent,
+            _for_each_component_lru=lambda *args, **kwargs: None,
+            _update_evictable_leaf_sets=lambda node: None,
+            inc_host_lock_ref=lambda node_id: (
+                inc_locked.append(node_id) or IncLockRefResult()
+            ),
+        )
+
+        with mock.patch(
+            "sglang.srt.mem_cache.unified_cache.unified_tree_core.split_node_hash_value",
+            return_value=([], []),
+        ):
+            UnifiedTreeCore._split_node(
+                fake_core, RadixKey(array("q", [1, 2])), child, 1
+            )
+
+        self.assertEqual(inc_locked, [new_parent.id])
+        self.assertEqual([node_id for node_id, _ in lease], [child.id, new_parent.id])
+        self.assertEqual(
+            fake_core._paused_host_lock_lease_nodes[new_parent.id], {id(lease)}
+        )
+        released = []
+        fake_core.dec_host_lock_ref = lambda node_id, params: released.append(node_id)
+
+        self.assertTrue(UnifiedTreeCore.release_paused_host_lock_lease(fake_core, lease))
+        self.assertEqual(released, [new_parent.id, child.id])
+        self.assertNotIn(id(lease), fake_core._paused_host_lock_leases)
+        self.assertNotIn(child.id, fake_core._paused_host_lock_lease_nodes)
+        self.assertNotIn(new_parent.id, fake_core._paused_host_lock_lease_nodes)
+
+
 def _write_backup(cache, node, write_back: bool = False) -> int:
     """Back up one node's KV D->H via the tree's build+execute primitives."""
     return cache._execute_and_commit_kv_backup(

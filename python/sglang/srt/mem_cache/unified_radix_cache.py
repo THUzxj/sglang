@@ -775,6 +775,16 @@ class UnifiedRadixCache(BasePrefixCache):
             return DecLockRefResult()
         return self.tree_core.dec_host_lock_ref(node_id, params)
 
+    def dec_host_lock_refs(
+        self, locks: Optional[list[tuple[NodeId, DecLockRefParams]]]
+    ) -> None:
+        if locks is None:
+            return
+        if self.tree_core.release_paused_host_lock_lease(locks):
+            return
+        for node_id, params in reversed(locks or ()):
+            self.dec_host_lock_ref(node_id, params)
+
     def cache_finished_req(
         self, req: Req, is_insert: bool = True, *, kv_len_to_handle: int, **kwargs
     ) -> None:
@@ -1056,7 +1066,9 @@ class UnifiedRadixCache(BasePrefixCache):
         self._free_values(result.device_frees, result.host_frees)
         return result.tracker.get(component_type, 0)
 
-    def protect_cache_paused_node(self, node_id: NodeId) -> Optional[DecLockRefParams]:
+    def protect_cache_paused_node(
+        self, node_id: NodeId
+    ) -> Optional[list[tuple[NodeId, DecLockRefParams]]]:
         """Back up and pin a paused decode prefix in L2 without pinning its L1 slots.
 
         The host lock prevents a later host-LRU eviction from forcing a PD
@@ -1120,33 +1132,69 @@ class UnifiedRadixCache(BasePrefixCache):
                 node.write_through_pending_id,
             )
             return None
-        if self.supports_mamba() and node.component_data[ComponentType.MAMBA].host_value is None:
-            mamba = node.component_data[ComponentType.MAMBA]
+        if (
+            self.supports_mamba()
+            and node.component_data[ComponentType.MAMBA].value is not None
+            and node.component_data[ComponentType.MAMBA].host_value is None
+        ):
+            if not self._execute_mamba_only_backup(
+                node_id, node.component_data[ComponentType.MAMBA]
+            ):
+                logger.error(
+                    "Paused-node protection failed: Mamba-only backup failed "
+                    "node=%s full_host=%s",
+                    node_id,
+                    node.component_data[ComponentType.FULL].host_value is not None,
+                )
+                return None
+        mamba_nodes = []
+        if self.supports_mamba():
+            pending = [node]
+            while pending:
+                candidate = pending.pop()
+                if candidate.component_data[ComponentType.MAMBA].host_value is not None:
+                    mamba_nodes.append(candidate)
+                pending.extend(candidate.children.values())
+        if self.supports_mamba() and not mamba_nodes:
             host_pool = self.components[ComponentType.MAMBA]._mamba_pool_host
             logger.error(
                 "Paused-node protection failed: Mamba backup missing "
-                "node=%s full_host=%s mamba_device=%s mamba_host=%s "
+                "node=%s full_host=%s "
                 "mamba_host_available=%s pending_write=%s ongoing_write_ids=%s",
                 node_id,
                 node.component_data[ComponentType.FULL].host_value is not None,
-                mamba.value is not None,
-                mamba.host_value is not None,
                 host_pool.available_size() if host_pool is not None else None,
                 node.write_through_pending_id,
                 list(self.ongoing_write_through),
             )
             return None
-        host_lock = self.inc_host_lock_ref(node_id).to_dec_params()
+        lock_nodes = [node_id]
+        lock_nodes.extend(
+            mamba_node.id for mamba_node in mamba_nodes if mamba_node.id != node_id
+        )
+        host_locks = []
+        try:
+            for lock_node_id in lock_nodes:
+                host_locks.append(
+                    (
+                        lock_node_id,
+                        self.inc_host_lock_ref(lock_node_id).to_dec_params(),
+                    )
+                )
+        except Exception:
+            self.dec_host_lock_refs(host_locks)
+            raise
+        self.tree_core.register_paused_host_lock_lease(host_locks)
         logger.debug(
-            "Paused-node protection established: node=%s full_host=%s "
-            "mamba_host=%s pending_write=%s",
+            "Paused-node protection established: node=%s mamba_nodes=%s "
+            "full_host=%s mamba_host=%s pending_write=%s",
             node_id,
+            [mamba_node.id for mamba_node in mamba_nodes],
             node.component_data[ComponentType.FULL].host_value is not None,
-            self.supports_mamba()
-            and node.component_data[ComponentType.MAMBA].host_value is not None,
+            bool(mamba_nodes),
             node.write_through_pending_id,
         )
-        return host_lock
+        return host_locks
 
     # ---- HiCache: Backup / LoadBack ----
 
@@ -1158,7 +1206,26 @@ class UnifiedRadixCache(BasePrefixCache):
         for node_id in action.node_ids:
             # Overlapping chain actions: skip already-backed nodes.
             if self.tree_core.is_backuped(node_id):
-                logger.debug("HiCache backup skipped: node=%s already backuped", node_id)
+                node = self.tree_core.node_by_id(node_id)
+                mamba = (
+                    node.component_data[ComponentType.MAMBA]
+                    if self.supports_mamba()
+                    else None
+                )
+                missing_component_backup = mamba is not None and (
+                    mamba.value is not None and mamba.host_value is None
+                )
+                logger.debug(
+                    "HiCache backup skipped: node=%s already_full_backuped="
+                    "%s mamba_device=%s mamba_host=%s missing_component_backup=%s",
+                    node_id,
+                    node.backuped,
+                    mamba is not None and mamba.value is not None,
+                    mamba is not None and mamba.host_value is not None,
+                    missing_component_backup,
+                )
+                if missing_component_backup:
+                    self._execute_mamba_only_backup(node_id, mamba)
                 continue
             device_value, comp_xfers = self.tree_core.build_backup_spec(node_id)
             sidecar_xfers = self._build_backup_sidecar(device_value, comp_xfers)
@@ -1275,6 +1342,57 @@ class UnifiedRadixCache(BasePrefixCache):
             )
             written = len(host_indices)
         return written
+
+    def _execute_mamba_only_backup(self, node_id: NodeId, mamba) -> bool:
+        """Back up a missing Mamba checkpoint without touching existing Full KV."""
+        device_value = mamba.value
+        if device_value is None:
+            logger.error(
+                "Mamba-only backup unavailable: node=%s device checkpoint missing",
+                node_id,
+            )
+            return False
+        node = self.tree_core.node_by_id(node_id)
+        transfers = self.components[ComponentType.MAMBA].build_hicache_transfers(
+            node, CacheTransferPhase.BACKUP_HOST
+        )
+        if not transfers:
+            logger.error("Mamba-only backup unavailable: node=%s no transfer spec", node_id)
+            return False
+        mamba_transfers = transfers
+        empty_full_indices = device_value.new_empty((0,))
+        sidecar_transfers = self._build_backup_sidecar(
+            empty_full_indices, {ComponentType.MAMBA: mamba_transfers}
+        )
+        transfers.extend(sidecar_transfers)
+        lock_params = self.inc_lock_ref(node_id).to_dec_params()
+        host_indices = self.cache_controller.write(
+            empty_full_indices, node_id=node_id, extra_pools=transfers
+        )
+        if host_indices is None:
+            self.dec_lock_ref(node_id, lock_params)
+            logger.error(
+                "Mamba-only backup allocation failed: node=%s mamba_host_available=%s",
+                node_id,
+                self.components[ComponentType.MAMBA]._mamba_pool_host.available_size(),
+            )
+            return False
+        self._track_write_through_node(node_id, lock_params, write_back=True)
+        logger.info(
+            "Mamba-only backup submitted: node=%s full_host_preserved=%s "
+            "mamba_host=%s",
+            node_id,
+            node.component_data[ComponentType.FULL].host_value is not None,
+            node.component_data[ComponentType.MAMBA].host_value is not None,
+        )
+        self.writing_check(write_back=True)
+        self.components[ComponentType.MAMBA].commit_hicache_transfer(
+            node,
+            CacheTransferPhase.BACKUP_HOST,
+            transfers=mamba_transfers,
+            cache_actions=[],
+        )
+        return node.component_data[ComponentType.MAMBA].host_value is not None
 
     def _build_backup_sidecar(self, device_value, comp_xfers):
         """Gather sidecar transfer spec."""

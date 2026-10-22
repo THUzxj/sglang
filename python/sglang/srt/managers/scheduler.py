@@ -5256,9 +5256,8 @@ class Scheduler(
             if recv_req.abort_all or req.rid.startswith(recv_req.rid):
                 req.is_context_engineering_paused = False
                 if req.context_engineering_pause_node is not None:
-                    self.tree_cache.dec_host_lock_ref(
-                        req.context_engineering_pause_node,
-                        req.context_engineering_pause_host_lock,
+                    self.tree_cache.dec_host_lock_refs(
+                        req.context_engineering_pause_host_lock
                     )
                     req.context_engineering_pause_node = None
                     req.context_engineering_pause_host_lock = None
@@ -5483,9 +5482,8 @@ class Scheduler(
             if self.disaggregation_mode == DisaggregationMode.DECODE:
                 local_cache_pause = req.context_engineering_pause_node is not None
                 if local_cache_pause:
-                    self.tree_cache.dec_host_lock_ref(
-                        req.context_engineering_pause_node,
-                        req.context_engineering_pause_host_lock,
+                    self.tree_cache.dec_host_lock_refs(
+                        req.context_engineering_pause_host_lock
                     )
                     req.context_engineering_pause_node = None
                     req.context_engineering_pause_host_lock = None

@@ -900,9 +900,7 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
             req.is_context_engineering_cache_paused = False
             req.context_engineering_pause_committed_len = 0
             req.context_engineering_pause_pending_token_id = None
-            self.tree_cache.dec_host_lock_ref(
-                node_id, req.context_engineering_pause_host_lock
-            )
+            self.tree_cache.dec_host_lock_refs(req.context_engineering_pause_host_lock)
             req.context_engineering_pause_host_lock = None
             req.context_engineering_pause_node = None
             logger.info(
