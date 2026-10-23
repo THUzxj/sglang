@@ -22,7 +22,9 @@ from sglang.srt.mem_cache.hybrid_cache.hybrid_cache_controller import (
     HybridCacheController,
 )
 from sglang.srt.mem_cache.hybrid_cache.hybrid_pool_assembler import (
+    _split_virtual_l2_capacity,
     build_kv_host_pool,
+    build_mamba_host_pool,
     build_pool_entry,
 )
 from sglang.srt.mem_cache.memory_pool import (
@@ -31,7 +33,7 @@ from sglang.srt.mem_cache.memory_pool import (
     MLATokenToKVPool,
     ReqToTokenPool,
 )
-from sglang.srt.mem_cache.memory_pool_host import HostPoolGroup, MambaPoolHost
+from sglang.srt.mem_cache.memory_pool_host import HostPoolGroup
 from sglang.srt.mem_cache.pool_host.common import get_allocator_type
 from sglang.srt.mem_cache.pool_host.mha import get_mha_host_pool_cls
 from sglang.srt.mem_cache.pool_host.mla import MLATokenToKVPoolHost
@@ -92,6 +94,11 @@ class DecodeKVCacheOffloadManager:
         if self.is_hybrid_linear_kv_pool:
             self.decode_host_mem_pool, transfer_layer_num = (
                 self._init_hybrid_host_mem_pool(kv_cache, allocator_type)
+            )
+        elif getattr(server_args, "virtual_l2_enable", False):
+            self.decode_host_mem_pool = build_kv_host_pool(
+                kv_pool=kv_cache, page_size=self.page_size, server_args=server_args,
+                use_mla=isinstance(kv_cache, MLATokenToKVPool),
             )
         elif isinstance(kv_cache, MHATokenToKVPool):
             self.decode_host_mem_pool = get_mha_host_pool_cls(kv_cache)(
@@ -178,11 +185,15 @@ class DecodeKVCacheOffloadManager:
 
         full_host_size = None
         mamba_host_size = 0
-        if self.server_args.hicache_size > 0:
-            full_host_size, mamba_host_size = _split_hicache_size(
-                self.server_args.hicache_size,
-                (full_kv_pool, mamba_pool),
-            )
+        if self.server_args.hicache_size > 0 or getattr(self.server_args, "virtual_l2_enable", False):
+            if getattr(self.server_args, "virtual_l2_enable", False):
+                full_host_size, mamba_host_size = _split_virtual_l2_capacity(
+                    self.server_args.virtual_l2_capacity_gb, (full_kv_pool, mamba_pool)
+                )
+            else:
+                full_host_size, mamba_host_size = _split_hicache_size(
+                    self.server_args.hicache_size, (full_kv_pool, mamba_pool)
+                )
 
         full_host_pool = build_kv_host_pool(
             kv_pool=full_kv_pool,
@@ -191,13 +202,7 @@ class DecodeKVCacheOffloadManager:
             use_mla=kv_cache.use_mla,
             host_size=full_host_size,
         )
-        self.mamba_pool_host = MambaPoolHost(
-            mamba_pool,
-            self.server_args.hicache_ratio,
-            mamba_host_size,
-            allocator_type=allocator_type,
-            layout=self.server_args.hicache_mem_layout,
-        )
+        self.mamba_pool_host = build_mamba_host_pool(mamba_pool, self.server_args, mamba_host_size)
 
         full_layer_mapping = dict(kv_cache.full_attention_layer_id_mapping)
         mamba_layer_mapping = dict(mamba_map)

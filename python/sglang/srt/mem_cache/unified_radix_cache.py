@@ -1295,6 +1295,58 @@ class UnifiedRadixCache(BasePrefixCache):
             host_indices = self._execute_kv_backup(
                 node_id, device_value, comp_xfers, sidecar_xfers
             )
+            # Virtual L2 has a deliberately bounded logical capacity. A hybrid
+            # Mamba checkpoint can exhaust its much smaller slot pool before
+            # the KV pool fills (and session locks may keep every checkpoint
+            # temporarily live). Preserve the useful KV backup in that case;
+            # future matching starts from the nearest Mamba checkpoint that
+            # was retained and recomputes the uncovered recurrent state.
+            mamba_host_pool = (
+                self.components[ComponentType.MAMBA]._mamba_pool_host
+                if self.supports_mamba()
+                else None
+            )
+            has_mamba_transfer = bool(comp_xfers.get(ComponentType.MAMBA))
+            if not has_mamba_transfer:
+                has_mamba_transfer = any(
+                    transfer.name == PoolName.MAMBA
+                    for transfer in sidecar_xfers or []
+                )
+            if (
+                host_indices is None
+                and mamba_host_pool is not None
+                and getattr(mamba_host_pool, "is_virtual_l2_pool", False)
+                and has_mamba_transfer
+                and self.cache_controller.mem_pool_host.available_size() >= num_tokens
+            ):
+                # Keep the normal asynchronous KV write/ack path, but omit only
+                # the saturated Mamba pool. HybridCacheController rolls back
+                # any partial sidecar allocation when the combined write fails.
+                kv_only_comp_xfers = {
+                    component: transfers
+                    for component, transfers in comp_xfers.items()
+                    if component != ComponentType.MAMBA
+                }
+                kv_only_sidecar_xfers = [
+                    transfer
+                    for transfer in sidecar_xfers or []
+                    if transfer.name != PoolName.MAMBA
+                ]
+                host_indices = self._execute_kv_backup(
+                    node_id,
+                    device_value,
+                    kv_only_comp_xfers,
+                    kv_only_sidecar_xfers,
+                )
+                if host_indices is not None:
+                    comp_xfers = kv_only_comp_xfers
+                    logger.info(
+                        "Virtual L2 Mamba sidecar full; submitting KV-only backup: "
+                        "node=%s kv_tokens=%s mamba_host_available=%s",
+                        node_id,
+                        num_tokens,
+                        mamba_host_pool.available_size(),
+                    )
             if host_indices is None:
                 logger.error(
                     "HiCache backup failed: node=%s write_back=%s kv_tokens=%s "

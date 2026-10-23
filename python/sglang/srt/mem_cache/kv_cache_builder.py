@@ -114,7 +114,14 @@ def maybe_register_hicache_draft(
         allocator_type=server_args.hicache_storage_backend,
         pool_label="draft",
     )
-    if isinstance(pool, MHATokenToKVPool):
+    if getattr(server_args, "virtual_l2_enable", False):
+        from sglang.srt.mem_cache.virtual_l2.factory import build_virtual_host_pool
+
+        draft_host_pool = build_virtual_host_pool(
+            pool, page_size=page_size, pool_name="draft",
+            server_args=server_args, capacity_units=primary.size,
+        )
+    elif isinstance(pool, MHATokenToKVPool):
         draft_host_pool = get_mha_host_pool_cls(pool)(pool, **kw)
     elif isinstance(pool, MLATokenToKVPool):
         draft_host_pool = MLATokenToKVPoolHost(pool, **kw)

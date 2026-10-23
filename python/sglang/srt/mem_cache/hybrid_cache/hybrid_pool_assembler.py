@@ -68,6 +68,14 @@ def build_kv_host_pool(
     host_size: Optional[float] = None,
     pool_label: str = "kv",
 ):
+    if getattr(server_args, "virtual_l2_enable", False):
+        from sglang.srt.mem_cache.virtual_l2.factory import build_virtual_host_pool
+
+        return build_virtual_host_pool(
+            kv_pool, page_size=page_size, pool_name=pool_label,
+            server_args=server_args,
+            capacity_bytes=int(host_size) if host_size is not None else None,
+        )
     kv_host_pool_cls = (
         MLATokenToKVPoolHost if use_mla else get_mha_host_pool_cls(kv_pool)
     )
@@ -94,20 +102,77 @@ def build_kv_host_pool(
     )
 
 
+def build_mamba_host_pool(mamba_pool, server_args, host_size=0, allocator_type=None):
+    if getattr(server_args, "virtual_l2_enable", False):
+        from sglang.srt.mem_cache.virtual_l2.factory import (
+            _device_bytes_per_token,
+            build_virtual_host_pool,
+        )
+
+        # Mamba has a variable-sized state row per cache slot. Proportional
+        # splitting can round its share below one row, which would make the
+        # hybrid pool unusable even though the worker's total Virtual L2
+        # capacity is valid. Reserve one logical Mamba slot; the remainder
+        # stays proportionally assigned to the other pools.
+        capacity_bytes = None
+        if host_size is not None:
+            capacity_bytes = max(
+                int(host_size), _device_bytes_per_token(mamba_pool, page_size=1)
+            )
+
+        return build_virtual_host_pool(
+            mamba_pool, page_size=1, pool_name="mamba", server_args=server_args,
+            capacity_bytes=capacity_bytes,
+        )
+    return MambaPoolHost(
+        mamba_pool, server_args.hicache_ratio, host_size,
+        allocator_type=allocator_type or _get_allocator_type(server_args),
+        layout=server_args.hicache_mem_layout,
+    )
+
+
 def _split_hicache_size(
     hicache_size: int, kv_pools: tuple[Any, ...]
 ) -> tuple[float, ...]:
     device_pool_sizes = []
     for kv_pool in kv_pools:
         size_bytes = kv_pool.get_kv_size_bytes()
+        # Pool implementations may return NumPy scalar byte counts. Keep the
+        # arithmetic in Python integers: multiplying the GiB budget by a
+        # uint64 size can overflow before the division.
         device_pool_sizes.append(
-            sum(size_bytes) if isinstance(size_bytes, tuple) else size_bytes
+            int(sum(size_bytes) if isinstance(size_bytes, tuple) else size_bytes)
         )
     total_device_pool_size = sum(device_pool_sizes)
     return tuple(
-        hicache_size * size_bytes / total_device_pool_size
+        hicache_size * size_bytes
+        / total_device_pool_size
         for size_bytes in device_pool_sizes
     )
+
+
+def _split_virtual_l2_capacity(capacity_gib: float, kv_pools: tuple[Any, ...]) -> tuple[int, ...]:
+    """Split a Virtual L2 GiB budget by device-pool size, returning bytes."""
+    device_pool_sizes = []
+    for kv_pool in kv_pools:
+        size_bytes = kv_pool.get_kv_size_bytes()
+        device_pool_sizes.append(
+            int(sum(size_bytes) if isinstance(size_bytes, tuple) else size_bytes)
+        )
+    total_device_pool_size = sum(device_pool_sizes)
+    if total_device_pool_size <= 0:
+        raise ValueError("Cannot split Virtual L2 capacity across empty device pools.")
+    budget_bytes = int(capacity_gib * 1024**3)
+    # Assign integer-division remainder to the final pool so the per-pool
+    # budgets account for the configured total exactly. Pool constructors may
+    # round down further to page/slot boundaries, but can never exceed this
+    # worker-wide budget.
+    splits = [
+        budget_bytes * size // total_device_pool_size
+        for size in device_pool_sizes[:-1]
+    ]
+    splits.append(budget_bytes - sum(splits))
+    return tuple(splits)
 
 
 def build_pool_entry(
@@ -151,6 +216,11 @@ def build_kv_only_stack(
     storage_backend_extra_config: Optional[dict] = None,
     enable_storage_metrics: bool = False,
 ) -> tuple[HostPoolGroup, HybridCacheController]:
+    if getattr(server_args, "virtual_l2_enable", False):
+        raise NotImplementedError(
+            "Virtual L2 currently requires a dedicated logical sidecar adapter; "
+            "DSA/indexer host pools are not virtualized and must not allocate real L2 memory"
+        )
     transfer_layer_num = len(full_layer_mapping)
     kv_host_pool = build_kv_host_pool(
         kv_pool=kv_pool,
@@ -211,9 +281,11 @@ def build_hybrid_swa_stack(
 ) -> tuple[HostPoolGroup, HybridCacheController]:
     transfer_layer_num = len(full_layer_mapping | swa_layer_mapping)
     kv_host_size = swa_host_size = None
-    if server_args.hicache_size > 0:
-        kv_host_size, swa_host_size = _split_hicache_size(
-            server_args.hicache_size, (full_kv_pool, swa_kv_pool)
+    if server_args.hicache_size > 0 or getattr(server_args, "virtual_l2_enable", False):
+        splitter = _split_virtual_l2_capacity if getattr(server_args, "virtual_l2_enable", False) else _split_hicache_size
+        kv_host_size, swa_host_size = splitter(
+            server_args.virtual_l2_capacity_gb if getattr(server_args, "virtual_l2_enable", False) else server_args.hicache_size,
+            (full_kv_pool, swa_kv_pool),
         )
     kv_host_pool = build_kv_host_pool(
         kv_pool=full_kv_pool,
@@ -566,9 +638,11 @@ def build_hybrid_mamba_stack(
     transfer_layer_num = len(full_layer_mapping | mamba_layer_mapping)
     mamba_allocator = params.req_to_token_pool.mamba_allocator
     kv_host_size, mamba_host_size = None, 0
-    if server_args.hicache_size > 0:
-        kv_host_size, mamba_host_size = _split_hicache_size(
-            server_args.hicache_size, (kv_pool, mamba_pool)
+    if server_args.hicache_size > 0 or getattr(server_args, "virtual_l2_enable", False):
+        splitter = _split_virtual_l2_capacity if getattr(server_args, "virtual_l2_enable", False) else _split_hicache_size
+        kv_host_size, mamba_host_size = splitter(
+            server_args.virtual_l2_capacity_gb if getattr(server_args, "virtual_l2_enable", False) else server_args.hicache_size,
+            (kv_pool, mamba_pool),
         )
     kv_host_pool = build_kv_host_pool(
         kv_pool=kv_pool,
@@ -577,13 +651,7 @@ def build_hybrid_mamba_stack(
         use_mla=use_mla,
         host_size=kv_host_size,
     )
-    mamba_host_pool = MambaPoolHost(
-        mamba_pool,
-        server_args.hicache_ratio,
-        mamba_host_size,
-        allocator_type=_get_allocator_type(server_args),
-        layout=server_args.hicache_mem_layout,
-    )
+    mamba_host_pool = build_mamba_host_pool(mamba_pool, server_args, mamba_host_size)
     entries = [
         build_pool_entry(
             name=PoolName.KV,
@@ -659,9 +727,11 @@ def build_hybrid_mamba_swa_stack(
     swa_attn_allocator = params.token_to_kv_pool_allocator.swa_attn_allocator
     mamba_allocator = params.req_to_token_pool.mamba_allocator
     kv_host_size, swa_host_size, mamba_host_size = None, None, 0
-    if server_args.hicache_size > 0:
-        kv_host_size, swa_host_size, mamba_host_size = _split_hicache_size(
-            server_args.hicache_size, (full_kv_pool, swa_kv_pool, mamba_pool)
+    if server_args.hicache_size > 0 or getattr(server_args, "virtual_l2_enable", False):
+        splitter = _split_virtual_l2_capacity if getattr(server_args, "virtual_l2_enable", False) else _split_hicache_size
+        kv_host_size, swa_host_size, mamba_host_size = splitter(
+            server_args.virtual_l2_capacity_gb if getattr(server_args, "virtual_l2_enable", False) else server_args.hicache_size,
+            (full_kv_pool, swa_kv_pool, mamba_pool),
         )
     kv_host_pool = build_kv_host_pool(
         kv_pool=full_kv_pool,
@@ -679,12 +749,9 @@ def build_hybrid_mamba_swa_stack(
         host_size=swa_host_size,
         pool_label="swa",
     )
-    mamba_host_pool = MambaPoolHost(
-        mamba_pool,
-        server_args.hicache_ratio,
-        mamba_host_size,
+    mamba_host_pool = build_mamba_host_pool(
+        mamba_pool, server_args, mamba_host_size,
         allocator_type=server_args.hicache_storage_backend,
-        layout=server_args.hicache_mem_layout,
     )
     entries = [
         build_pool_entry(
@@ -757,6 +824,10 @@ def build_anchor_sidecar_stack(
     storage_backend_extra_config: Optional[dict] = None,
     enable_storage_metrics: bool = False,
 ) -> tuple[HostPoolGroup, HybridCacheController]:
+    if getattr(server_args, "virtual_l2_enable", False):
+        raise NotImplementedError(
+            "Virtual L2 does not yet virtualize DSA/MiniMax sparse index sidecar pools"
+        )
     transfer_layer_num = len(full_layer_mapping)
     kv_host_pool = build_kv_host_pool(
         kv_pool=kv_pool,
@@ -1415,6 +1486,10 @@ def build_minimax_sparse_hicache_stack(
     enable_storage_metrics: bool = False,
 ) -> tuple[HostPoolGroup, HybridCacheController]:
     """KV (main_pool) + INDEXER (index_k_pool) host stack for MiniMax M3 sparse."""
+    if getattr(server_args, "virtual_l2_enable", False):
+        raise NotImplementedError(
+            "Virtual L2 does not yet virtualize MiniMax sparse index sidecar pools"
+        )
     # Mappings are stage-local keyed (controller iterates 0..transfer_layer_num).
     # PP>1 stays gated below pending end-to-end validation of the sparse host path.
     if params.pp_size > 1:

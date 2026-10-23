@@ -2670,6 +2670,56 @@ class ServerArgs:
     enable_hierarchical_cache: A[bool, "Enable hierarchical cache", NS("memory")] = (
         False
     )
+    virtual_l2_enable: A[
+        bool,
+        "Enable benchmark-only Virtual L2 with bounded pinned staging buffers.",
+        NS("memory"),
+    ] = False
+    virtual_l2_capacity_gb: A[
+        float,
+        "Logical Virtual L2 capacity per worker in GiB.",
+        NS("memory"),
+    ] = 0.0
+    virtual_l2_staging_gb: A[
+        float,
+        "Physical pinned staging budget per worker in GiB.",
+        NS("memory"),
+    ] = 0.0
+    virtual_l2_stage_ring_entries: A[
+        int,
+        "Number of reusable staging slots per transfer direction.",
+        NS("memory"),
+    ] = 4
+    virtual_l2_data_pattern: A[
+        str,
+        Arg(help="Synthetic H2D payload pattern for Virtual L2.", choices=["zeros", "ones"]),
+        NS("memory"),
+    ] = "zeros"
+    virtual_l2_dma_mode: A[
+        str,
+        Arg(help="Virtual L2 DMA pacing mode.", choices=["native", "paced"]),
+        NS("memory"),
+    ] = "native"
+    virtual_l2_disable_real_l3: A[
+        bool,
+        "Prevent synthetic Virtual L2 data from entering production L3.",
+        NS("memory"),
+    ] = True
+    virtual_l2_allow_pd: A[
+        bool,
+        "Allow Virtual L2 on PD workers (performance simulation only).",
+        NS("memory"),
+    ] = False
+    virtual_l2_bandwidth_gbps: A[
+        float,
+        "Optional paced Virtual L2 effective bandwidth in GB/s; zero uses native DMA.",
+        NS("memory"),
+    ] = 0.0
+    virtual_l2_fixed_latency_us: A[
+        float,
+        "Optional fixed latency added by paced Virtual L2 transfers in microseconds.",
+        NS("memory"),
+    ] = 0.0
     hicache_ratio: A[
         float,
         "The ratio of the size of host KV cache memory pool to the size of device pool.",
@@ -7215,6 +7265,32 @@ class ServerArgs:
         1) Layout <-> I/O compatibility for direct conflicts.
         2) Storage <-> layout compatibility (may rewrite layout).
         """
+        if getattr(self, "virtual_l2_enable", False):
+            from sglang.srt.mem_cache.virtual_l2.config import virtual_l2_config_from_args
+
+            virtual_l2_config_from_args(self)
+            from sglang.srt.mem_cache.virtual_l2.config import validate_pd_virtual_l2
+
+            validate_pd_virtual_l2(self)
+            if not self.enable_hierarchical_cache:
+                raise ValueError("--virtual-l2-enable requires --enable-hierarchical-cache")
+            if self.hicache_size > 0:
+                raise ValueError(
+                    "--virtual-l2-enable cannot be combined with --hicache-size; "
+                    "use --virtual-l2-capacity-gb as the sole capacity setting"
+                )
+            if self.disaggregation_mode in ("prefill", "decode") and not self.virtual_l2_allow_pd:
+                raise ValueError(
+                    "Virtual L2 with PD requires --virtual-l2-allow-pd; "
+                    "P/D local caches remain worker-private and synthetic"
+                )
+            if getattr(self, "hicache_storage_backend", None) is not None:
+                raise ValueError(
+                    "Virtual L2 cannot be combined with production L3; use a separate shadow namespace"
+                )
+            logger.warning(
+                "Virtual L2 enabled: cache payloads are synthetic and this run is performance-only"
+            )
         # Skip all normalization when neither hicache nor decode-offload path is active.
         if not (
             self.enable_hierarchical_cache

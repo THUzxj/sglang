@@ -87,7 +87,21 @@ class HiRadixCache(RadixCache):
 
         allocator_type = get_allocator_type(server_args)
 
-        if isinstance(self.kv_cache, MHATokenToKVPool):
+        if getattr(server_args, "virtual_l2_enable", False) and isinstance(
+            self.kv_cache, (DSATokenToKVPool, MiniMaxSparseKVPool)
+        ):
+            raise NotImplementedError(
+                "Virtual L2 does not yet virtualize DSA/MiniMax sparse index sidecar pools"
+            )
+        if getattr(server_args, "virtual_l2_enable", False) and isinstance(
+            self.kv_cache, MHATokenToKVPool
+        ):
+            from sglang.srt.mem_cache.virtual_l2.factory import build_virtual_host_pool
+
+            self.token_to_kv_pool_host = build_virtual_host_pool(
+                self.kv_cache, page_size=self.page_size, server_args=server_args
+            )
+        elif isinstance(self.kv_cache, MHATokenToKVPool):
             self.token_to_kv_pool_host = get_mha_host_pool_cls(self.kv_cache)(
                 self.kv_cache,
                 server_args.hicache_ratio,
@@ -106,16 +120,27 @@ class HiRadixCache(RadixCache):
             from sglang.srt.runtime_context import get_parallel
 
             _parallel = get_parallel()
-            self.token_to_kv_pool_host = MLATokenToKVPoolHost(
-                self.kv_cache,
-                server_args.hicache_ratio,
-                server_args.hicache_size,
-                self.page_size,
-                server_args.hicache_mem_layout,
-                allocator_type=allocator_type,
-                dcp_size=_parallel.attn_dcp_size,
-                dcp_rank=_parallel.attn_dcp_rank,
-            )
+            if getattr(server_args, "virtual_l2_enable", False):
+                if _parallel.dcp_enabled:
+                    raise NotImplementedError(
+                        "Virtual L2 MLA with DCP is not supported by the logical-index adapter"
+                    )
+                from sglang.srt.mem_cache.virtual_l2.factory import build_virtual_host_pool
+
+                self.token_to_kv_pool_host = build_virtual_host_pool(
+                    self.kv_cache, page_size=self.page_size, server_args=server_args
+                )
+            else:
+                self.token_to_kv_pool_host = MLATokenToKVPoolHost(
+                    self.kv_cache,
+                    server_args.hicache_ratio,
+                    server_args.hicache_size,
+                    self.page_size,
+                    server_args.hicache_mem_layout,
+                    allocator_type=allocator_type,
+                    dcp_size=_parallel.attn_dcp_size,
+                    dcp_rank=_parallel.attn_dcp_rank,
+                )
         else:
             raise ValueError("HiRadixCache only supports MHA, MLA, DSA, and MSA models")
 

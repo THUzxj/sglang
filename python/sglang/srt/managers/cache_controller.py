@@ -492,6 +492,11 @@ class HiCacheController:
         Requirement: no in-flight requests. This call is expected to run on the scheduler
         thread (control path), not concurrently with prefetch/backup.
         """
+        pools = [self.mem_pool_host] + [
+            entry.host_pool for entry in getattr(self.mem_pool_host, "entries", ())
+        ]
+        if any(getattr(pool, "is_virtual_l2_pool", False) for pool in pools):
+            raise ValueError("Virtual L2 cannot attach production L3 storage")
         if self.enable_storage:
             raise RuntimeError("Storage backend already attached.")
 
